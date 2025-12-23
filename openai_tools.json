@@ -1,0 +1,302 @@
+
+{	
+	"state_update": {
+		"type": "function",
+		"function": {
+			"name": "state_update",
+			"description": "Update session defaults (charge, multiplicity, method, basis, solvent, current_geom, etc.) in a uniform way.",
+			"parameters": {
+			"type": "object",
+			"properties": {
+				"set": {
+				"type": "object",
+				"description": "Key-value updates to apply.",
+				"additionalProperties": true
+				}
+			},
+			"required": ["set"]
+			}
+		}
+	},
+	"state_get_tool_args": {
+		"type": "function",
+		"function": {
+			"name": "state_get_tool_args",
+			"description": "Fetch all arguments needed for a specific MCP tool using current session state (injects geometry_xyz and defaults).",
+			"parameters": {
+			"type": "object",
+			"properties": {
+				"tool_name": { "type": "string" },
+				"overrides": {
+				"type": "object",
+				"description": "Optional explicit overrides to apply on top of state defaults.",
+				"additionalProperties": true
+				}
+			},
+			"required": ["tool_name"]
+			}
+		}
+	},
+
+	"name_to_geometry_xyz": {
+		"type": "function",
+		"function": {
+		"name": "name_to_geometry_xyz",
+		"description": "Resolve a chemical name to an initial 3D geometry (XYZ without natoms/comment). Uses web services (OPSIN/PubChem) and converts SDF->XYZ. Stores provenance in result.",
+		"parameters": {
+			"type": "object",
+			"properties": {
+			"name": { "type": "string", "description": "Chemical name, e.g. acetone, methanol, caffeine." }
+			},
+			"required": ["name"]
+		}
+		}
+	},
+	
+    "run_opt_job": {
+        "type": "function",
+        "function": {
+            "name": "run_opt_job",
+            "description": "Optimize geometry with ORCA.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "geometry_name": {
+                        "type": "string",
+                        "description": "Name/key of a loaded geometry in session state (preferred)."
+					},
+                    "geometry_xyz": {
+                        "type": "string",
+                        "description": "XYZ coords without natoms/comment header (optional; host can inject)."
+                    },
+                    "charge": {"type": "integer", "default": 0},
+                    "multiplicity": {"type": "integer", "default": 1},
+                    "method": {"type": "string", "default": "B3LYP"},
+                    "basis": {"type": "string", "default": "def2-SVP"},
+                    "use_ri": {"type": "boolean", "default": true},
+                    "scf_max_iter": {"type": "integer", "default": 150},
+                    "opt_max_iter": {"type": "integer", "default": 100},
+                    "wall_timeout_seconds": {"type": "integer", "default": 1800}
+                },
+                "required": []}
+        }
+    },
+
+    "run_nbo_job": {
+        "type": "function",
+        "function": {
+            "name": "run_nbo_job",
+            "description": "Run an ORCA NBO/NPA calculation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "geometry_name": {
+                        "type": "string",
+                        "description": "Name/key of a loaded geometry in session state (preferred)."},
+                    "geometry_xyz": {
+                        "type": "string",
+                        "description": "XYZ coords without natoms/comment header (optional; host can inject)."},
+                    "charge": {"type": "integer", "default": 0},
+                    "multiplicity": {"type": "integer", "default": 1},
+                    "method": {"type": "string", "default": "B3LYP"},
+                    "basis": {"type": "string", "default": "def2-SVP"},
+                    "job_type": {"type": "string", "enum": ["sp", "opt"], "default": "sp"},
+                    "use_ri": {"type": "boolean", "default": true},
+                    "scf_max_iter": {"type": "integer", "default": 150},
+                    "opt_max_iter": {"type": "integer", "default": 50},
+                    "wall_timeout_seconds": {"type": "integer", "default": 600}},
+                "required": []}}},
+
+    "run_sp_energy": {
+        "type": "function",
+        "function": {
+            "name": "run_sp_energy",
+            "description": "Run a single-point energy calculation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "geometry_name": {"type": "string", "description": "Loaded geometry key (preferred)."},
+                    "geometry_xyz": {"type": "string", "description": "Optional; host can inject."},
+                    "charge": {"type": "integer", "default": 0},
+                    "multiplicity": {"type": "integer", "default": 1},
+                    "method": {"type": "string", "default": "B3LYP"},
+                    "basis": {"type": "string", "default": "def2-SVP"},
+                    "use_ri": {"type": "boolean", "default": true},
+                    "scf_max_iter": {"type": "integer", "default": 150},
+                    "wall_timeout_seconds": {"type": "integer", "default": 600}},
+                "required": []}}},
+    "build_reaction_coordinate_scan": {
+        "type": "function",
+        "function": {
+            "name": "build_reaction_coordinate_scan",
+            "description": "Construct an ORCA %geom scan block using internal coordinates (B/A/D).",
+            "parameters": {
+            "type": "object",
+            "properties": {
+                "coords": {
+                "type": "array",
+                "description": "Up to 3 coordinates to scan.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                    "type": {"type": "string", "enum": ["B", "A", "D"]},
+                    "atoms": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Atom indices (ORCA is typically 0-based). Length: 2 for B, 3 for A, 4 for D."
+                    },
+                    "start": {"type": "number"},
+                    "end": {"type": "number"},
+                    "nsteps": {"type": "integer"}
+                    },
+                    "required": ["type", "atoms", "start", "end", "nsteps"]
+                }
+                },
+                "simul_scan": {
+                "type": "boolean",
+                "description": "If true, vary all scan coords simultaneously (cheaper than nested loops).",
+                "default": false
+                },
+                "index_base": {
+                "type": "integer",
+                "enum": [0, 1],
+                "description": "If 1, convert given atom indices to 0-based for ORCA blocks.",
+                "default": 0
+                }
+            },
+            "required": ["coords"]
+            }
+        }
+    },
+	"run_solvator_cluster_thermo":{
+		"type": "function",
+		"function": {
+		"name": "run_solvator_cluster_thermo",
+		"description": "Run ORCA SOLVATOR to build a microsolvated cluster (e.g., water) from a solute XYZ.",
+			"parameters": {
+			"type": "object",
+			"properties": {
+				"geometry_xyz": {
+				"type": "string",
+				"description": "Solute XYZ coordinates without natoms/comment header. Normally injected by the host via state_get_tool_args."
+				},
+				"charge": {
+				"type": "integer",
+				"description": "Total solute charge.",
+				"default": 0
+				},
+				"multiplicity": {
+				"type": "integer",
+				"description": "Spin multiplicity of the solute.",
+				"default": 1
+				},
+				"nsolv": {
+				"type": "integer",
+				"description": "Number of water molecules to add around the solute.",
+				"default": 3
+				},
+				"wall_timeout_seconds": {
+				"type": "integer",
+				"description": "Soft wall-clock timeout hint; host may ignore.",
+				"default": 600
+				},
+				"job_label": {
+				"type": "string",
+				"description": "Optional label for this SOLVATOR job. If omitted, the server will generate one."
+				}
+			},
+			"required": []
+			}
+		}
+	},
+	"structure_add_remove_proton":{
+		"type": "function",
+		"function": {
+			"name": "structure_add_remove_proton",
+			"description": "Add or remove one proton (H) from a structure in XYZ format. If the site is not specified, uses simple geometry heuristics to propose and apply a site. Returns the edited XYZ plus the chosen site and candidates for user confirmation.",
+			"strict": true,
+			"parameters": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"geometry_xyz": { "type": "string" },
+				"geometry_name": {
+					"type": ["string", "null"],
+					"description": "Optional name/key of the input geometry (e.g. 'ethanol'). Used to name outputs.",
+					"default": null
+				},
+				"mode": { "type": "string", "enum": ["add", "remove"] },
+				"charge": { "type": "integer" },
+				"multiplicity": { "type": "integer", "minimum": 1 },
+				"site_spec": {
+				"type": ["object", "null"],
+				"additionalProperties": false,
+				"properties": {
+					"h_index": { "type": ["integer", "null"], "minimum": 0 },
+					"target_atom_index": { "type": ["integer", "null"], "minimum": 0 }
+				},
+				"required": ["h_index", "target_atom_index"]
+				},
+				"strategy": { "type": "string", "enum": ["auto", "distance", "candidates_only"] },
+				"max_hx_distance": { "type": ["number", "null"], "minimum": 0.5, "maximum": 2.5 },
+				"return_candidates": { "type": "boolean" },
+				"top_k_candidates": { "type": "integer", "minimum": 1, "maximum": 20 }
+			},
+			"required": [
+				"geometry_xyz","geometry_name","mode","charge","multiplicity","site_spec","strategy",
+				"max_hx_distance","return_candidates","top_k_candidates"
+			]
+			}
+		}
+	},
+    "opsin_parse_name": {
+        "type": "function",
+        "function": {
+            "name": "opsin_parse_name",
+            "description": "Resolve a chemical name via OPSIN web API (name->SMILES/InChI).",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]}}},
+    "pubchem_name_to_cid": {
+        "type": "function",
+        "function": {
+            "name": "pubchem_name_to_cid",
+            "description": "Resolve a chemical name via PubChem PUG-REST (name->CID).",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]}}},
+    "pubchem_cid_to_properties": {
+        "type": "function",
+        "function": {
+            "name": "pubchem_cid_to_properties",
+            "description": "Fetch basic identifiers/properties (SMILES/InChI/InChIKey/IUPACName) for a PubChem CID.",
+            "parameters": {
+                "type": "object",
+                "properties": {"cid": {"type": "integer"}},
+                "required": ["cid"]}}},
+    "pubchem_cid_to_sdf3d": {
+        "type": "function",
+        "function": {
+            "name": "pubchem_cid_to_sdf3d",
+            "description": "Fetch 3D SDF for a PubChem CID (record_type=3d).",
+            "parameters": {
+                "type": "object",
+                "properties": {"cid": {"type": "integer"}},
+                "required": ["cid"]}}},
+	"get_trivial_properties": {
+		"type": "function",
+		"function": {
+			"name": "get_trivial_properties",
+		"description": "Return simple properties (formula, molecular weight, point group symmetry) using cached identifiers/geometry in session state.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+				"name": { "type": "string", "description": "Optional: molecule name to use; otherwise uses current geometry." }
+			},
+			"required": []
+			}
+		}
+	}
+}

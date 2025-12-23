@@ -1,361 +1,275 @@
+# nbo_agent_repl.py
 import asyncio
 import json
 import os
 import sys
-from typing import Optional, Any, Dict
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional, Any, Dict
+import traceback
 
+from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
 from openai import OpenAI
-from dotenv import load_dotenv
 
-load_dotenv()  # load environment variables from .env
-import re
+from client_helpers import (
+    NEEDS_GEOM_SINGLE,
+    TOOLS_RETURNING_STRUCTURE,
+    load_xyz_as_geometry,
+    summarize_geometries_prompt,
+    #resolve_geometry_xyz,
+    geom_key_from_path,
+    name_to_geometry_xyz,
+    print_tool_output,
+    get_trivial_properties,
+    pubchem_get_basic_properties,
+    ALLOWED_STATE_KEYS,
+    state_update,
+    state_get_tool_args,
+    get_geometry_xyz_by_name,
+    _maybe_store_geometry_from_payload,
+    xyz_to_no_header,
+    _store_new_geometry,
+    print_session_state,
+    coerce_geometry_xyz,
+)
 
-# Very small keyword dictionaries; expand as needed.
-METHOD_KEYWORDS = {
-    "b3lyp": "B3LYP",
-    "pbe0": "PBE0",
-    "pbeh-3c": "PBEh-3c",
-    "tpssh": "TPSSh",
-    "bp86": "BP86",
-    "pw6b95-d3": "PW6B95-D3",
-}
-
-BASIS_KEYWORDS = {
-    "def2-svp": "def2-SVP",
-    "def2-tzvp": "def2-TZVP",
-    "def2-tzvpp": "def2-TZVPP",
-    "def2-qzvp": "def2-QZVP",
-}
-
-JOBTYPE_KEYWORDS = {
-    "opt": "opt",          # we tunnel this to job_type="opt"
-    "optimize": "opt",
-    "optimization": "opt",
-    "geometry optimization": "opt",
-}
-
-
-def extract_orca_hints(user_text: str) -> Dict[str, Any]:
-    """
-    Look for obvious ORCA-related keywords in the user's text:
-    - method (B3LYP, PBE0, ...)
-    - basis (def2-SVP, ...)
-    - job_type (opt vs sp)
-    Returns a dict of hints, e.g. {"method": "B3LYP", "basis": "def2-TZVP"}.
-    """
-    text = user_text.lower()
-    hints: Dict[str, Any] = {}
-
-    # Methods
-    for key, val in METHOD_KEYWORDS.items():
-        if re.search(rf"\b{re.escape(key)}\b", text):
-            hints["method"] = val
-            break  # prefer first match; you can change this if needed
-
-    # Basis sets
-    for key, val in BASIS_KEYWORDS.items():
-        if re.search(rf"\b{re.escape(key)}\b", text):
-            hints["basis"] = val
-            break
-
-    # Job type: if we see "opt" or similar, treat as optimization
-    for key, val in JOBTYPE_KEYWORDS.items():
-        if re.search(rf"\b{re.escape(key)}\b", text):
-            hints["job_type"] = "opt"
-            break
-
-    return hints
-
-@dataclass
-class SessionState:
-    files: Dict[str, str] = field(default_factory=dict)  # name -> local path
-    # named geometries (e.g. "initial", "opt", "ts1", etc.)
-    geometries: Dict[str, str] = field(default_factory=dict)
-    current_geom_name: Optional[str] = None
-
-    # cache some scalar properties
-    last_energy: Optional[float] = None
-    last_jobs: list[dict[str, Any]] = field(default_factory=list)
-
-def load_xyz_as_geometry(path: str) -> str:
-    """Load an XYZ file and return only the coordinate lines (no natoms/comment)."""
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        raw_lines = f.readlines()
-
-    raw_lines = [ln.rstrip("\n\r") for ln in raw_lines]
-    if not raw_lines:
-        raise ValueError(f"XYZ file {path!r} is empty")
-
-    # Try natoms on first token, even if there is a trailing comment
-    first_tokens = raw_lines[0].split()
-    natoms = None
-    if first_tokens:
-        try:
-            natoms = int(first_tokens[0])
-        except ValueError:
-            natoms = None
-
-    if natoms is not None and len(raw_lines) >= natoms + 2:
-        coord_lines = raw_lines[2 : 2 + natoms]
-    else:
-        coord_lines = [
-            ln
-            for ln in raw_lines
-            if ln.strip() and not ln.lstrip().startswith(("#", "!", "//"))
-        ]
-
-    if not coord_lines:
-        raise ValueError(f"No coordinate lines found in {path!r}")
-
-    return "\n".join(coord_lines)
-
+load_dotenv()
 
 SYSTEM_PROMPT = """
-You are an assistant that runs NBO (Natural Bond Orbital) calculations via an MCP tool called run_nbo_job.
+You are an assistant that runs NBO (Natural Bond Orbital) calculations via an MCP tool run_nbo_job, or solvation frequency calculation with run_solvator_cluster_thermo.
 
-- Use the tool to run at most one or two calculations for a given question.
+- If the user tell you not to call any tools, then use reasoning only.
+- Otherwise, use the tool to run some calculations for a given question.
 - If the user does not specify charge/multiplicity, you may assume charge = 0 and multiplicity = 1 unless there is a clear reason not to.
+- If no structure is explicitly provided by the user, the agent must obtain it via tools (PCP, file lookup, etc.) or ask the user for it.
 - Prefer B3LYP/def2-SVP, TightSCF, RIJCOSX+def2/J for typical ground-state jobs.
 - If the tool result shows an error or timeout, do NOT keep retrying; instead, explain the problem.
 - After a successful job, summarize the key NBO/NPA results clearly.
 - If a tool call fails (non-ok status or error text), do NOT say you will retry unless you actually make another tool call in this same turn. Prefer: explain the failure and show the likely fix.
+- If a tool requires a geometry, retrieve the value with corresponding name as the key, or use the content of current_geom.  
+
+STATE & DEFAULTS
+- The session has a state containing:
+  - current_geom (key of the active geometry)
+  - geometries[current_geom] = XYZ coordinates (no natoms/comment header)
+  - default_charge (int) and default_multiplicity (int)
+  - identifiers[name] (cid/smiles/inchi/inchikey) and cached_props (formula/mw/etc.)
+TOOL SEQUENCING POLICY
+- Avoid redundant state_update calls. Do not call state_update unless a user explicitly asks to change defaults, or a tool output requires updating defaults (charge/multiplicity).
+- When a tool returns new_charge/new_multiplicity, update the in-memory SessionState directly (no tool call needed).
+- For multi-step workflows (load → edit structure → compute):
+   1,run the structure/lookup tool (e.g., name_to_geometry_xyz)
+   2,run the structure edit tool (structure_add_remove_proton)
+   3,run the compute tool (run_solvator_cluster_thermo)
+- Never call state_update twice with the same values in a single turn.
+
+ARGUMENT RULES
+- Do NOT guess charge/multiplicity if state already has defaults.
+- If the user explicitly the name of structure, try to retrieve the structure from Sessionstate before use current_geom or call client tools.
+- If the user explicitly provides charge or multiplicity, use these parameters directly and bypass the default ones.
+- If the user does not provide them, use state defaults (default_charge/default_multiplicity).
+- Only call ORCA tools (run_opt_job/run_nbo_job/run_sp_energy) after you have a valid geometry in state
+  (current_geom exists and geometries[current_geom] is available).
+
+GEOMETRY RULES
+- If the user names a molecule but no geometry is loaded, first call name_to_geometry_xyz(name=...),
+  which should load geometry into state (or return not_found). If you do so, do not call state_update then.
+- If an optimization produces final_geometry_xyz, treat it as the new active geometry (current_geom="opt")
+  and preserve metadata linkages in geom_meta.
+
+LIMITS / EARLY EXIT
+- Avoid endless iterations: at most one ORCA job per round; stop and ask the user if repeated failures happen.
+
 """.strip()
 
-# JSON schema for the OpenAI tool corresponding to the MCP tool
-OPENAI_TOOLS = {
-    "run_opt_job": {
-        "type": "function",
-        "function": {
-            "name": "run_opt_job",
-            "description": "Optimize geometry with ORCA.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "geometry_name": {
-                        "type": "string",
-                        "description": "Name/key of a loaded geometry in session state (preferred).",
-                    },
-                    "geometry_xyz": {
-                        "type": "string",
-                        "description": "XYZ coords without natoms/comment header (optional; host can inject).",
-                    },
-                    "charge": {"type": "integer", "default": 0},
-                    "multiplicity": {"type": "integer", "default": 1},
-                    "method": {"type": "string", "default": "B3LYP"},
-                    "basis": {"type": "string", "default": "def2-SVP"},
-                    "use_ri": {"type": "boolean", "default": True},
-                    "scf_max_iter": {"type": "integer", "default": 150},
-                    "opt_max_iter": {"type": "integer", "default": 100},
-                    "wall_timeout_seconds": {"type": "integer", "default": 1800},
-                },
-                "required": [],  # <- IMPORTANT: allow omitting geometry_xyz
-            },
-        },
-    },
-
-    "run_nbo_job": {
-        "type": "function",
-        "function": {
-            "name": "run_nbo_job",
-            "description": "Run an ORCA NBO/NPA calculation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "geometry_name": {
-                        "type": "string",
-                        "description": "Name/key of a loaded geometry in session state (preferred).",
-                    },
-                    "geometry_xyz": {
-                        "type": "string",
-                        "description": "XYZ coords without natoms/comment header (optional; host can inject).",
-                    },
-                    "charge": {"type": "integer", "default": 0},
-                    "multiplicity": {"type": "integer", "default": 1},
-                    "method": {"type": "string", "default": "B3LYP"},
-                    "basis": {"type": "string", "default": "def2-SVP"},
-                    "job_type": {"type": "string", "enum": ["sp", "opt"], "default": "sp"},
-                    "use_ri": {"type": "boolean", "default": True},
-                    "scf_max_iter": {"type": "integer", "default": 150},
-                    "opt_max_iter": {"type": "integer", "default": 50},
-                    "wall_timeout_seconds": {"type": "integer", "default": 600},
-                },
-                "required": [],
-            },
-        },
-    },
-
-    "run_sp_energy": {
-        "type": "function",
-        "function": {
-            "name": "run_sp_energy",
-            "description": "Run a single-point energy calculation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "geometry_name": {"type": "string", "description": "Loaded geometry key (preferred)."},
-                    "geometry_xyz": {"type": "string", "description": "Optional; host can inject."},
-                    "charge": {"type": "integer", "default": 0},
-                    "multiplicity": {"type": "integer", "default": 1},
-                    "method": {"type": "string", "default": "B3LYP"},
-                    "basis": {"type": "string", "default": "def2-SVP"},
-                    "use_ri": {"type": "boolean", "default": True},
-                    "scf_max_iter": {"type": "integer", "default": 150},
-                    "wall_timeout_seconds": {"type": "integer", "default": 600},
-                },
-                "required": [],
-            },
-        },
-    },
+OPENAI_TOOLS = json.loads(Path("openai_tools.json").read_text(encoding="utf-8"))
+CLIENT_SIDE_TOOL_FUNCS = {
+    "name_to_geometry_xyz": name_to_geometry_xyz,
+    "pubchem_get_basic_properties": pubchem_get_basic_properties,
+    
+    "state_update": lambda **kw: state_update(state, **kw),          # not so useful: applicable only when data readily to be fill into the state
+    "state_get_tool_args": lambda **kw: state_get_tool_args(state, **kw),
+    #"pubchem_get_record_fields": pubchem_get_record_fields,
 }
+#CLIENT_SIDE_TOOL_FUNCS = {
+#}
+
+@dataclass
+class SessionState:
+    files: Dict[str, str] = field(default_factory=dict)        # key -> path
+    geometries: Dict[str, str] = field(default_factory=dict)   # key -> xyz(no header)
+    current_geom: Optional[str] = None
+    name_to_geom: Dict[str, str] = field(default_factory=dict)
+    identifiers: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # name -> {smiles,inchi,inchikey,cid,...}
+    geom_meta: Dict[str, Dict[str, Any]] = field(default_factory=dict)    # geom_key -> {name,cid,smiles,...}
+
+    cached_props: dict[str, dict] = field(default_factory=dict)  # key (name or cid) -> {formula,mw,dipole,homo,lumo,...}
+
+    last_tool_name: Optional[str] = None
+    last_tool_raw: Optional[str] = None
+    default_charge: int = 0
+    default_multiplicity: int = 1   # PubChem won't give multiplicity; keep 1 unless user says otherwise
 
 def tools_for_server(tool_names: list[str]) -> list[dict]:
-    """Return OpenAI tool schemas that are both defined in client and available on MCP server."""
-    out = []
-    for name in tool_names:
-        if name in OPENAI_TOOLS:
-            out.append(OPENAI_TOOLS[name])
-    return out
-
-NEEDS_GEOM = {"run_opt_job", "run_nbo_job", "run_sp_energy"}
-
-def summarize_geometries(state) -> str:
-    keys = list(state.geometries.keys())
-    if not keys:
-        return "No geometries are loaded."
-    cur = state.current_geom
-    lines = [f"Loaded geometries: {', '.join(keys)}."]
-    if cur:
-        lines.append(f"Current geometry: {cur!r}.")
-    lines.append("When calling tools, prefer passing geometry_name. You may omit geometry_xyz; the host will inject it.")
-    return "\n".join(lines)
-
-def resolve_geometry_xyz(state, args: dict) -> str | None:
-    # 1) explicit geometry_name
-    gname = args.pop("geometry_name", None)
-    if isinstance(gname, str) and gname in state.geometries:
-        return state.geometries[gname]
-
-    # 2) already provided geometry_xyz
-    gxyz = args.get("geometry_xyz", "")
-    if isinstance(gxyz, str) and gxyz.strip():
-        return gxyz
-
-    # 3) fallback to current geometry
-    if state.current_geom and state.current_geom in state.geometries:
-        return state.geometries[state.current_geom]
-
-    return None
+    return [OPENAI_TOOLS[name] for name in tool_names if name in OPENAI_TOOLS]
 
 async def handle_user_turn(session, client, state, user_text: str, server_tool_names: list[str]):
-    tools_for_this_call = [OPENAI_TOOLS[name] for name in server_tool_names if name in OPENAI_TOOLS]
+    # Merge: MCP tools + client-side tools, but only if schema exists in OPENAI_TOOLS
+    tool_names_for_model = [n for n in server_tool_names if n in OPENAI_TOOLS]
+    for n in CLIENT_SIDE_TOOL_FUNCS:
+        if n in OPENAI_TOOLS and n not in tool_names_for_model:
+            tool_names_for_model.append(n)
+
+    tools_for_this_call = [OPENAI_TOOLS[n] for n in tool_names_for_model]
 
     user_prompt = f"""
-{summarize_geometries(state)}
+{summarize_geometries_prompt(state)}
 
 User request:
 {user_text}
 """.strip()
 
-    first = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        tools=tools_for_this_call,
-        tool_choice="auto",
-    )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    msg = first.choices[0].message
-    if not msg.tool_calls:
-        print("\n[Model response]\n")
-        print(msg.content)
-        return
-
-    # Execute tool calls (supports multiple)
-    tool_messages = []
-    for tc in msg.tool_calls:
-        tool_name = tc.function.name
-        raw_args = tc.function.arguments
-        args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-
-        if tool_name in NEEDS_GEOM:
-            gxyz = resolve_geometry_xyz(state, args)
-            if not gxyz:
-                print("\n[Agent note] No geometry available. Please `load <file.xyz>` first.\n")
-                return
-            args["geometry_xyz"] = gxyz
-
-        # Call MCP
-        print("\n[Tool call]", tool_name)
-        for k, v in args.items():
-            if k == "geometry_xyz":
-                print("  geometry_xyz = <injected>")
-            else:
-                print(f"  {k} = {v!r}")
-        mcp_res = await session.call_tool(tool_name, args)
-
-        text = ""
-        for item in mcp_res.content:
-            if isinstance(item, TextContent):
-                text += item.text
-            else:
-                text += repr(item)
-        print("\n[Tool raw output]\n")
-        print(text[:4000])  # don’t spam; adjust size if you want
-        if len(text) > 4000:
-            print("\n...[truncated]...\n")
-        tool_messages.append(
-            {"role": "tool", "tool_call_id": tc.id, "name": tool_name, "content": text}
+    MAX_TOOL_ROUNDS = 4
+    for _round in range(MAX_TOOL_ROUNDS):
+        #print("TOOL NAMES FOR MODEL:", tool_names_for_model)
+        #print("TOOLS SENT:", [t["function"]["name"] for t in tools_for_this_call])
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=messages,
+            tools=tools_for_this_call,
+            tool_choice="auto",
         )
+        msg = resp.choices[0].message
+        messages.append(msg)
 
-        # Optional: if your opt tool returns final xyz in JSON, store it here.
-        # (Only if you’re returning JSON from tools.)
-        try:
-            payload = json.loads(text)
-            if tool_name == "run_opt_job" and payload.get("status") == "ok":
-                final_xyz = (payload.get("final_geometry_xyz") or "").strip()
-                if final_xyz:
-                    state.geometries["opt"] = final_xyz
-                    state.current_geom = "opt"
-        except Exception:
-            pass
+        # Done: model answered without tools
+        if not msg.tool_calls:
+            print("\n[Final]\n")
+            print(msg.content)
+            return
 
-    second = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-            msg,
-            *tool_messages,
-        ],
-    )
+        tool_messages = []
+        for tc in msg.tool_calls:
+            print("tool:", tc.function.name)
+            print("raw arguments type:", type(tc.function.arguments))
+            print("raw arguments:", tc.function.arguments)
+            tool_name = tc.function.name
+            raw_args = tc.function.arguments
+            args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
 
-    print("\n[Final]\n")
-    print(second.choices[0].message.content)
+            # ---- client-side tool ----
+            
+            if tool_name in CLIENT_SIDE_TOOL_FUNCS:
+                print("\n[Client tool call]", tool_name, args)
+                try:
+                    if tool_name == "get_trivial_properties":#not trivial, using pymatgen to find the symmetry with the structure
+                        out = get_trivial_properties(state, name=args.get("name"))
+                    else:
+                        out = CLIENT_SIDE_TOOL_FUNCS[tool_name](**args)
+                except Exception as e:
+                    out = {"status": "error", "tool": tool_name, "error": str(e)}
+                text = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+                
+                # If it produced geometry, store to state and set current
+                try:
+                    payload = json.loads(text)
+
+                    # existing behavior
+                    if tool_name == "run_opt_job" and payload.get("status") == "ok":
+                        final_xyz = (payload.get("final_geometry_xyz") or "").strip()
+                        if final_xyz:
+                            prev = state.current_geom
+                            state.geometries["opt"] = final_xyz
+                            if prev and prev in state.geom_meta:
+                                state.geom_meta["opt"] = dict(state.geom_meta[prev])
+                            state.current_geom = "opt"
+
+                    # NEW: generic “structure-like” geometry outputs from MCP tools
+                    if payload.get("status") == "ok":
+                        geom_out = (payload.get("xyz") or payload.get("geometry_xyz") or "").strip()
+                        if geom_out:
+                            prev = state.current_geom
+                            key_hint = payload.get("name") or payload.get("label") or tool_name
+                            new_key = _store_new_geometry(
+                                state,
+                                geom_out,
+                                key_hint=key_hint,
+                                carry_meta_from=prev,
+                                charge=payload.get("new_charge"),
+                                multiplicity=payload.get("new_multiplicity"),
+                            )
+                            print(f"[STATE] Stored MCP geometry as {new_key!r} and set current.")
+                except Exception:
+                    pass
+
+                tool_messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "name": tool_name, "content": text}
+                )
+                continue
+
+            # ---- MCP tool ----
+            if tool_name in NEEDS_GEOM_SINGLE:
+                '''gxyz = resolve_geometry_xyz(state, args)
+                if not gxyz:
+                    tool_messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "name": tool_name,
+                         "content": json.dumps({"status":"error","error":"No geometry loaded. Use `load <file.xyz>` or resolve a name first."})}
+                    )
+                    continue
+                args["geometry_xyz"] = gxyz'''
+                args["geometry_xyz"] = coerce_geometry_xyz(state, args)
+
+            print("\n[MCP tool call]", tool_name)
+            mcp_res = await session.call_tool(tool_name, args)
+
+            text = ""
+            for item in mcp_res.content:
+                text += item.text if isinstance(item, TextContent) else repr(item)
+            print_tool_output(text, limit=20000)
+
+            tool_messages.append(
+                {"role": "tool", "tool_call_id": tc.id, "name": tool_name, "content": text}
+            )
+
+            # Keep your existing opt -> state update
+            try:
+                payload = json.loads(text)
+                if tool_name in TOOLS_RETURNING_STRUCTURE and payload.get("status") == "ok":
+                    geom_out = (payload.get("geometry_xyz") or payload.get("final_geometry_xyz") or payload.get("xyz") or "").strip()
+                    print("geom_out:", geom_out)
+                    if geom_out:
+                        prev = state.current_geom
+                        key_hint = payload.get("name") or payload.get("label") or tool_name
+                        new_key = _store_new_geometry(state, geom_out, key_hint=key_hint, carry_meta_from=prev)
+                        if new_key:
+                            # update defaults if tool provides them
+                            if payload.get("new_charge") is not None:
+                                state.default_charge = int(payload["new_charge"])
+                            if payload.get("new_multiplicity") is not None:
+                                state.default_multiplicity = int(payload["new_multiplicity"])
+                            print(f"[STATE] Stored MCP geometry as {new_key!r} and set current.")
+            except Exception as e:
+                print("[STATE] postprocess failed:", repr(e))
+                traceback.print_exc()
+
+        messages.extend(tool_messages)
+
+    print("\n[Final]\nEarly exit: too many tool rounds. Please rephrase or provide missing info.")
+
 
 async def main():
-    # Optional: initial geometry from CLI argument
-    geometry_xyz: str | None = None
-    if len(sys.argv) >= 2:
-        initial_xyz = sys.argv[1]
-        if os.path.exists(initial_xyz):
-            geometry_xyz = load_xyz_as_geometry(initial_xyz)
-            print(f"Loaded initial geometry from {initial_xyz!r}")
-        else:
-            print(f"Warning: initial XYZ file {initial_xyz!r} not found.")
-
-    # --- Start MCP server (same config that worked in your simple client) ---
     server_params = StdioServerParameters(
         command="uv",
-        args=["run", "orca_nbo_server.py"],
-        env={
-            "PATH": "/Applications/ORCA:" + os.environ.get("PATH", ""),
-        },
+        args=["run", "orca_nbo_server_opi_with_solvator_thermo_debug.py"],
+        env={"PATH": "/Users/zhangruiqi/Library/orca_6_1_1:" + os.environ.get("PATH", "")},
     )
 
     client = OpenAI()
@@ -367,109 +281,29 @@ async def main():
             tools = await session.list_tools()
             tool_names = [t.name for t in tools.tools]
             print("MCP tools available:", tool_names)
-            if "run_nbo_job" not in tool_names:
-                print("ERROR: run_nbo_job not exposed by MCP server.")
-                return
 
-            print(
-                "\nInteractive NBO agent ready.\n"
-                "Commands:\n"
-                "  load <file.xyz>   - load or change the current geometry\n"
-                "  quit / exit       - stop\n"
-                "  state / status    - show current state"
-                "  geoms / geometries- show current geometry files"
-                "  show xx           - show file content"
-                "Anything else       - natural language question (may trigger NBO run)\n"
-            )
-
-            # Interactive loop
-                        # Interactive loop
             while True:
-                try:
-                    line = input("> ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print("\nExiting.")
-                    break
-
+                line = input("> ").strip()
                 if not line:
                     continue
-
-                # Explicit quit
                 if line.lower() in {"quit", "exit"}:
-                    print("Bye.")
                     break
 
-                # Explicit load command still works
                 if line.lower().startswith("load "):
                     path = line.split(maxsplit=1)[1]
-                    if not os.path.exists(path):
-                        print(f"File not found: {path}")
-                        continue
-                    try:
-                        geometry_xyz = load_xyz_as_geometry(path)
-                        state.files["test_1.xyz"] = path
-                        state.geometries["test_1.xyz"] = geometry_xyz
-                        state.current_geom = "test_1.xyz"
-                        print(f"Loaded geometry from {path!r}")
-                    except Exception as e:
-                        print(f"Failed to load {path!r}: {e}")
-                    continue
-                if line.lower() in {"state", "status"}:
-                    print("\n[STATE]")
-                    print("  current_geom:", state.current_geom)
-                    print("  geometries:", list(state.geometries.keys()))
-                    print("  files:", getattr(state, "files", {}))
-                    print("  tasks:", [(t.id, t.kind, t.subtype, t.status) for t in getattr(state, "tasks", [])])
-                    print()
+                    geometry_xyz = load_xyz_as_geometry(path)
+                    key = geom_key_from_path(path)
+                    state.files[key] = path
+                    state.geometries[key] = geometry_xyz
+                    state.current_geom = key
+                    print(f"Loaded geometry from {path!r} as {key!r}")
                     continue
 
-                if line.lower() in {"geoms", "geometries"}:
-                    print("\n[GEOMETRIES]")
-                    for k in state.geometries.keys():
-                        mark = " (current)" if k == state.current_geom else ""
-                        print(f"  - {k}{mark}")
-                    print()
+                if line.strip().lower() == "state":
+                    print_session_state(state, preview_lines=6, show_full_current=True, max_full_lines=None)
                     continue
-                if line.lower().startswith("show "):
-                    name = line.split(maxsplit=1)[1].strip()
-                    if name == "current":
-                        name = state.current_geom
-                    if not name or name not in state.geometries:
-                        print(f"Unknown geometry: {name!r}. Available: {list(state.geometries.keys())}")
-                        continue
-                    print(f"\n[GEOMETRY {name}]\n{state.geometries[name]}\n")
-                    continue
-                # NEW: auto-detect .xyz path in a normal sentence
-                # e.g. "run NBO on ./geom/fe.xyz with charge 2"
-                tokens = line.split()
-                xyz_path = None
-                for tok in tokens:
-                    # crude but effective: token ending in .xyz that exists
-                    if tok.endswith(".xyz") and os.path.exists(tok):
-                        xyz_path = tok
-                if xyz_path is not None:
-                    try:
-                        geometry_xyz = load_xyz_as_geometry(xyz_path)
-                        state.files["test_1.xyz"] = path
-                        state.geometries["test_1.xyz"] = geometry_xyz
-                        state.current_geom = "test_1.xyz"
-                        print(f"Loaded geometry from {xyz_path!r}")
-                    except Exception as e:
-                        print(f"Failed to load {xyz_path!r}: {e}")
-                        # keep going, but don't try to run NBO
-                        continue
 
-                    # Remove the path token from the user text before sending to the LLM
-                    tokens = [t for t in tokens if t != xyz_path]
-                    line = " ".join(tokens).strip()
-                    if not line:
-                        # user only gave a path, no question → just update geometry and wait
-                        continue
-
-                # Normal question turn (may trigger a tool call)
                 await handle_user_turn(session, client, state, line, tool_names)
-
-
 
 if __name__ == "__main__":
     asyncio.run(main())
