@@ -448,6 +448,8 @@ async def run_solvator_cluster_thermo(
                 "G_eh": extract_gibbs_free_energy(out_text),
                 "thermo_tail": "\n".join(out_text.splitlines()[-120:]),
                 "solvator": solv_result,
+                "product": ("E_eh", "H_eh", "G_eh")
+                
             }
         )
     except Exception as e:
@@ -496,6 +498,7 @@ async def run_solvator_cluster_thermo(
             "thermo_label": thermo_label,
             "solvator": solv_result,
             "text": f"Status: OK\nE={E} Eh\nH={H} Eh\nG={G} Eh",
+            "product": ("G_eh")
         }
     )
 
@@ -712,7 +715,9 @@ async def run_nbo_job(
             "label": job_label,
             "energy": energy,
             "nbo_section": nbo_section,
-            "text": "Status: OK\n=== NBO / NPA Section (excerpt) ===\n" + nbo_section,
+            "text": "Status: OK\n=== NBO / NPA Section (excerpt) ===\n" + nbo_section, 
+            "product": ("energy", "nbo_section")
+            
         }
     )
 
@@ -772,7 +777,7 @@ async def run_sp_energy(
         return json.dumps({"status": "error", "label": job_label, "tail": "\n".join(out_text.splitlines()[-120:])})
 
     energy = extract_total_energy(out_text)
-    return json.dumps({"status": "ok", "label": job_label, "energy": energy})
+    return json.dumps({"status": "ok", "label": job_label, "energy": energy, "product": "energy"})
 '''
 @mcp.tool()
 async def run_solvator_cluster(

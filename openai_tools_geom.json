@@ -61,16 +61,7 @@
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "geometry_name": {
-                        "type": "string",
-                        "description": "Name/key of a loaded geometry in session state (preferred)."
-					},
-                    "geometry_xyz": {
-                        "type": "string",
-                        "description": "XYZ coords without natoms/comment header (optional; host can inject)."
-                    },
-                    "charge": {"type": "integer", "default": 0},
-                    "multiplicity": {"type": "integer", "default": 1},
+                    "input_geom_id": { "type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from." },
                     "method": {"type": "string", "default": "B3LYP"},
                     "basis": {"type": "string", "default": "def2-SVP"},
                     "use_ri": {"type": "boolean", "default": true},
@@ -78,7 +69,7 @@
                     "opt_max_iter": {"type": "integer", "default": 100},
                     "wall_timeout_seconds": {"type": "integer", "default": 1800}
                 },
-                "required": []}
+                "required": ["input_geom_id"]}
         }
     },
 
@@ -90,14 +81,7 @@
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "geometry_name": {
-                        "type": "string",
-                        "description": "Name/key of a loaded geometry in session state (preferred)."},
-                    "geometry_xyz": {
-                        "type": "string",
-                        "description": "XYZ coords without natoms/comment header (optional; host can inject)."},
-                    "charge": {"type": "integer", "default": 0},
-                    "multiplicity": {"type": "integer", "default": 1},
+                    "input_geom_id": { "type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from." },
                     "method": {"type": "string", "default": "B3LYP"},
                     "basis": {"type": "string", "default": "def2-SVP"},
                     "job_type": {"type": "string", "enum": ["sp", "opt"], "default": "sp"},
@@ -105,7 +89,7 @@
                     "scf_max_iter": {"type": "integer", "default": 150},
                     "opt_max_iter": {"type": "integer", "default": 50},
                     "wall_timeout_seconds": {"type": "integer", "default": 600}},
-                "required": []}}},
+                "required": ["input_geom_id"]}}},
 
     "run_sp_energy": {
         "type": "function",
@@ -115,16 +99,13 @@
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "geometry_name": {"type": "string", "description": "Loaded geometry key (preferred)."},
-                    "geometry_xyz": {"type": "string", "description": "Optional; host can inject."},
-                    "charge": {"type": "integer", "default": 0},
-                    "multiplicity": {"type": "integer", "default": 1},
+                    "input_geom_id": { "type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from." },
                     "method": {"type": "string", "default": "B3LYP"},
                     "basis": {"type": "string", "default": "def2-SVP"},
                     "use_ri": {"type": "boolean", "default": true},
                     "scf_max_iter": {"type": "integer", "default": 150},
                     "wall_timeout_seconds": {"type": "integer", "default": 600}},
-                "required": []}}},
+                "required": ["input_geom_id"]}}},
     "build_reaction_coordinate_scan": {
         "type": "function",
         "function": {
@@ -176,20 +157,7 @@
 			"parameters": {
 			"type": "object",
 			"properties": {
-				"geometry_xyz": {
-				"type": "string",
-				"description": "Solute XYZ coordinates without natoms/comment header. Normally injected by the host via state_get_tool_args."
-				},
-				"charge": {
-				"type": "integer",
-				"description": "Total solute charge.",
-				"default": 0
-				},
-				"multiplicity": {
-				"type": "integer",
-				"description": "Spin multiplicity of the solute.",
-				"default": 1
-				},
+				"input_geom_id": { "type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from." },
 				"nsolv": {
 				"type": "integer",
 				"description": "Number of water molecules to add around the solute.",
@@ -205,7 +173,7 @@
 				"description": "Optional label for this SOLVATOR job. If omitted, the server will generate one."
 				}
 			},
-			"required": []
+			"required": ["input_geom_id"]
 			}
 		}
 	},
@@ -249,54 +217,23 @@
 			}
 		}
 	},
-    "opsin_parse_name": {
-        "type": "function",
-        "function": {
-            "name": "opsin_parse_name",
-            "description": "Resolve a chemical name via OPSIN web API (name->SMILES/InChI).",
-            "parameters": {
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"]}}},
-    "pubchem_name_to_cid": {
-        "type": "function",
-        "function": {
-            "name": "pubchem_name_to_cid",
-            "description": "Resolve a chemical name via PubChem PUG-REST (name->CID).",
-            "parameters": {
-                "type": "object",
-                "properties": {"name": {"type": "string"}},
-                "required": ["name"]}}},
-    "pubchem_cid_to_properties": {
-        "type": "function",
-        "function": {
-            "name": "pubchem_cid_to_properties",
-            "description": "Fetch basic identifiers/properties (SMILES/InChI/InChIKey/IUPACName) for a PubChem CID.",
-            "parameters": {
-                "type": "object",
-                "properties": {"cid": {"type": "integer"}},
-                "required": ["cid"]}}},
-    "pubchem_cid_to_sdf3d": {
-        "type": "function",
-        "function": {
-            "name": "pubchem_cid_to_sdf3d",
-            "description": "Fetch 3D SDF for a PubChem CID (record_type=3d).",
-            "parameters": {
-                "type": "object",
-                "properties": {"cid": {"type": "integer"}},
-                "required": ["cid"]}}},
-	"get_trivial_properties": {
+	"geom_update":{
 		"type": "function",
 		"function": {
-			"name": "get_trivial_properties",
-		"description": "Return simple properties (formula, molecular weight, point group symmetry) using cached identifiers/geometry in session state.",
+			"name": "geom_update",
+			"description": "Update geometry metadata/electronic state (rename, add alias, set charge/multiplicity) and optionally set it as current.",
 			"parameters": {
-				"type": "object",
-				"properties": {
-				"name": { "type": "string", "description": "Optional: molecule name to use; otherwise uses current geometry." }
-			},
-			"required": []
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"ref": { "type": "string", "description": "Geometry id or alias/name. If omitted, uses current." },
+				"name": { "type": "string", "description": "Rename geometry (also becomes an alias)." },
+				"add_alias": { "type": "string", "description": "Add an additional alias." },
+				"charge": { "type": "integer", "description": "Set total charge." },
+				"multiplicity": { "type": "integer", "description": "Set spin multiplicity." },
+				"set_current": { "type": "boolean", "description": "If true, set this geometry as current.", "default": true }
+			}
 			}
 		}
-	}
+		}
 }

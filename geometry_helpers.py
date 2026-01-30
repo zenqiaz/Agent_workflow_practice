@@ -242,17 +242,13 @@ def structure_proton_edit(
         # inside structure_proton_edit result:
         return {
             "status": "ok",
-            "geometry_xyz": xyz_to_no_header(full_xyz_string),
+            "mode": "add",
+            "xyz": format_xyz(atoms2, coords2, comment="protonated"),
             "provenance": {"geometry": "proton_edit"},
-            "edit": {
-                "mode": mode,
-                "reason": reason,
-                "chosen_site": {...},
-                "old_charge": charge,
-                "new_charge": new_charge,
-                "old_multiplicity": multiplicity,
-                "new_multiplicity": multiplicity,
-            }
+            "old_charge": charge,
+            "new_charge": charge - 1,
+            "old_multiplicity": multiplicity,
+            "new_multiplicity": multiplicity,
         }
 
     raise ValueError(f"Unknown mode: {mode}")
