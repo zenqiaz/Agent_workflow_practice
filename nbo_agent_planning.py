@@ -43,6 +43,7 @@ from client_helpers import (
     #run_plan_deterministically,
     run_tool_node,
     make_run_llm_node,
+    result_dict_to_prompt,
 )
 from build_graph_from_plan import build_graph_from_plan, build_state
 
@@ -59,7 +60,7 @@ Mission
 - Assume all required QC tools exist (geometry loading, ORCA OPI jobs, solvator/microsolvation, parsing, analysis, database I/O).
 - Assume facts, constants and other resourses can be retrieved via agent skill
 - Do NOT execute tools. Do NOT fabricate numerical results. Do NOT ask the user to run commands.
-- Your output MUST be a single valid JSON object and nothing else.
+- Your output MUST be a single valid JSON object and nothing else. User input must be copied into the plan.
 
 Operating model (control room vs assembly line)
 - The workflow should run mostly without LLM intervention once determined.
@@ -128,6 +129,7 @@ Constraints
 Workflow JSON output contract (MUST follow, if the domain is not needed in this plan, let it be empty rather than delete it. Not necessarily to contain all kinds of nodes in the plan.)
 Output a single JSON object with these top-level keys:
 {
+  "user_text": "Please first optimize the geometry of this molecule and calculate frequency and SP energy."
   "name": "Example: DFT opt + freq + SP (GeometryRegistry-based)",
   "version": "1.3",
   "geom_ids": ["the_molecule"],
@@ -280,6 +282,13 @@ Output constraints
 
 """.strip()
 
+REPORTER_SYSTEM_PROMPT = """You are a workflow reporter.
+Write a concise, factual markdown report of the run result.
+- Highlight key numeric results (energies, ΔG, frequencies) with units.
+- Mention failures/errors clearly and suggest next debugging step.
+- Do not invent values not present in the input.
+"""
+
 OPENAI_TOOLS = json.loads(Path("openai_tools_geom.json").read_text(encoding="utf-8"))
 CLIENT_SIDE_TOOL_FUNCS = {
     "name_to_geometry_xyz": name_to_geometry_xyz,
@@ -309,8 +318,9 @@ class AgentState(TypedDict, total=False):
     plans: Dict[str, Dict[str, Any]]      # plan_name -> plan_pkg
     last_run_id: Optional[str]
     runs: List[Dict[str, Any]]
+    last_user_text: str
 
-    # -------- execution / graph bookkeeping --------
+    # -------- execution / graph bookkeeping not used--------
     run_log: List[Dict[str, Any]]
     last_status: str
     last_tool_result: Dict[str, Any]
@@ -353,6 +363,7 @@ User request:
     {"role": "system", "content": "WORKFLOW_STATE:\n" + summarize_workflow_state(state)},
     {"role": "user", "content": user_text},
     ]
+    state["last_user_text"] = user_text
 
     MAX_TOOL_ROUNDS = 4
     for _round in range(MAX_TOOL_ROUNDS):
@@ -486,7 +497,22 @@ async def main():
                     },client_side_tools=CLIENT_SIDE_TOOL_FUNCS)
                     result = await graph.ainvoke(init_state)   # or graph.invoke(...)
                     print("Done:", result.get("status", "unknown"))
-                    pprint(result["artifacts"])
+                    pprint(result.get("artifacts"))
+                    user_payload = (
+                        f"Original user request:\n{state.get('last_user_text','(not provided)')}\n\n"
+                        f"Run result:\n{result_dict_to_prompt(result=result, user_text=state.get('last_user_text'))}"
+                    )
+                    report_messages = [
+                        {"role": "system", "content": REPORTER_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_payload},
+                    ]
+                    
+                    resp = client.chat.completions.create(
+                        model="gpt-4.1-mini",
+                        messages=report_messages,
+                    )
+                    msg = resp.choices[0].message
+                    print(msg.content)
                     #print(json.dumps(result, ensure_ascii=False, indent=2))
                     continue
                 

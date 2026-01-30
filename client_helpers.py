@@ -2004,3 +2004,225 @@ def make_run_llm_node(
             return {"status": "error", "error": "executor returned non-dict"}
         return {"status": "ok", **node_run}
     return run_llm_node
+
+def _latest_node_id_from_run_log(run_log: Any) -> Optional[str]:
+    if not isinstance(run_log, list) or not run_log:
+        return None
+    last = run_log[-1]
+    if isinstance(last, dict):
+        node = last.get("node")
+        if isinstance(node, str) and node:
+            return node
+    return None
+
+
+def _extract_geom_snapshot_from_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort: build a minimal geometry-registry-like dict for formatting."""
+    # Case A: result is a full executor state.
+    if isinstance(result.get("geometries"), dict):
+        return {
+            "geometries": result.get("geometries") or {},
+            "geom_meta": result.get("geom_meta") or {},
+            "name_to_geom": result.get("name_to_geom") or {},
+            "current_geom": result.get("current_geom"),
+            "default_charge": result.get("default_charge", 0),
+            "default_multiplicity": result.get("default_multiplicity", 1),
+        }
+
+    # Case B: result is the orchestrator payload with embedded runtime_report.
+    rr = result.get("runtime_report")
+    if not isinstance(rr, dict):
+        return {}
+
+    tail = rr.get("node_results_tail")
+    if not isinstance(tail, dict) or not tail:
+        return {}
+
+    # Prefer the node that ran last.
+    last_node = _latest_node_id_from_run_log(rr.get("run_log"))
+    snap = tail.get(last_node) if (last_node and isinstance(tail.get(last_node), dict)) else None
+    if snap is None:
+        # Fall back to any available snapshot.
+        for _k in reversed(list(tail.keys())):
+            v = tail.get(_k)
+            if isinstance(v, dict):
+                snap = v
+                break
+    if not isinstance(snap, dict):
+        return {}
+
+    return {
+        "geometries": snap.get("geometries") or {},
+        "geom_meta": snap.get("geom_meta") or {},
+        "name_to_geom": snap.get("name_to_geom") or {},
+        "current_geom": snap.get("current_geom"),
+        "default_charge": 0,
+        "default_multiplicity": 1,
+    }
+
+
+def _extract_plan_brief_from_result(result: Dict[str, Any], max_nodes: int = 30) -> Dict[str, Any]:
+    rr = result.get("runtime_report")
+    plan = None
+    if isinstance(rr, dict) and isinstance(rr.get("plan"), dict):
+        plan = rr.get("plan")
+    elif isinstance(result.get("plan"), dict):
+        plan = result.get("plan")
+
+    if not isinstance(plan, dict):
+        return {}
+
+    nodes = plan.get("nodes")
+    nodes_brief = []
+    if isinstance(nodes, list):
+        for n in nodes[:max_nodes]:
+            if not isinstance(n, dict):
+                continue
+            nodes_brief.append(
+                {
+                    "id": n.get("id"),
+                    "kind": n.get("kind"),
+                    "tool": n.get("tool"),
+                    "task": n.get("task"),
+                    "input_id": n.get("input_id"),
+                    "output_id": n.get("output_id"),
+                }
+            )
+
+    out = {
+        "name": plan.get("name") or plan.get("title"),
+        "version": plan.get("version"),
+        "geom_ids": plan.get("geom_ids"),
+        "artifacts_to_save": plan.get("artifacts_to_save"),
+        "nodes": nodes_brief,
+    }
+    if isinstance(nodes, list) and len(nodes) > max_nodes:
+        out["nodes_truncated"] = len(nodes) - max_nodes
+    return out
+
+
+def _extract_artifacts_from_result(result: Dict[str, Any], artifact_keys_hint: Optional[List[str]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+
+    # If this is a full executor state, artifacts live under result["artifacts"].
+    if isinstance(result.get("artifacts"), dict):
+        out.update(result.get("artifacts") or {})
+
+    # Orchestrator payloads often lift key artifacts to the top-level.
+    keys: List[str] = []
+    if artifact_keys_hint:
+        keys.extend([k for k in artifact_keys_hint if isinstance(k, str)])
+
+    rr = result.get("runtime_report")
+    if isinstance(rr, dict):
+        summ = rr.get("summary")
+        if isinstance(summ, dict) and isinstance(summ.get("artifact_keys"), list):
+            keys.extend([k for k in summ.get("artifact_keys") if isinstance(k, str)])
+        plan = rr.get("plan")
+        if isinstance(plan, dict) and isinstance(plan.get("artifacts_to_save"), list):
+            keys.extend([k for k in plan.get("artifacts_to_save") if isinstance(k, str)])
+
+    # Deduplicate while preserving order.
+    seen = set()
+    keys = [k for k in keys if not (k in seen or seen.add(k))]
+
+    for k in keys:
+        if k in out:
+            continue
+        if k in result:
+            out[k] = result.get(k)
+
+    return out
+
+
+def result_dict_to_prompt(
+    result: Dict[str, Any],
+    *,
+    user_text: Optional[str] = None,
+    max_chars: int = 8000,
+    include_run_log_tail: int = 20,
+) -> str:
+    """Convert a LangGraph/orchestrator result dict to a compact LLM-ready prompt."""
+    if not isinstance(result, dict):
+        return f"<non-dict result: {type(result).__name__}>"
+
+    rr = result.get("runtime_report") if isinstance(result.get("runtime_report"), dict) else {}
+    status = None
+    if isinstance(rr, dict):
+        status = rr.get("final_status")
+        if not status and isinstance(rr.get("final_report"), dict):
+            status = rr.get("final_report", {}).get("status")
+    if not status:
+        status = result.get("last_status") or result.get("status")
+
+    run_id = rr.get("run_id") if isinstance(rr, dict) else result.get("run_id")
+    started = rr.get("run_started_utc") if isinstance(rr, dict) else result.get("run_started_utc")
+    finished = rr.get("run_finished_utc") if isinstance(rr, dict) else result.get("run_finished_utc")
+
+    plan_brief = _extract_plan_brief_from_result(result)
+    artifacts = _extract_artifacts_from_result(result)
+
+    geom_state = _extract_geom_snapshot_from_result(result)
+    geom_summary = summarize_geometries_prompt(geom_state) if geom_state else "No geometries found in result."
+
+    # run_log tail
+    run_log_tail = []
+    if isinstance(rr, dict) and isinstance(rr.get("run_log"), list):
+        run_log_tail = rr.get("run_log")[-include_run_log_tail:]
+    elif isinstance(result.get("run_log"), list):
+        run_log_tail = result.get("run_log")[-include_run_log_tail:]
+
+    # Paths (if present)
+    report_json = result.get("runtime_report_json_path")
+    report_md = result.get("runtime_report_md_path")
+
+    blocks: List[str] = []
+    if user_text:
+        blocks.append("User request:\n" + str(user_text).strip())
+    blocks.append(f"Workflow status: {status}")
+    if run_id:
+        blocks.append(f"Run id: {run_id}")
+    if started:
+        blocks.append(f"Run started (UTC): {started}")
+    if finished:
+        blocks.append(f"Run finished (UTC): {finished}")
+    if report_json or report_md:
+        blocks.append(
+            "Saved reports:\n"
+            + (f"- JSON: {report_json}\n" if report_json else "")
+            + (f"- MD: {report_md}" if report_md else "")
+        )
+
+    if plan_brief:
+        blocks.append("Plan (brief):\n```json\n" + json.dumps(plan_brief, ensure_ascii=False, indent=2) + "\n```")
+
+    if artifacts:
+        blocks.append("Artifacts (key outputs):\n```json\n" + json.dumps(artifacts, ensure_ascii=False, indent=2) + "\n```")
+
+    blocks.append("Geometries:\n" + geom_summary)
+
+    if run_log_tail:
+        blocks.append("Run log (tail):\n```json\n" + json.dumps(run_log_tail, ensure_ascii=False, indent=2) + "\n```")
+
+    prompt = "\n\n".join(blocks).strip() + "\n"
+    if len(prompt) > max_chars:
+        prompt = prompt[:max_chars] + "\n...<truncated>...\n"
+    return prompt
+
+
+def print_result_prompt(
+    result: Dict[str, Any],
+    *,
+    user_text: Optional[str] = None,
+    max_chars: int = 8000,
+    include_run_log_tail: int = 20,
+) -> str:
+    """Build prompt with result_dict_to_prompt and print it. Returns the prompt string."""
+    prompt = result_dict_to_prompt(
+        result,
+        user_text=user_text,
+        max_chars=max_chars,
+        include_run_log_tail=include_run_log_tail,
+    )
+    print(prompt)
+    return prompt
