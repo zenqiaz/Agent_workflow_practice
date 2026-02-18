@@ -30,7 +30,7 @@ def _state_get_dict(state: Any, key: str) -> Dict[str, Any]:
     v = _state_get(state, key, {})
     return v if isinstance(v, dict) else {}
 
-NEEDS_GEOM_SINGLE = {'run_solvator_cluster_thermo', 'run_opt_job', 'run_nbo_job', 'run_sp_energy', 'run_solvator_cluster', 'structure_add_remove_proton'}
+NEEDS_GEOM_SINGLE = {'run_solvator_cluster_thermo', 'run_opt_job', 'run_nbo_job', 'run_sp_energy', 'run_freq_job', 'run_solvator_cluster', 'structure_add_remove_proton'}
 
 TOOLS_RETURNING_STRUCTURE = {
     "name_to_geometry_xyz",
@@ -988,6 +988,17 @@ def _maybe_store_geometry_from_payload(
         meta_extra = product.get("meta")
 
     meta_extra_dict = meta_extra if isinstance(meta_extra, dict) else None
+
+    # Inherit charge/multiplicity from input geometry when payload doesn't provide them.
+    if (charge is None or multiplicity is None) and input_geom_id:
+        try:
+            in_chg, in_mult = reg.get_charge_mult(str(input_geom_id))
+            if charge is None and in_chg is not None:
+                charge = in_chg
+            if multiplicity is None and in_mult is not None:
+                multiplicity = in_mult
+        except Exception:
+            pass
 
     # Decide write target.
     if new_geometry:
@@ -1948,27 +1959,7 @@ def persist_node_outputs(state: Dict[str, Any], node_id: str, node_spec: Dict[st
             for art_name, result_key in produces.items():
                 if isinstance(result_key, str) and result_key in last_payload:
                     state["artifacts"][art_name] = last_payload[result_key]
-'''
-async def run_plan_deterministically(
-    plan: Dict[str, Any],
-    *,
-    state: Dict[str, Any],
-    run_tool_node,   # async callable: (state, node_spec) -> dict
-    run_llm_node=None,  # optional
-) -> Dict[str, Any]:
-    """
-    Runs the plan and returns the final_report dict (also stored in state["result"]).
-    """
-    graph = build_graph_from_plan(
-        plan=plan,
-        run_tool_node=run_tool_node,
-        run_llm_node=run_llm_node,
-        # if your builder still requires call_tool/get_tool_args/call_llm_task, pass dummies
-    )
-    out_state = await graph.ainvoke(state)
-    return out_state.get("result") or out_state.get("final_report") or {}
 
-'''
 
 def make_run_llm_node(
     *,

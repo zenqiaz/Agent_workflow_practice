@@ -10,6 +10,7 @@ import json
 import time
 from datetime import datetime, timezone
 from orchestrator_reporter import report_bug_and_persist, report_runtime_and_persist
+from prompts import CALCULATOR_SYSTEM_PROMPT
 from typing import Tuple
 
 class State(TypedDict, total=False):
@@ -168,10 +169,9 @@ def compile_expr(expr: str) -> Callable[[Dict[str, float]], float]:
 def build_graph_from_plan(
     plan: Dict[str, Any],
     call_tool: Optional[ToolCaller] = None,
-    call_llm_task: Optional[LLMCaller] = None,
     get_tool_args: Optional[Callable[[Any, str, Dict[str, Any]], Dict[str, Any]]] = None,
     run_tool_node: Optional[ToolNodeRunner | AsyncToolNodeRunner] = None,
-    run_llm_node: Optional[ToolNodeRunner | AsyncToolNodeRunner] = None,
+    openai_client: Optional[Any] = None,
 ):
     plan_nodes: List[Dict[str, Any]] = plan.get("nodes") or []
     if not plan_nodes:
@@ -262,13 +262,16 @@ def build_graph_from_plan(
         result = result.get("last_tool_result")
         upd["node_results"] = node_results
 
+        if result is None:
+            return upd
+
         artifacts = dict(state.get("artifacts", {}))
 
         # Convention: tools may return a primary output via a "product" field.
         # Example: {"status":"ok","product":"energy","energy":-76.32,...}
         product = result.get("product")#product key of result dict
         product_spec = spec.get("product") or {}# artifact key to store the product
-        #print("product:", product,"result:", result, "product_spec:",product_spec)
+        print("product:", product,"result:", result, "product_spec:",product_spec)
         if isinstance(product_spec, dict):
             for out_key, src in product_spec.items():
                 v = _get_by_path(result, product)
@@ -276,7 +279,7 @@ def build_graph_from_plan(
                     artifacts[out_key] = v
 
         upd["artifacts"] = artifacts
-        #print("artifacts:", artifacts)
+        print("artifacts:", artifacts)
         return upd
     
     def _set_by_path_root_update(state: State, path: str, value: Any) -> Dict[str, Any]:
@@ -423,21 +426,67 @@ def build_graph_from_plan(
                         updates.update(_stash_artifacts(node_id, spec, result, state))
                 elif kind == "llm":
                     task = spec.get("task") or spec.get("pattern") or "llm_task"
-                    if run_llm_node is not None:
-                        node_spec = dict(spec)
-                        node_spec["id"] = node_id
-                        out = await _maybe_await(run_llm_node(state, node_spec))
-                        if not isinstance(out, dict):
-                            out = {"status": "error", "error": "llm node runner returned non-dict"}
+                    prompt = spec.get("prompt") or task
+                    needs_artifacts = spec.get("needs_artifacts") or []
+
+                    if openai_client is None:
+                        out = {"status": "error", "error": "no openai_client provided for llm node"}
                     else:
-                        out = call_llm_task(task, state, spec) or {}
+                        # Gather requested artifacts from state
+                        artifacts = state.get("artifacts") or {}
+                        gathered = {}
+                        missing = []
+                        for key in needs_artifacts:
+                            val = artifacts.get(key)
+                            if val is None:
+                                missing.append(key)
+                            else:
+                                gathered[key] = val
+
+                        if missing:
+                            out = {"status": "error", "error": f"missing artifacts: {missing}"}
+                        else:
+                            # Build context for the calculator LLM
+                            plan_settings = plan.get("settings") or {}
+                            user_content = (
+                                f"Task: {prompt}\n\n"
+                                f"Artifacts:\n{json.dumps(gathered, indent=2)}\n\n"
+                                f"Plan settings:\n{json.dumps(plan_settings, indent=2)}"
+                            )
+                            messages = [
+                                {"role": "system", "content": CALCULATOR_SYSTEM_PROMPT},
+                                {"role": "user", "content": user_content},
+                            ]
+
+                            try:
+                                resp = openai_client.chat.completions.create(
+                                    model="gpt-4.1-mini",
+                                    messages=messages,
+                                )
+                                raw = (resp.choices[0].message.content or "").strip()
+                                out = json.loads(raw)
+                                if not isinstance(out, dict):
+                                    out = {"status": "error", "error": "LLM returned non-dict JSON", "raw": raw}
+                            except json.JSONDecodeError:
+                                out = {"status": "error", "error": "LLM returned non-JSON", "raw": raw}
+                            except Exception as e:
+                                out = {"status": "error", "error": str(e)}
 
                     status = out.get("status", "ok")
 
                     ended_utc = datetime.now(timezone.utc).isoformat()
                     duration_ms = int((time.perf_counter() - t0) * 1000)
 
+                    # Store LLM output as last_tool_result so _stash_artifacts can read product
+                    out_with_meta = dict(out)
+                    out_with_meta.setdefault("task", task)
+
+                    node_results = dict(state.get("node_results") or {})
+                    node_results[node_id] = out_with_meta
+                    updates["node_results"] = node_results
+
                     updates["last_status"] = status
+                    updates["last_tool_result"] = out_with_meta
                     updates["run_log"] = state.get("run_log", []) + [{
                         "node": node_id,
                         "kind": kind,
@@ -447,8 +496,21 @@ def build_graph_from_plan(
                         "ended_utc": ended_utc,
                         "duration_ms": duration_ms,
                     }]
-                    if isinstance(out, dict):
-                        updates.update(_stash_artifacts(node_id, spec, result, state))
+
+                    # Stash artifacts from LLM output via product spec
+                    # LLM may return values at top level or nested under "values"
+                    product_spec = spec.get("product") or {}
+                    if isinstance(product_spec, dict) and isinstance(out, dict):
+                        cur_artifacts = dict(state.get("artifacts") or {})
+                        cur_artifacts.update(updates.get("artifacts") or {})
+                        values_dict = out.get("values") if isinstance(out.get("values"), dict) else {}
+                        for art_key, src_key in product_spec.items():
+                            val = out.get(src_key)
+                            if val is None:
+                                val = values_dict.get(src_key)
+                            if val is not None:
+                                cur_artifacts[art_key] = val
+                        updates["artifacts"] = cur_artifacts
                 elif kind in ("calc_expr", "expr", "calc"):
                     expr = spec.get("expr")
                     inputs = spec.get("inputs") or {}

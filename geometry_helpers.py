@@ -79,6 +79,15 @@ def format_xyz(atoms: List[str], coords: List[Vec3], comment: str = "") -> str:
         out.append(f"{s:<2} {x: .10f} {y: .10f} {z: .10f}")
     return "\n".join(out) + "\n"
 
+def format_xyz_no_header(atoms: List[str], coords: List[Vec3]) -> str:
+    """Return atom lines only (no natoms/comment header) for GeometryRegistry compatibility."""
+    if len(atoms) != len(coords):
+        raise ValueError("atoms/coords length mismatch")
+    lines = []
+    for s, (x,y,z) in zip(atoms, coords):
+        lines.append(f"{s} {x: .10f} {y: .10f} {z: .10f}")
+    return "\n".join(lines)
+
 def infer_bonds(atoms: List[str], coords: List[Vec3], scale: float = 1.25) -> List[List[int]]:
     """Very simple bond inference by covalent radii sum * scale."""
     n = len(atoms)
@@ -226,7 +235,8 @@ def structure_proton_edit(
             "new_charge": charge - 1,
             "old_multiplicity": multiplicity,
             "new_multiplicity": multiplicity,
-            "xyz": format_xyz(atoms2, coords2, comment="deprotonated"),
+            "geometry_xyz": format_xyz_no_header(atoms2, coords2),
+            "provenance": {"geometry": "proton_edit_remove"},
         }
 
     if mode == "add":
@@ -239,14 +249,13 @@ def structure_proton_edit(
         h_pos = place_H_on_atom(atoms, coords, target_atom_index)
         atoms2 = atoms + ["H"]
         coords2 = coords + [h_pos]
-        # inside structure_proton_edit result:
         return {
             "status": "ok",
             "mode": "add",
-            "xyz": format_xyz(atoms2, coords2, comment="protonated"),
-            "provenance": {"geometry": "proton_edit"},
+            "geometry_xyz": format_xyz_no_header(atoms2, coords2),
+            "provenance": {"geometry": "proton_edit_add"},
             "old_charge": charge,
-            "new_charge": charge - 1,
+            "new_charge": charge + 1,
             "old_multiplicity": multiplicity,
             "new_multiplicity": multiplicity,
         }

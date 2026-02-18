@@ -106,6 +106,23 @@
                     "scf_max_iter": {"type": "integer", "default": 150},
                     "wall_timeout_seconds": {"type": "integer", "default": 600}},
                 "required": ["input_geom_id"]}}},
+
+    "run_freq_job": {
+        "type": "function",
+        "function": {
+            "name": "run_freq_job",
+            "description": "Run an ORCA frequency calculation. Returns electronic energy E, enthalpy H, and Gibbs free energy G (all in Eh). Use after geometry optimization to obtain thermodynamic properties.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input_geom_id": { "type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from." },
+                    "method": {"type": "string", "default": "B3LYP"},
+                    "basis": {"type": "string", "default": "def2-SVP"},
+                    "use_ri": {"type": "boolean", "default": true},
+                    "scf_max_iter": {"type": "integer", "default": 150},
+                    "wall_timeout_seconds": {"type": "integer", "default": 3600}},
+                "required": ["input_geom_id"]}}},
+
     "build_reaction_coordinate_scan": {
         "type": "function",
         "function": {
@@ -149,11 +166,39 @@
             }
         }
     },
+	"run_solvator_cluster":{
+		"type": "function",
+		"function": {
+			"name": "run_solvator_cluster",
+			"description": "Build an explicit-solvent cluster (water) around a solute using ORCA SOLVATOR. Returns cluster geometry only (no thermochemistry). Use run_freq_job on the output cluster to get E/H/G.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"input_geom_id": { "type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from." },
+					"nsolv": {
+						"type": "integer",
+						"description": "Number of water molecules to add around the solute.",
+						"default": 3
+					},
+					"wall_timeout_seconds": {
+						"type": "integer",
+						"description": "Soft wall-clock timeout hint.",
+						"default": 600
+					},
+					"job_label": {
+						"type": "string",
+						"description": "Optional label. If omitted, the server will generate one."
+					}
+				},
+				"required": ["input_geom_id"]
+			}
+		}
+	},
 	"run_solvator_cluster_thermo":{
 		"type": "function",
 		"function": {
 		"name": "run_solvator_cluster_thermo",
-		"description": "Run ORCA SOLVATOR to build a microsolvated cluster (e.g., water) from a solute XYZ.",
+		"description": "Combined tool: build microsolvated cluster with SOLVATOR then run ORCA frequency for E/H/G. Prefer using run_solvator_cluster + run_freq_job separately for more control.",
 			"parameters": {
 			"type": "object",
 			"properties": {
@@ -181,39 +226,17 @@
 		"type": "function",
 		"function": {
 			"name": "structure_add_remove_proton",
-			"description": "Add or remove one proton (H) from a structure in XYZ format. If the site is not specified, uses simple geometry heuristics to propose and apply a site. Returns the edited XYZ plus the chosen site and candidates for user confirmation.",
-			"strict": true,
+			"description": "Add or remove one proton (H) from a geometry. Geometry, charge and multiplicity are read from the GeometryRegistry via input_geom_id (do NOT specify them). The tool auto-selects the site by default. Returns edited XYZ with updated charge.",
 			"parameters": {
 			"type": "object",
-			"additionalProperties": false,
 			"properties": {
-				"geometry_xyz": { "type": "string" },
-				"geometry_name": {
-					"type": ["string", "null"],
-					"description": "Optional name/key of the input geometry (e.g. 'ethanol'). Used to name outputs.",
-					"default": null
-				},
+				"input_geom_id": { "type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from." },
 				"mode": { "type": "string", "enum": ["add", "remove"] },
-				"charge": { "type": "integer" },
-				"multiplicity": { "type": "integer", "minimum": 1 },
-				"site_spec": {
-				"type": ["object", "null"],
-				"additionalProperties": false,
-				"properties": {
-					"h_index": { "type": ["integer", "null"], "minimum": 0 },
-					"target_atom_index": { "type": ["integer", "null"], "minimum": 0 }
-				},
-				"required": ["h_index", "target_atom_index"]
-				},
-				"strategy": { "type": "string", "enum": ["auto", "distance", "candidates_only"] },
-				"max_hx_distance": { "type": ["number", "null"], "minimum": 0.5, "maximum": 2.5 },
-				"return_candidates": { "type": "boolean" },
-				"top_k_candidates": { "type": "integer", "minimum": 1, "maximum": 20 }
+				"h_index": { "type": "integer", "minimum": 0, "description": "Optional: index of H to remove (auto-detected if omitted)." },
+				"target_atom_index": { "type": "integer", "minimum": 0, "description": "Optional: index of atom to protonate (auto-detected if omitted)." },
+				"strategy": { "type": "string", "enum": ["auto", "distance"], "default": "auto" }
 			},
-			"required": [
-				"geometry_xyz","geometry_name","mode","charge","multiplicity","site_spec","strategy",
-				"max_hx_distance","return_candidates","top_k_candidates"
-			]
+			"required": ["input_geom_id", "mode"]
 			}
 		}
 	},
