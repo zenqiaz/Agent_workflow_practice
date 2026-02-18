@@ -401,6 +401,29 @@ async def run_solvator_cluster_thermo(
         solv_result["thermo_error"] = "Could not find cluster XYZ in SOLVATOR result."
         return json.dumps(solv_result)
 
+    # Validate: check solvator actually added water molecules
+    input_lines = [ln for ln in str(geometry_xyz).splitlines() if ln.strip()]
+    cluster_lines = [ln for ln in cluster_xyz_no_header.splitlines() if ln.strip()]
+    if len(cluster_lines) <= len(input_lines):
+        solv_result.setdefault("status", "error")
+        solv_result["label"] = job_label
+        solv_result["thermo_status"] = "skipped"
+        solv_result["thermo_error"] = (
+            f"SOLVATOR did not add solvent molecules: input has {len(input_lines)} atoms, "
+            f"cluster has {len(cluster_lines)} atoms. Molecule may be too small for solvation."
+        )
+        solv_result["cluster_xyz"] = cluster_xyz_no_header
+        return json.dumps(solv_result)
+
+    # Guard: freq needs at least 2 atoms (no vibrations for a single atom)
+    if len(cluster_lines) < 2:
+        solv_result.setdefault("status", "error")
+        solv_result["label"] = job_label
+        solv_result["thermo_status"] = "skipped"
+        solv_result["thermo_error"] = "Cannot run frequency calculation on a single atom."
+        solv_result["cluster_xyz"] = cluster_xyz_no_header
+        return json.dumps(solv_result)
+
     # 2) ORCA frequency job for thermochemistry
     jobs_dir = Path(os.environ.get("ORCA_JOBS_DIR", "jobs"))
     thermo_label = f"{job_label}_freq"
@@ -778,7 +801,75 @@ async def run_sp_energy(
 
     energy = extract_total_energy(out_text)
     return json.dumps({"status": "ok", "label": job_label, "energy": energy, "product": "energy"})
-'''
+
+
+@mcp.tool()
+async def run_freq_job(
+    geometry_xyz: str,
+    charge: int = 0,
+    multiplicity: int = 1,
+    method: str = "B3LYP",
+    basis: str = "def2-SVP",
+    use_ri: bool = True,
+    scf_max_iter: int = 150,
+    wall_timeout_seconds: int = 3600,
+    job_label: Optional[str] = None,
+    ncores: int = 1,
+) -> str:
+    """Run an ORCA frequency calculation. Returns E, H, G (Gibbs free energy) in Eh."""
+    if not geometry_xyz.strip():
+        raise ValueError("geometry_xyz is empty")
+
+    if job_label is None:
+        job_label = f"freq_{os.getpid()}_{int(asyncio.get_event_loop().time())}"
+    job_label = sanitize_label(job_label)
+    jobs_dir = Path(os.environ.get("ORCA_JOBS_DIR", "jobs"))
+    workdir = jobs_dir / job_label
+
+    calc = _build_calc(
+        label=job_label,
+        workdir=workdir,
+        geometry_xyz=geometry_xyz,
+        charge=charge,
+        multiplicity=multiplicity,
+        method=method,
+        basis=basis,
+        job_type="freq",
+        use_ri=use_ri,
+        scf_max_iter=scf_max_iter,
+        opt_max_iter=1,
+        nbo=False,
+        ncores=ncores,
+    )
+
+    try:
+        output = await _run_calc_with_timeout(calc, wall_timeout_seconds)
+    except asyncio.TimeoutError:
+        return json.dumps(
+            {"status": "timeout", "label": job_label, "text": f"Status: TIMEOUT after {wall_timeout_seconds}s"}
+        )
+    except Exception as e:
+        return json.dumps({"status": "error", "label": job_label, "error": str(e)})
+
+    ok = output.terminated_normally()
+    out_text = _read_out_text(workdir, job_label)
+    if not ok:
+        return json.dumps({"status": "error", "label": job_label, "tail": "\n".join(out_text.splitlines()[-120:])})
+
+    energy = extract_total_energy(out_text)
+    enthalpy = extract_total_enthalpy(out_text)
+    gibbs = extract_gibbs_free_energy(out_text)
+
+    return json.dumps({
+        "status": "ok",
+        "label": job_label,
+        "energy": energy,
+        "enthalpy_eh": enthalpy,
+        "gibbs_free_energy_eh": gibbs,
+        "product": "gibbs_free_energy_eh",
+    })
+
+
 @mcp.tool()
 async def run_solvator_cluster(
     geometry_xyz: str,
@@ -826,8 +917,6 @@ async def inspect_job(
     dbg = _collect_debug(workdir, job_label, tail_lines=tail_lines)
     return json.dumps({"status": "ok", "label": job_label, "debug": dbg})
 
-'''
-from typing import Optional, Literal
 @mcp.tool()
 async def structure_add_remove_proton(
     geometry_xyz: str,

@@ -324,10 +324,18 @@ def _extract_cluster_geometry_from_workdir(workdir: Path, label: str) -> str:
     candidates += sorted(workdir.glob("*.xyz"))
     candidates += sorted(workdir.glob("*.trj"))
 
-    # Prefer exact match, then shorter names (heuristic)
+    # Prefer: solvator output > exact label match > others
+    # "solute.xyz" is the input; ".solvator.xyz" is the cluster output
     candidates = sorted(
         {p for p in candidates if p.exists()},
-        key=lambda p: (p.name != f"{label}.xyz", p.name != f"{label}.trj", len(p.name), p.name),
+        key=lambda p: (
+            "solvator" not in p.name,       # solvator files first
+            p.name == "solute.xyz",          # input file last
+            p.name != f"{label}.xyz",
+            p.name != f"{label}.trj",
+            len(p.name),
+            p.name,
+        ),
     )
 
     for p in candidates:
