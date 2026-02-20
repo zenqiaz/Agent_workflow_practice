@@ -520,6 +520,325 @@ def pubchem_get_basic_properties(name: str, timeout: int = 20) -> Dict[str, Any]
     }
     return out
 
+
+# ---------------------------------------------------------------------------
+# Pre-planning compound identification helpers
+# ---------------------------------------------------------------------------
+
+def extract_compound_names_llm(user_text: str, openai_client: Any) -> List[str]:
+    """Use a fast LLM call to extract chemical compound names from free-form text.
+
+    Returns a (possibly empty) list of name strings.
+    """
+    prompt = (
+        "Extract chemical compound or molecule names from the following text. "
+        "Return ONLY a JSON array of strings (the names), nothing else. "
+        "If no compound names are present, return []. "
+        f"Text: {user_text!r}"
+    )
+    try:
+        resp = openai_client.chat.completions.create(
+            model=os.getenv("LLM_MODEL", "gpt-4.1-mini"),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        names = json.loads(raw)
+        if isinstance(names, list):
+            return [str(n) for n in names if isinstance(n, str) and n.strip()]
+    except Exception:
+        pass
+    return []
+
+
+def fetch_compound_card(name: str) -> Dict[str, Any]:
+    """Fetch compound info from PubChem and OPSIN, returning a unified card dict.
+
+    Keys: name, formula, smiles, mw, charge, cid, inchi, inchikey, source.
+    source is 'pubchem', 'opsin', or 'not_found'.
+    """
+    card: Dict[str, Any] = {
+        "name": name,
+        "formula": None,
+        "smiles": None,
+        "mw": None,
+        "charge": 0,
+        "cid": None,
+        "inchi": None,
+        "inchikey": None,
+        "source": "not_found",
+    }
+
+    # Try PubChem first (richer data)
+    pc = pubchem_get_basic_properties(name)
+    if pc.get("status") == "ok":
+        card.update({
+            "formula": pc.get("formula"),
+            "smiles": pc.get("smiles"),
+            "mw": pc.get("mw"),
+            "charge": pc.get("charge") or 0,
+            "cid": pc.get("cid"),
+            "inchi": pc.get("inchi"),
+            "inchikey": pc.get("inchikey"),
+            "source": "pubchem",
+        })
+
+    # Always try OPSIN to fill in missing SMILES (PubChem sometimes omits it)
+    if not card.get("smiles"):
+        op = opsin_resolve(name)
+        if op:
+            card.update({
+                "smiles": op.get("smiles") or card.get("smiles"),
+                "inchi": card.get("inchi") or op.get("inchi"),
+                "inchikey": card.get("inchikey") or op.get("inchikey"),
+            })
+            if card["source"] == "not_found":
+                card["source"] = "opsin"
+
+    if card["source"] != "not_found":
+        return card
+
+    # OPSIN-only path (PubChem failed entirely)
+    op = opsin_resolve(name)
+    if op:
+        card.update({
+            "smiles": op.get("smiles"),
+            "inchi": op.get("inchi"),
+            "inchikey": op.get("inchikey"),
+            "source": "opsin",
+        })
+
+    return card
+
+
+def _xyz_no_header_to_block(xyz_no_header: str, charge: int = 0) -> str:
+    """Add natoms + comment header so RDKit's MolFromXYZBlock can parse it."""
+    lines = [ln for ln in xyz_no_header.splitlines() if ln.strip()]
+    return f"{len(lines)}\ncharge={charge}\n" + "\n".join(lines) + "\n"
+
+
+def render_xyz_image_rdkit(xyz_no_header: str, label: str, charge: int = 0) -> Optional[str]:
+    """Render a 2D structure PNG directly from XYZ atom lines (no SMILES needed).
+
+    Uses RDKit MolFromXYZBlock + DetermineBonds to infer connectivity, then
+    Compute2DCoords for a clean 2D layout.  Opens the PNG in the OS viewer.
+    Returns the saved path, or None on failure.
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Draw, AllChem, rdDetermineBonds
+    except ImportError:
+        return None
+
+    try:
+        xyz_block = _xyz_no_header_to_block(xyz_no_header, charge)
+        mol = Chem.MolFromXYZBlock(xyz_block)
+        if mol is None:
+            return None
+        rdDetermineBonds.DetermineBonds(mol, charge=charge)
+
+        # Project to 2D for a clean drawing
+        mol_2d = Chem.RWMol(Chem.RemoveAllHs(mol))  # hide H for larger molecules
+        # For small molecules keep explicit H so bonds are visible
+        if mol.GetNumAtoms() <= 6:
+            mol_2d = Chem.RWMol(mol)
+        AllChem.Compute2DCoords(mol_2d)
+
+        import tempfile, platform, subprocess as sp
+        tmp_dir = Path(tempfile.gettempdir()) / "qcagent_structures"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_label = re.sub(r"[^A-Za-z0-9_\-]", "_", label)[:40]
+        png_path = tmp_dir / f"{safe_label}.png"
+
+        img = Draw.MolToImage(mol_2d, size=(500, 400))
+        img.save(str(png_path))
+
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(str(png_path))
+        elif system == "Darwin":
+            sp.Popen(["open", str(png_path)])
+        else:
+            sp.Popen(["xdg-open", str(png_path)])
+
+        return str(png_path)
+    except Exception:
+        return None
+
+
+def fetch_compound_card_from_xyz(
+    xyz_no_header: str, geom_id: str, charge: int = 0
+) -> Dict[str, Any]:
+    """Derive a compound card from loaded XYZ via bond detection + optional PubChem lookup.
+
+    Tries DetermineBonds → canonical SMILES → PubChem lookup by SMILES.
+    Falls back to a minimal card with just the geom_id as name.
+    """
+    card: Dict[str, Any] = {
+        "name": geom_id,
+        "formula": None,
+        "smiles": None,
+        "mw": None,
+        "charge": charge,
+        "cid": None,
+        "inchi": None,
+        "inchikey": None,
+        "source": "xyz",
+    }
+
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import rdDetermineBonds, Descriptors
+        xyz_block = _xyz_no_header_to_block(xyz_no_header, charge)
+        mol = Chem.MolFromXYZBlock(xyz_block)
+        if mol is None:
+            return card
+        rdDetermineBonds.DetermineBonds(mol, charge=charge)
+        smiles = Chem.MolToSmiles(mol)
+        formula = Chem.rdMolDescriptors.CalcMolFormula(mol)
+        mw = round(Descriptors.ExactMolWt(mol), 4)
+        card.update({"smiles": smiles, "formula": formula, "mw": mw})
+    except Exception:
+        return card
+
+    # Try PubChem lookup by SMILES to get CID / InChI
+    try:
+        import urllib.parse
+        prolog = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+        prop_str = "MolecularFormula,MolecularWeight,Charge,IsomericSMILES,InChI,InChIKey"
+        url = f"{prolog}/compound/smiles/{urllib.parse.quote(smiles)}/property/{prop_str}/JSON"
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            props = r.json()["PropertyTable"]["Properties"][0]
+            card.update({
+                "formula": props.get("MolecularFormula") or card["formula"],
+                "mw": props.get("MolecularWeight") or card["mw"],
+                "cid": props.get("CID"),
+                "inchi": props.get("InChI"),
+                "inchikey": props.get("InChIKey"),
+                "source": "xyz+pubchem",
+            })
+    except Exception:
+        pass
+
+    return card
+
+
+def render_compound_image_rdkit(smiles: str, name: str) -> Optional[str]:
+    """Render a 2D structure PNG from SMILES using RDKit, then open it in the OS viewer.
+
+    Returns the saved PNG path, or None if rendering failed.
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Draw, AllChem
+    except ImportError:
+        return None
+
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+
+        # Add explicit H atoms so small molecules (e.g. water, HF) show bonds
+        mol = Chem.AddHs(mol)
+        AllChem.Compute2DCoords(mol)
+
+        import tempfile, platform, subprocess as sp
+        tmp_dir = Path(tempfile.gettempdir()) / "qcagent_structures"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_name = re.sub(r"[^A-Za-z0-9_\-]", "_", name)[:40]
+        png_path = tmp_dir / f"{safe_name}.png"
+
+        img = Draw.MolToImage(mol, size=(500, 400))
+        img.save(str(png_path))
+
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(str(png_path))
+        elif system == "Darwin":
+            sp.Popen(["open", str(png_path)])
+        else:
+            sp.Popen(["xdg-open", str(png_path)])
+
+        return str(png_path)
+    except Exception:
+        return None
+
+
+def display_and_confirm_compound(card: Dict[str, Any], openai_client: Any, _depth: int = 0) -> Optional[Dict[str, Any]]:
+    """Show a compound card to the user and ask for confirmation.
+
+    Returns the confirmed card (possibly for a renamed compound), or None if skipped.
+    Allows up to 3 rename attempts.
+    """
+    SEP = "─" * 56
+    name = card.get("name", "?")
+    print(f"\n{SEP}")
+    print(f"  Compound : {name}")
+    if card.get("formula"):
+        print(f"  Formula  : {card['formula']}")
+    if card.get("smiles"):
+        print(f"  SMILES   : {card['smiles']}")
+    if card.get("mw") is not None:
+        print(f"  MW       : {card['mw']} g/mol")
+    chg = card.get("charge", 0)
+    print(f"  Charge   : {chg}")
+    if card.get("cid"):
+        print(f"  CID      : {card['cid']}")
+    if card.get("source") == "not_found":
+        print("  [Not found in PubChem or OPSIN]")
+
+    if card.get("smiles"):
+        img_path = render_compound_image_rdkit(card["smiles"], name)
+        if img_path:
+            print(f"  Structure: {img_path} [opened]")
+        else:
+            print("  Structure: (RDKit rendering unavailable)")
+    print(SEP)
+
+    while True:
+        raw = input("  Correct compound? [y / n / rename to <name>]: ").strip()
+        if not raw or raw.lower() in ("y", "yes"):
+            return card
+        if raw.lower() in ("n", "no"):
+            # Offer manual SMILES entry before skipping
+            manual = input("  Enter SMILES manually (or blank to skip): ").strip()
+            if manual:
+                card = dict(card)
+                card["smiles"] = manual
+                card["source"] = "manual"
+                return card
+            return None
+        if raw.lower().startswith("rename to "):
+            new_name = raw[len("rename to "):].strip()
+            if new_name and _depth < 3:
+                new_card = fetch_compound_card(new_name)
+                return display_and_confirm_compound(new_card, openai_client, _depth + 1)
+            print("  Max rename attempts reached or empty name.")
+        else:
+            print("  Please type y, n, or 'rename to <name>'.")
+
+
+def compounds_to_planner_context(compounds: List[Dict[str, Any]]) -> str:
+    """Format a list of confirmed compound cards as a planner system-message string."""
+    if not compounds:
+        return ""
+    lines = ["CONFIRMED COMPOUNDS (verified by user before planning):"]
+    for c in compounds:
+        parts = [f"formula={c['formula']}" if c.get("formula") else None,
+                 f"SMILES={c['smiles']}" if c.get("smiles") else None,
+                 f"charge={c.get('charge', 0)}",
+                 f"MW={c['mw']} g/mol" if c.get("mw") else None,
+                 f"CID={c['cid']}" if c.get("cid") else None]
+        detail = ", ".join(p for p in parts if p)
+        lines.append(f"  - {c['name']}: {detail}")
+    lines.append("Use these confirmed identities when assigning geom_ids and charge/multiplicity.")
+    return "\n".join(lines)
+
+
 ALLOWED_STATE_KEYS = {
     "default_charge",
     "default_multiplicity",
@@ -527,7 +846,7 @@ ALLOWED_STATE_KEYS = {
     "default_basis",
     "default_solvent",
     "current_geom",
-    "current_name",   # optional: user’s “active molecule name”
+    "current_name",   # optional: user's "active molecule name"
 }
 
 ALLOWED_STATE_KEYS = {

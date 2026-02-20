@@ -43,15 +43,22 @@ from client_helpers import (
     #run_plan_deterministically,
     run_tool_node,
     result_dict_to_prompt,
+    extract_compound_names_llm,
+    fetch_compound_card,
+    fetch_compound_card_from_xyz,
+    display_and_confirm_compound,
+    compounds_to_planner_context,
+    render_xyz_image_rdkit,
 )
 from build_graph_from_plan import build_graph_from_plan, build_state
 from prompts import SYSTEM_PROMPT, CALCULATOR_SYSTEM_PROMPT, REPORTER_SYSTEM_PROMPT
 
 
 
-load_dotenv()
+load_dotenv(os.environ.get("ENV_FILE", ".env"))
 
-
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini")
+_LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip() or None
 
 OPENAI_TOOLS = json.loads(Path("openai_tools_geom.json").read_text(encoding="utf-8"))
 CLIENT_SIDE_TOOL_FUNCS = {
@@ -110,23 +117,18 @@ def tools_for_server(tool_names: list[str]) -> list[dict]:
 
 
 
-async def handle_user_turn(session, client, state, user_text: str, tools_for_this_call: list):
+async def handle_user_turn(session, client, state, user_text: str, tools_for_this_call: list,
+                           compound_context: str = ""):
     # Merge: MCP tools + client-side tools, but only if schema exists in OPENAI_TOOLS
 
-
-    '''user_prompt = f"""
-{summarize_geometries_prompt(state)}
-
-User request:
-{user_text}
-""".strip()'''
-    #state_msg_index = 1
     messages = [
     {"role": "system", "content": SYSTEM_PROMPT},
     {"role": "system", "content": "STATE:\n" + summarize_geometries_prompt(state)},
     {"role": "system", "content": "WORKFLOW_STATE:\n" + summarize_workflow_state(state)},
-    {"role": "user", "content": user_text},
     ]
+    if compound_context:
+        messages.append({"role": "system", "content": "CONFIRMED_COMPOUNDS:\n" + compound_context})
+    messages.append({"role": "user", "content": user_text})
     state["last_user_text"] = user_text
 
     MAX_TOOL_ROUNDS = 4
@@ -134,7 +136,7 @@ User request:
         #print("TOOL NAMES FOR MODEL:", tool_names_for_model)
         #print("TOOLS SENT:", [t["function"]["name"] for t in tools_for_this_call])
         resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=LLM_MODEL,
             messages=messages,
             tools=tools_for_this_call,
             tool_choice="none",
@@ -154,17 +156,98 @@ User request:
     #print("\n[Final]\nEarly exit: too many tool rounds. Please rephrase or provide missing info.")
 
 
+def _cache_confirmed_card(state: AgentState, name: str, card: dict) -> None:
+    """Store a confirmed compound card in state caches."""
+    state.setdefault("cached_props", {})[name] = card
+    if card.get("inchi") or card.get("smiles"):
+        state.setdefault("identifiers", {})[name] = {
+            "smiles": card.get("smiles"),
+            "inchi": card.get("inchi"),
+            "inchikey": card.get("inchikey"),
+            "formula": card.get("formula"),
+            "charge": card.get("charge", 0),
+        }
+
+
+async def identify_and_confirm_compounds(
+    user_text: str, client, state: AgentState
+) -> list:
+    """Pre-planning phase: identify all compounds (by name and/or loaded geometries).
+
+    Two sources:
+      1. Compound names extracted from user_text via LLM → PubChem/OPSIN lookup.
+      2. Geometries already in state that have no identity cached yet → XYZ-derived
+         SMILES + PubChem lookup, displayed for user confirmation.
+
+    Returns list of confirmed compound cards cached in state['cached_props'] /
+    state['identifiers'].
+    """
+    print("\n[Identifying compounds...]")
+    confirmed = []
+
+    # --- Source 1: names mentioned in the planning request ---
+    names = extract_compound_names_llm(user_text, client)
+    for name in names:
+        card = fetch_compound_card(name)
+        result = display_and_confirm_compound(card, client)
+        if result is None:
+            continue
+        confirmed.append(result)
+        _cache_confirmed_card(state, name, result)
+
+    # --- Source 2: geometries loaded in state with no cached identity ---
+    geometries = state.get("geometries") or {}
+    identifiers = state.get("identifiers") or {}
+    cached_props = state.get("cached_props") or {}
+    geom_meta = state.get("geom_meta") or {}
+
+    unidentified = [
+        gid for gid in geometries
+        if gid not in identifiers and gid not in cached_props
+    ]
+
+    if unidentified:
+        print(f"\n[{len(unidentified)} loaded geometry/geometries not yet identified]")
+
+    for geom_id in unidentified:
+        xyz = geometries[geom_id]
+        charge = (geom_meta.get(geom_id) or {}).get("charge", 0) or 0
+
+        print(f"\n── Loaded geometry: {geom_id} ──")
+        # Derive card from XYZ (bond detection + PubChem by SMILES)
+        card = fetch_compound_card_from_xyz(xyz, geom_id, charge=charge)
+        if card.get("smiles"):
+            print(f"  Detected SMILES : {card['smiles']}")
+        if card.get("formula"):
+            print(f"  Detected formula: {card['formula']}")
+
+        result = display_and_confirm_compound(card, client)
+        if result is None:
+            continue
+        confirmed.append(result)
+        _cache_confirmed_card(state, geom_id, result)
+
+    if not confirmed:
+        print("[No compounds identified — proceeding to planning with geometry state only]")
+
+    return confirmed
+
+
 async def main():
+    _mcp_ssh_key = os.getenv("MCP_SSH_KEY", "C:/Users/zrqrc/.ssh/droplet1")
+    _mcp_ssh_host = os.getenv("MCP_SSH_HOST", "root@188.166.232.163")
+    _mcp_server_cmd = os.getenv(
+        "MCP_SERVER_CMD",
+        "source ~/venvs/QCagent/bin/activate && cd /root/nbo_agent && "
+        "PATH=/root/ORCA/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg:$PATH python server_with_product.py",
+    )
     server_params = StdioServerParameters(
         command="ssh",
-        args=[
-            "-i", "C:/Users/zrqrc/.ssh/droplet1",
-            "root@188.166.232.163",
-            "source ~/venvs/QCagent/bin/activate && cd /root/nbo_agent && PATH=/root/ORCA/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg:$PATH python server_with_product.py",
-        ],
+        args=["-i", _mcp_ssh_key, _mcp_ssh_host, _mcp_server_cmd],
     )
 
-    client = OpenAI()
+    _client_kwargs = {"base_url": _LLM_BASE_URL} if _LLM_BASE_URL else {}
+    client = OpenAI(**_client_kwargs)
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -209,6 +292,12 @@ async def main():
                     state.setdefault("geometries", {})[key] = geometry_xyz
                     state["current_geom"] = key
                     print(f"Loaded geometry from {path!r} as {key!r}")
+                    charge = (state.get("geom_meta") or {}).get(key, {}).get("charge", 0) or 0
+                    img_path = render_xyz_image_rdkit(geometry_xyz, key, charge=charge)
+                    if img_path:
+                        print(f"Structure: {img_path} [opened]")
+                    else:
+                        print("Structure: (could not render — check RDKit / XYZ format)")
                     continue
 
                 if line.strip().lower() == "state":
@@ -282,7 +371,7 @@ async def main():
                     ]
                     
                     resp = client.chat.completions.create(
-                        model="gpt-4.1-mini",
+                        model=LLM_MODEL,
                         messages=report_messages,
                     )
                     msg = resp.choices[0].message
@@ -290,7 +379,10 @@ async def main():
                     #print(json.dumps(result, ensure_ascii=False, indent=2))
                     continue
                 
-                await handle_user_turn(session, client, state, line, tools_for_this_call)
+                compounds = await identify_and_confirm_compounds(line, client, state)
+                compound_context = compounds_to_planner_context(compounds)
+                await handle_user_turn(session, client, state, line, tools_for_this_call,
+                                       compound_context=compound_context)
 
 if __name__ == "__main__":
     asyncio.run(main())

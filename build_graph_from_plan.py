@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import TypedDict, Any, Dict, Callable, List, Awaitable, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
@@ -460,7 +461,7 @@ def build_graph_from_plan(
 
                             try:
                                 resp = openai_client.chat.completions.create(
-                                    model="gpt-4.1-mini",
+                                    model=os.getenv("LLM_MODEL", "gpt-4.1-mini"),
                                     messages=messages,
                                 )
                                 raw = (resp.choices[0].message.content or "").strip()
