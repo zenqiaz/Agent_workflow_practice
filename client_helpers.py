@@ -1780,13 +1780,60 @@ def download_mermaid_ink_png(encoded: str, out_path: str) -> None:
     urlretrieve(url, out_path)
 
 def parse_json_only(content: str) -> dict:
+    """Extract and parse the first JSON object from model output.
+
+    Handles:
+    - Plain JSON
+    - JSON wrapped in ```json ... ``` fences
+    - <think>...</think> reasoning blocks (qwen / deepseek models)
+    - Preamble / postamble text around the JSON object
+    """
+    import re as _re
+
     content = content.strip()
-    # If model wraps JSON in ```json fences, strip them
-    if content.startswith("```"):
-        content = content.strip("`")
-        # crude: remove a leading 'json' line if present
-        content = content.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
-    return json.loads(content)
+
+    # Strip <think>...</think> reasoning blocks produced by some local models
+    content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+
+    # Strip ``` code fences (```json ... ``` or ``` ... ```)
+    fence = _re.match(r"^```(?:json)?\s*\n?(.*?)\n?```$", content, _re.DOTALL)
+    if fence:
+        content = fence.group(1).strip()
+
+    # Fast path: content is already valid JSON
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    # Slow path: find the first top-level { ... } block using brace counting
+    start = content.find("{")
+    if start == -1:
+        raise ValueError(f"No JSON object found in model output:\n{content[:300]}")
+
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i, ch in enumerate(content[start:], start):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(content[start: i + 1])
+
+    raise ValueError(f"Unmatched braces in model output:\n{content[:300]}")
 
 
 
@@ -2112,6 +2159,30 @@ def _normalize_tool_name(tool_name: str) -> str:
             return t[len(prefix):]
     return t
 
+def _expand_settings_refs(obj: Any, settings: dict) -> Any:
+    """Expand '$(settings.KEY)' template strings using plan settings values.
+
+    Full-match replaces the entire value (preserving bool/int type).
+    Partial-match replaces within a string (result is always str).
+    Works recursively for dicts and lists.
+    """
+    import re as _re
+    if isinstance(obj, str):
+        m = _re.fullmatch(r'\$\(settings\.([^)]+)\)', obj)
+        if m:
+            return settings.get(m.group(1), obj)
+        return _re.sub(
+            r'\$\(settings\.([^)]+)\)',
+            lambda match: str(settings.get(match.group(1), match.group(0))),
+            obj,
+        )
+    if isinstance(obj, dict):
+        return {k: _expand_settings_refs(v, settings) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_settings_refs(v, settings) for v in obj]
+    return obj
+
+
 async def execute_tool_from_node_spec(*, state: Dict[str, Any], node_spec: Dict[str, Any]) -> Dict[str, Any]:
     tool_raw = node_spec.get("tool")
     tool_name = _normalize_tool_name(tool_raw)
@@ -2129,6 +2200,16 @@ async def execute_tool_from_node_spec(*, state: Dict[str, Any], node_spec: Dict[
         overrides = {}
     if not isinstance(overrides, dict):
         return {"status": "error", "tool": tool_name, "error": "node_spec.args must be a dict"}
+
+    # Expand $(settings.KEY) references using plan settings.
+    # _plan_settings is injected by build_graph_from_plan.make_node; fall back to state["plan"].
+    plan_settings = (
+        node_spec.get("_plan_settings")
+        or ((state.get("plan") or {}).get("settings") if isinstance(state, dict) else None)
+        or {}
+    )
+    if plan_settings:
+        overrides = _expand_settings_refs(overrides, plan_settings)
     new_geometry = False
     if not input_geom_id or output_geom_id != input_geom_id:
         new_geometry = True

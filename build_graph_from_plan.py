@@ -380,6 +380,8 @@ def build_graph_from_plan(
                         # or any higher-level runner you provide.
                         node_spec = dict(spec)
                         node_spec["id"] = node_id
+                        # Inject plan settings so execute_tool_from_node_spec can expand $(settings.KEY)
+                        node_spec["_plan_settings"] = plan.get("settings") or {}
                         result = await _maybe_await(run_tool_node(state, node_spec))
                         if not isinstance(result, dict):
                             result = {"status": "error", "error": "tool node runner returned non-dict"}

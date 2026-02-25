@@ -923,6 +923,8 @@ async def structure_add_remove_proton(
     mode: Literal["add", "remove"],
     charge: int = 0,
     multiplicity: int = 1,
+    site_selector: Optional[str] = None,
+    variant: int = 0,
     h_index: Optional[int] = None,
     target_atom_index: Optional[int] = None,
     geometry_name: Optional[str] = None,
@@ -933,11 +935,12 @@ async def structure_add_remove_proton(
         mode=mode,
         charge=charge,
         multiplicity=multiplicity,
+        site_selector=site_selector,
+        variant=variant,
         h_index=h_index,
         target_atom_index=target_atom_index,
         geometry_name=geometry_name,
         strategy=strategy,
-        #status = 'ok'
     )
     return json.dumps(res)
 

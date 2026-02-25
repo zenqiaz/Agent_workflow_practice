@@ -149,10 +149,12 @@ LLM node policy (kind: "llm")
   Do NOT create intermediate artifacts like "deltaG" — the calc node does the full chain.
 - Keep the prompt short: list the formula and which artifacts/settings to use. Standard constants (R, T, ln10, Eh_to_J_mol) are already known to the calculator.
 
-Domain requirements (QC)
-- If user requests ΔG, pKa, or equilibrium constants, the workflow must include thermochemistry (frequency) OR explicitly rely on a validated protocol tool that provides those quantities.
-- For pKa planning, ensure the plan yields free energies for HA and A− in the appropriate environment (gas/solvent/microsolvation) as required by the chosen validated protocol.
-- Record any external reference constants (e.g., aqueous proton free energy reference) as explicit assumptions and summarizer.constants, not implicit text.
+Domain knowledge
+- Task-specific chemical reasoning (pKa protocol, solvation, thermochemistry, NBO,
+  method selection) is provided in SKILL: blocks injected before this message.
+- Follow the skill instructions precisely; they take precedence over general defaults.
+- Record any external reference constants given in a skill (e.g. G_H_plus_ref_eh)
+  in plan settings, not as implicit text.
 
 Output constraints
 - Output MUST be valid JSON: NO comments (no //), NO trailing commas, NO markdown fences.
@@ -214,6 +216,21 @@ Sanity checks
 - If the task asks for pKa and ΔG is not in J/mol, convert it.
 - If temperature is provided as settings.temperature_K, use it.
 - If ΔG is extremely large (|pKa| > 100) add a warning message but still return ok.
+
+Data integrity checks (MANDATORY — run before any calculation or ranking)
+- If multiple energy values that are supposed to be distinct (different isomers, tautomers,
+  protonation sites, conformers) are EXACTLY equal or differ by less than 1e-6 Eh
+  (< 0.001 kcal/mol), this is a DATA ERROR, not a valid chemical result.
+  Possible causes: duplicate input geometries were fed to the SP tool; geometry
+  optimisation migrated all protons to the same minimum; or a tool returned the same
+  cached result for all calls.
+  Action: set status="error", name which values are identical, state the likely cause,
+  and DO NOT produce a ranking or recommend a "preferred site". The data cannot support
+  any conclusion until the upstream error is fixed.
+- The check applies to any set of values that must be chemically distinct:
+  SP energies of protonated isomers, Gibbs energies of conformers, etc.
+- If only a SUBSET of values are identical (e.g., two out of three isomers match),
+  flag those specific pairs and still report the one distinct value with a warning.
 """.strip()
 
 

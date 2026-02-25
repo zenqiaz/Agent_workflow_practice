@@ -52,6 +52,7 @@ from client_helpers import (
 )
 from build_graph_from_plan import build_graph_from_plan, build_state
 from prompts import SYSTEM_PROMPT, CALCULATOR_SYSTEM_PROMPT, REPORTER_SYSTEM_PROMPT
+from skills import run_planning_skills
 
 
 
@@ -118,16 +119,19 @@ def tools_for_server(tool_names: list[str]) -> list[dict]:
 
 
 async def handle_user_turn(session, client, state, user_text: str, tools_for_this_call: list,
-                           compound_context: str = ""):
-    # Merge: MCP tools + client-side tools, but only if schema exists in OPENAI_TOOLS
+                           compound_context: str = "", skill_contexts: list = []):
+    # Build message list: general prompt → skills → state → compound identity → user
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    messages = [
-    {"role": "system", "content": SYSTEM_PROMPT},
-    {"role": "system", "content": "STATE:\n" + summarize_geometries_prompt(state)},
-    {"role": "system", "content": "WORKFLOW_STATE:\n" + summarize_workflow_state(state)},
-    ]
+    for skill_ctx in skill_contexts:
+        messages.append({"role": "system", "content": "SKILL:\n" + skill_ctx})
+
+    messages.append({"role": "system", "content": "STATE:\n" + summarize_geometries_prompt(state)})
+    messages.append({"role": "system", "content": "WORKFLOW_STATE:\n" + summarize_workflow_state(state)})
+
     if compound_context:
         messages.append({"role": "system", "content": "CONFIRMED_COMPOUNDS:\n" + compound_context})
+
     messages.append({"role": "user", "content": user_text})
     state["last_user_text"] = user_text
 
@@ -234,7 +238,8 @@ async def identify_and_confirm_compounds(
 
 
 async def main():
-    _mcp_ssh_key = os.getenv("MCP_SSH_KEY", "C:/Users/zrqrc/.ssh/droplet1")
+    _mcp_ssh_bin  = os.getenv("MCP_SSH_BIN",  "ssh")
+    _mcp_ssh_key  = os.getenv("MCP_SSH_KEY",  "C:/Users/zrqrc/.ssh/droplet1")
     _mcp_ssh_host = os.getenv("MCP_SSH_HOST", "root@188.166.232.163")
     _mcp_server_cmd = os.getenv(
         "MCP_SERVER_CMD",
@@ -242,8 +247,10 @@ async def main():
         "PATH=/root/ORCA/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg:$PATH python server_with_product.py",
     )
     server_params = StdioServerParameters(
-        command="ssh",
-        args=["-i", _mcp_ssh_key, _mcp_ssh_host, _mcp_server_cmd],
+        command=_mcp_ssh_bin,
+        args=["-i", _mcp_ssh_key, "-o", "StrictHostKeyChecking=no",
+              "-o", "BatchMode=yes", _mcp_ssh_host, _mcp_server_cmd],
+        env=dict(os.environ),  # MCP's default env filter strips vars SSH needs
     )
 
     _client_kwargs = {"base_url": _LLM_BASE_URL} if _LLM_BASE_URL else {}
@@ -381,8 +388,10 @@ async def main():
                 
                 compounds = await identify_and_confirm_compounds(line, client, state)
                 compound_context = compounds_to_planner_context(compounds)
+                skill_contexts = run_planning_skills(line, state)
                 await handle_user_turn(session, client, state, line, tools_for_this_call,
-                                       compound_context=compound_context)
+                                       compound_context=compound_context,
+                                       skill_contexts=skill_contexts)
 
 if __name__ == "__main__":
     asyncio.run(main())

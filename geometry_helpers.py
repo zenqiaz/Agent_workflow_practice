@@ -40,6 +40,20 @@ def _unit(a: Vec3) -> Vec3:
 
 def parse_xyz_flexible(xyz: str) -> Tuple[List[str], List[Vec3]]:
     """Accept XYZ with or without header. Returns atoms + coords."""
+    atoms, coords, _ = parse_xyz_with_tags(xyz)
+    return atoms, coords
+
+
+def parse_xyz_with_tags(xyz: str) -> Tuple[List[str], List[Vec3], List[Optional[str]]]:
+    """Accept XYZ with or without header. Returns (atoms, coords, tags).
+
+    Tags are read from the 5th token on each atom line; a leading '#' is stripped.
+    Atoms with no 5th token have tag=None.
+
+    Tagged XYZ examples (both forms accepted):
+        O   1.2  0.0  0.0  O_target
+        O  -0.6  1.04 0.0  # O_hydroxyl
+    """
     if xyz is None or not isinstance(xyz, str) or not xyz.strip():
         raise ValueError("xyz is empty/None")
 
@@ -47,29 +61,34 @@ def parse_xyz_flexible(xyz: str) -> Tuple[List[str], List[Vec3]]:
     if not lines:
         raise ValueError("xyz has no lines")
 
-    # Try XYZ header
-    start = 0
+    # Skip natoms + comment header if present
     try:
         nat = int(lines[0])
         if len(lines) >= nat + 2:
-            start = 2
-            lines = lines[start:start+nat]
+            lines = lines[2:2 + nat]
     except Exception:
         pass
 
     atoms: List[str] = []
     coords: List[Vec3] = []
+    tags: List[Optional[str]] = []
     for ln in lines:
         parts = ln.split()
         if len(parts) < 4:
             continue
         sym = parts[0]
         x, y, z = map(float, parts[1:4])
+        tag: Optional[str] = None
+        if len(parts) >= 5:
+            # Join everything after x y z, strip leading '#' (with or without space)
+            rest = ' '.join(parts[4:]).lstrip('#').strip()
+            tag = rest.split()[0] if rest else None
         atoms.append(sym)
         coords.append((x, y, z))
+        tags.append(tag)
     if not atoms:
         raise ValueError("failed to parse any atoms")
-    return atoms, coords
+    return atoms, coords, tags
 
 def format_xyz(atoms: List[str], coords: List[Vec3], comment: str = "") -> str:
     if len(atoms) != len(coords):
@@ -184,6 +203,124 @@ def pick_protonation_site(atoms: List[str], coords: List[Vec3]) -> Tuple[int, st
     score, i = cand[0]
     return i, f"picked {atoms[i]} atom index {i} (deg~{len(infer_bonds(atoms, coords)[i])}, score={score})"
 
+
+_SEMANTIC_SELECTORS = {
+    "oxygen_terminal", "oxygen_terminal_not_hydroxyl", "o_terminal", "o_nonhydroxyl",
+    "oxygen_hydroxyl", "o_hydroxyl", "oh",
+    "nitrogen", "n_atom", "n",
+}
+
+
+def pick_protonation_site_by_selector(
+    atoms: List[str],
+    coords: List[Vec3],
+    tags: List[Optional[str]],
+    site_selector: str,
+    variant: int = 0,
+) -> Tuple[int, str]:
+    """Resolve a site_selector to an atom index.
+
+    Three selector kinds (tried in order):
+
+    1. Direct — line number:
+         "line:N"   →  1-based atom line N  (e.g. "line:2" = second atom, index 1)
+
+    2. Direct — atom tag:
+         Any string that does NOT match a semantic name is looked up in the tags
+         extracted from the 5th XYZ column (case-insensitive, leading '@' stripped).
+         Tagged XYZ:  O  1.2  0.0  0.0  O_target
+                      O -0.6  1.04 0.0  # O_hydroxyl
+
+    3. Semantic — bond-inference:
+         "oxygen_terminal" / "o_terminal" / "oxygen_terminal_not_hydroxyl" / "o_nonhydroxyl"
+             → O atoms NOT bonded to any H
+         "oxygen_hydroxyl" / "o_hydroxyl" / "oh"
+             → O atoms bonded to at least one H
+         "nitrogen" / "n_atom" / "n"
+             → N atoms
+
+    variant: 0-based index when multiple atoms match (sorted by atom index).
+    Returns (atom_index, reason_string).
+    """
+    # --- Kind 1: line:N ---
+    if site_selector.lower().startswith("line:"):
+        try:
+            n = int(site_selector.split(":", 1)[1])
+        except (ValueError, IndexError):
+            raise ValueError(
+                f"Invalid line selector '{site_selector}'. Use 'line:N' with N as a 1-based integer."
+            )
+        idx = n - 1
+        if idx < 0 or idx >= len(atoms):
+            raise ValueError(
+                f"line:{n} is out of range (geometry has {len(atoms)} atoms, valid: 1–{len(atoms)})."
+            )
+        return idx, f"line:{n} → {atoms[idx]} atom index {idx}"
+
+    sel = site_selector.lower().strip()
+
+    # --- Kind 2: atom tag (any unrecognised string) ---
+    if sel not in _SEMANTIC_SELECTORS:
+        tag_query = site_selector.lstrip('@').strip()
+        # "*" matches any non-empty tag (first tagged atom, or variant-th)
+        if tag_query == "*":
+            matches = [i for i, t in enumerate(tags) if t is not None]
+        else:
+            matches = [
+                i for i, t in enumerate(tags)
+                if t is not None and t.lower() == tag_query.lower()
+            ]
+        if matches:
+            matches.sort()
+            if variant >= len(matches):
+                raise ValueError(
+                    f"variant={variant} out of range: only {len(matches)} atom(s) "
+                    f"tagged '{tag_query}'."
+                )
+            idx = matches[variant]
+            return idx, f"atom tag '{tag_query}' variant={variant} → {atoms[idx]} index {idx}"
+        raise ValueError(
+            f"Unknown site_selector '{site_selector}'. "
+            "Direct: 'line:N' (1-based), '*' (first tagged atom), or a named atom tag "
+            "in the XYZ 5th column. "
+            "Semantic: 'oxygen_terminal', 'oxygen_hydroxyl', 'nitrogen'."
+        )
+
+    # --- Kind 3: semantic ---
+    adj = infer_bonds(atoms, coords)
+    candidates: List[int] = []
+
+    if sel in ("oxygen_terminal", "oxygen_terminal_not_hydroxyl", "o_terminal", "o_nonhydroxyl"):
+        for i, sym in enumerate(atoms):
+            if sym == "O" and not any(atoms[j] == "H" for j in adj[i]):
+                candidates.append(i)
+
+    elif sel in ("oxygen_hydroxyl", "o_hydroxyl", "oh"):
+        for i, sym in enumerate(atoms):
+            if sym == "O" and any(atoms[j] == "H" for j in adj[i]):
+                candidates.append(i)
+
+    elif sel in ("nitrogen", "n_atom", "n"):
+        for i, sym in enumerate(atoms):
+            if sym == "N":
+                candidates.append(i)
+
+    if not candidates:
+        raise ValueError(
+            f"No atoms found matching site_selector='{site_selector}'."
+        )
+    candidates.sort()
+    if variant >= len(candidates):
+        raise ValueError(
+            f"variant={variant} out of range: only {len(candidates)} candidate(s) "
+            f"for site_selector='{site_selector}'."
+        )
+    idx = candidates[variant]
+    return idx, (
+        f"site_selector='{site_selector}' variant={variant}: "
+        f"{atoms[idx]} index {idx} ({len(candidates)} candidate(s))"
+    )
+
 def place_H_on_atom(atoms: List[str], coords: List[Vec3], atom_index: int) -> Vec3:
     """Place H along direction opposite to neighbor vectors (rough lone-pair direction)."""
     sym = atoms[atom_index]
@@ -209,19 +346,41 @@ def structure_proton_edit(
     charge: int,
     multiplicity: int,
     # optional explicit site
+    site_selector: Optional[str] = None,
+    variant: int = 0,
     h_index: Optional[int] = None,
     target_atom_index: Optional[int] = None,
     geometry_name: Optional[str] = None,
     strategy: Literal["auto", "distance"] = "auto",
 ) -> Dict:
-    atoms, coords = parse_xyz_flexible(xyz)
+    atoms, coords, tags = parse_xyz_with_tags(xyz)
 
     if mode == "remove":
-        if h_index is None:
-            h_index, heavy_index, reason = pick_deprotonation_site(atoms, coords)
-        else:
+        if h_index is not None:
             heavy_index = find_heavy_neighbor_for_H(atoms, coords, h_index) or -1
             reason = f"user-selected H index {h_index} (heavy={heavy_index})"
+        elif site_selector and site_selector.lower() not in ("auto", ""):
+            resolved_idx, sel_reason = pick_protonation_site_by_selector(
+                atoms, coords, tags, site_selector, variant
+            )
+            if atoms[resolved_idx] == "H":
+                h_index = resolved_idx
+                heavy_index = find_heavy_neighbor_for_H(atoms, coords, h_index) or -1
+                reason = f"{sel_reason} (H atom, removed directly)"
+            else:
+                # Heavy atom: find the bonded H to remove
+                adj = infer_bonds(atoms, coords)
+                h_candidates = sorted(j for j in adj[resolved_idx] if atoms[j] == "H")
+                if not h_candidates:
+                    raise ValueError(
+                        f"site_selector='{site_selector}' resolved to {atoms[resolved_idx]} "
+                        f"index {resolved_idx} but it has no bonded H to remove."
+                    )
+                h_index = h_candidates[0]
+                heavy_index = resolved_idx
+                reason = f"{sel_reason} → remove H index {h_index} on {atoms[resolved_idx]}"
+        else:
+            h_index, heavy_index, reason = pick_deprotonation_site(atoms, coords)
         if atoms[h_index] != "H":
             raise ValueError(f"h_index {h_index} is not H (got {atoms[h_index]})")
         atoms2, coords2 = remove_atom(atoms, coords, h_index)
@@ -240,10 +399,14 @@ def structure_proton_edit(
         }
 
     if mode == "add":
-        if target_atom_index is None:
-            target_atom_index, reason = pick_protonation_site(atoms, coords)
-        else:
+        if target_atom_index is not None:
             reason = f"user-selected atom index {target_atom_index}"
+        elif site_selector and site_selector.lower() not in ("auto", ""):
+            target_atom_index, reason = pick_protonation_site_by_selector(
+                atoms, coords, tags, site_selector, variant
+            )
+        else:
+            target_atom_index, reason = pick_protonation_site(atoms, coords)
         if atoms[target_atom_index] == "H":
             raise ValueError("target_atom_index cannot be H")
         h_pos = place_H_on_atom(atoms, coords, target_atom_index)
@@ -258,6 +421,8 @@ def structure_proton_edit(
             "new_charge": charge + 1,
             "old_multiplicity": multiplicity,
             "new_multiplicity": multiplicity,
+            "site_selector": site_selector,
+            "reason": reason,
         }
 
     raise ValueError(f"Unknown mode: {mode}")
