@@ -30,7 +30,7 @@ def _state_get_dict(state: Any, key: str) -> Dict[str, Any]:
     v = _state_get(state, key, {})
     return v if isinstance(v, dict) else {}
 
-NEEDS_GEOM_SINGLE = {'run_solvator_cluster_thermo', 'run_opt_job', 'run_nbo_job', 'run_sp_energy', 'run_freq_job', 'run_solvator_cluster', 'structure_add_remove_proton'}
+NEEDS_GEOM_SINGLE = {'run_solvator_cluster_thermo', 'run_opt_job', 'run_nbo_job', 'run_sp_energy', 'run_freq_job', 'run_spectrum_job', 'run_tddft_job', 'run_scan_job', 'run_ts_opt_job', 'run_solvator_cluster', 'structure_add_remove_proton'}
 
 TOOLS_RETURNING_STRUCTURE = {
     "name_to_geometry_xyz",
@@ -519,6 +519,34 @@ def pubchem_get_basic_properties(name: str, timeout: int = 20) -> Dict[str, Any]
         "request_url": url,
     }
     return out
+
+
+def structure_add_remove_proton(
+    geometry_xyz: str,
+    mode: str,
+    charge: int = 0,
+    multiplicity: int = 1,
+    site_selector: Optional[str] = None,
+    variant: int = 0,
+    h_index: Optional[int] = None,
+    target_atom_index: Optional[int] = None,
+    geometry_name: Optional[str] = None,
+    strategy: str = "auto",
+) -> dict:
+    """Local implementation of structure_add_remove_proton — no MCP/SSH round-trip."""
+    from geometry_helpers import structure_proton_edit
+    return structure_proton_edit(
+        xyz=geometry_xyz,
+        mode=mode,
+        charge=charge,
+        multiplicity=multiplicity,
+        site_selector=site_selector,
+        variant=variant,
+        h_index=h_index,
+        target_atom_index=target_atom_index,
+        geometry_name=geometry_name,
+        strategy=strategy,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2617,3 +2645,202 @@ def print_result_prompt(
     )
     print(prompt)
     return prompt
+
+
+# ─── Spectrum visualization ────────────────────────────────────────────────────
+
+def render_spectrum_image(
+    spectrum_data: list,
+    spectrum_type: str,
+    label: str,
+) -> Optional[str]:
+    """Render an IR or UV-Vis spectrum PNG and open it in the OS viewer.
+
+    spectrum_type: "ir"    → x=freq_cm1, y=intensity_km_mol, Lorentzian (FWHM 30 cm⁻¹)
+    spectrum_type: "uvvis" → x=wavelength_nm, y=oscillator_strength, Gaussian (σ=10 nm)
+
+    Returns the saved PNG path, or None on failure.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("[spectrum] matplotlib / numpy not available — skipping visualization")
+        return None
+
+    if not spectrum_data:
+        return None
+
+    import tempfile
+    import platform
+    import subprocess as sp
+
+    tmp_dir = Path(tempfile.gettempdir()) / "qcagent_spectra"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_label = re.sub(r"[^A-Za-z0-9_\-]", "_", label)[:50]
+    png_path = tmp_dir / f"{safe_label}.png"
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+
+    if spectrum_type == "ir":
+        freqs = np.array([p["freq_cm1"] for p in spectrum_data])
+        ints  = np.array([p["intensity_km_mol"] for p in spectrum_data])
+
+        x_min = max(0.0, float(freqs.min()) - 150.0)
+        x_max = float(freqs.max()) + 150.0
+        x = np.linspace(x_min, x_max, 5000)
+
+        gamma = 15.0  # half-width at half-maximum (cm⁻¹), FWHM = 30
+        y = np.zeros_like(x)
+        for f, I in zip(freqs, ints):
+            y += I * (gamma ** 2) / ((x - f) ** 2 + gamma ** 2)
+
+        ax.plot(x, y, color="steelblue", linewidth=1.4, label="Lorentzian (FWHM 30 cm⁻¹)")
+        markerline, stemlines, baseline = ax.stem(freqs, ints, linefmt="grey",
+                                                   markerfmt=" ", basefmt=" ")
+        stemlines.set_linewidth(0.8)
+        ax.set_xlabel("Wavenumber (cm⁻¹)", fontsize=11)
+        ax.set_ylabel("Intensity (km mol⁻¹)", fontsize=11)
+        ax.set_xlim(x_max, x_min)   # inverted: high freq on left, conventional
+        ax.set_title(f"IR Spectrum — {label}", fontsize=12)
+
+    elif spectrum_type == "uvvis":
+        wls  = np.array([p["wavelength_nm"] for p in spectrum_data])
+        oscs = np.array([p["oscillator_strength"] for p in spectrum_data])
+
+        x_min = max(100.0, float(wls.min()) - 80.0)
+        x_max = float(wls.max()) + 80.0
+        x = np.linspace(x_min, x_max, 5000)
+
+        sigma = 10.0  # nm
+        y = np.zeros_like(x)
+        for wl, f in zip(wls, oscs):
+            y += f * np.exp(-0.5 * ((x - wl) / sigma) ** 2)
+
+        ax.plot(x, y, color="darkorange", linewidth=1.4, label=f"Gaussian (σ={sigma} nm)")
+        markerline, stemlines, baseline = ax.stem(wls, oscs, linefmt="grey",
+                                                   markerfmt=" ", basefmt=" ")
+        stemlines.set_linewidth(0.8)
+        ax.set_xlabel("Wavelength (nm)", fontsize=11)
+        ax.set_ylabel("Oscillator strength", fontsize=11)
+        ax.set_xlim(x_min, x_max)
+        ax.set_title(f"UV-Vis Spectrum — {label}", fontsize=12)
+
+    else:
+        plt.close(fig)
+        return None
+
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    fig.savefig(str(png_path), dpi=150)
+    plt.close(fig)
+
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(str(png_path))
+    elif system == "Darwin":
+        sp.Popen(["open", str(png_path)])
+    else:
+        sp.Popen(["xdg-open", str(png_path)])
+
+    return str(png_path)
+
+
+def auto_display_spectra(artifacts: dict) -> None:
+    """Scan artifacts for IR / UV-Vis / PES data and auto-display each one.
+
+    Recognised key patterns:
+      ir_spectrum_<label>    or  ir_spectrum    → IR render
+      excited_states_<label> or  excited_states → UV-Vis render
+      scan_results_<label>   or  scan_results   → PES plot
+    """
+    if not isinstance(artifacts, dict):
+        return
+    for key, value in artifacts.items():
+        if not isinstance(value, list) or not value:
+            continue
+        k = key.lower()
+        if k.startswith("ir_spectrum_") or k == "ir_spectrum":
+            mol_label = key[len("ir_spectrum_"):] if k.startswith("ir_spectrum_") else "molecule"
+            path = render_spectrum_image(value, "ir", f"IR_{mol_label}")
+            if path:
+                print(f"[spectrum] IR plot → {path}  [opened]")
+        elif k.startswith("excited_states_") or k == "excited_states":
+            mol_label = key[len("excited_states_"):] if k.startswith("excited_states_") else "molecule"
+            path = render_spectrum_image(value, "uvvis", f"UVVis_{mol_label}")
+            if path:
+                print(f"[spectrum] UV-Vis plot → {path}  [opened]")
+        elif k.startswith("scan_results_") or k == "scan_results":
+            scan_label = key[len("scan_results_"):] if k.startswith("scan_results_") else "scan"
+            path = render_pes_plot(value, f"PES_{scan_label}")
+            if path:
+                print(f"[spectrum] PES plot → {path}  [opened]")
+
+
+def render_pes_plot(scan_results: list, label: str) -> Optional[str]:
+    """Render a potential energy surface (PES) plot from scan results.
+
+    scan_results: [{"step": int, "value": float, "energy_eh": float}, ...]
+    x-axis: coordinate value (Å or degrees)
+    y-axis: relative energy in kcal/mol (minimum set to 0)
+
+    Returns the saved PNG path, or None on failure.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("[spectrum] matplotlib / numpy not available — skipping PES plot")
+        return None
+
+    if not scan_results:
+        return None
+
+    import tempfile
+    import platform
+    import subprocess as sp
+
+    tmp_dir = Path(tempfile.gettempdir()) / "qcagent_spectra"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_label = re.sub(r"[^A-Za-z0-9_\-]", "_", label)[:50]
+    png_path = tmp_dir / f"{safe_label}.png"
+
+    values    = np.array([p["value"]     for p in scan_results], dtype=float)
+    energies  = np.array([p["energy_eh"] for p in scan_results], dtype=float)
+    kcal_conv = 627.509474          # Eh → kcal/mol
+    rel_kcal  = (energies - energies.min()) * kcal_conv
+    min_idx   = int(np.argmin(energies))
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(values, rel_kcal, color="steelblue", linewidth=1.6, marker="o",
+            markersize=5, markerfacecolor="white", markeredgecolor="steelblue",
+            markeredgewidth=1.5)
+    ax.axvline(values[min_idx], color="tomato", linewidth=1.0, linestyle="--",
+               label=f"min @ {values[min_idx]:.4f}")
+
+    # Axis labels — guess units from value range
+    value_range = float(values.max() - values.min())
+    x_label = "Coordinate value (Å)" if value_range < 10 else "Coordinate value (degrees)"
+    ax.set_xlabel(x_label, fontsize=11)
+    ax.set_ylabel("Relative energy (kcal mol⁻¹)", fontsize=11)
+    ax.set_title(f"Potential Energy Surface — {label}", fontsize=12)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    fig.savefig(str(png_path), dpi=150)
+    plt.close(fig)
+
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(str(png_path))
+    elif system == "Darwin":
+        sp.Popen(["open", str(png_path)])
+    else:
+        sp.Popen(["xdg-open", str(png_path)])
+
+    return str(png_path)

@@ -23,10 +23,9 @@ Operating model (control room vs assembly line)
 - Only include LLM “supervisor” steps for a SMALL, task-specific whitelist of potential patterns (typically 1–3). Do NOT design a general “fix everything” supervisor.
 
 Node types
-- There are 3 kinds of node in the workflow: tool, calculation and LLM, each node should show their type in its kind field.
+- There are 2 kinds of node in the workflow: tool and calc (LLM), each node should show their type in its kind field.
 - tools: running tools. kind: "tool"
-- calculation: calculating with values yielded from tools or other sources. kind: "llm"  (executed by a calculator LLM)
-- LLM report: generate report. kind: "llm"
+- calculation: computing NUMERIC derived quantities (e.g., pKa) from tool artifacts. kind: "llm"  (executed by QC-CALCULATOR, returns JSON only)
 
 TOOL NODES
 - Always omit charge and multiplicity in tool input, do not guess the values.
@@ -114,10 +113,33 @@ Output a single JSON object with these top-level keys:
   "final_report": { "format": "markdown", "fields": ["G_HA_eh", "G_A_minus_eh", "pka"] }
 }
 
+Tool result field names (use EXACTLY these paths in product mappings):
+  run_sp_energy:             energy_eh
+  run_opt_job:               energy_eh  ← no geometry field; geometry stored via output_id
+  run_freq_job:              energy_eh, enthalpy_eh, gibbs_free_energy_eh
+  run_spectrum_job:          energy_eh, enthalpy_eh, gibbs_free_energy_eh,
+                             ir_spectrum, raman_spectrum (raman only when requested)
+  run_tddft_job:             energy_ground_state_eh,
+                             excited_states (list of {state, energy_ev, wavelength_nm, oscillator_strength})
+  run_scan_job:              scan_results (list of {step, value, energy_eh}),
+                             min_energy_eh, min_value, n_points,
+                             geometry_xyz (geometry at PES maximum — TS candidate)
+  run_ts_opt_job:            energy_eh, geometry_xyz (optimised TS), ts_converged
+  run_nbo_job:               nbo_section
+  run_solvator_cluster_thermo: energy_eh, enthalpy_eh, gibbs_free_energy_eh
+  structure_add_remove_proton: geometry_xyz (geometry stored via output_id)
+  name_to_geometry_xyz:      geometry_xyz (geometry stored via output_id)
+
+Geometry via input_id/output_id:
+- Geometry strings are NEVER artifacts. Do NOT put them in artifacts_to_save or product.
+- Use input_id / output_id to route geometries between nodes automatically.
+- LLM report nodes MUST NOT list geometry artifact keys in needs_artifacts.
+
 Artifacts contract
 - artifacts_to_save is the authoritative list of artifact KEYS that must be available in state["artifacts"] at the end.
-- Every key in artifacts_to_save MUST be produced by at least one node via node.product and/or tool-result artifacts/properties.
-- For tool nodes: if you declare product {"K": ...} and K is an artifact, the tool MUST return result.artifacts.K (preferred) or an equivalent path you map in product.
+- Only NUMERICAL or LIST values belong in artifacts_to_save (energies, spectra, derived quantities).
+- Every key in artifacts_to_save MUST be produced by at least one node via node.product.
+- For tool nodes: declare product {"K": "result_field"} and K is stored from result["result_field"].
 - Node args may reference artifacts with $(artifacts.K) or $(node_id.artifacts.K) (use whichever is more natural).
 
 Geometry rules
@@ -141,10 +163,12 @@ Error handling policy (custodian-like)
 - Do NOT escalate to an LLM for error fixing.
 
 LLM node policy (kind: "llm")
-- LLM nodes are allowed only for:
-  - computing derived quantities from INDIVIDUAL values gathered from tool artifacts
-    (e.g., computing pKa from G_HA_eh, G_A_minus_eh, and G_H_plus_ref_eh — NOT from a pre-computed deltaG)
-  - generating final reports
+- LLM nodes (QC-CALCULATOR) are ONLY for computing numeric derived quantities from tool artifacts.
+  Example: pKa from G_HA_eh, G_A_minus_eh, G_H_plus_ref_eh.
+- QC-CALCULATOR returns machine-readable JSON ONLY. It CANNOT write narrative text, tables, or reports.
+  Do NOT create a kind:"llm" node for report generation — it will always fail.
+- Only add a kind:"llm" node when a derived number (pKa, ΔG, relative energy, etc.) must be computed.
+  If the tool output already contains all needed values, skip the LLM node entirely.
 - The calc node gathers individual values via needs_artifacts and computes the final result.
   Do NOT create intermediate artifacts like "deltaG" — the calc node does the full chain.
 - Keep the prompt short: list the formula and which artifacts/settings to use. Standard constants (R, T, ln10, Eh_to_J_mol) are already known to the calculator.

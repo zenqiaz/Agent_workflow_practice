@@ -24,6 +24,7 @@ from client_helpers import (
     summarize_geometries_prompt,
     geom_key_from_path,
     name_to_geometry_xyz,
+    structure_add_remove_proton,
     print_tool_output,
     get_trivial_properties,
     pubchem_get_basic_properties,
@@ -49,6 +50,9 @@ from client_helpers import (
     display_and_confirm_compound,
     compounds_to_planner_context,
     render_xyz_image_rdkit,
+    auto_display_spectra,
+    render_spectrum_image,
+    render_pes_plot,
 )
 from build_graph_from_plan import build_graph_from_plan, build_state
 from prompts import SYSTEM_PROMPT, CALCULATOR_SYSTEM_PROMPT, REPORTER_SYSTEM_PROMPT
@@ -65,6 +69,7 @@ OPENAI_TOOLS = json.loads(Path("openai_tools_geom.json").read_text(encoding="utf
 CLIENT_SIDE_TOOL_FUNCS = {
     "name_to_geometry_xyz": name_to_geometry_xyz,
     "pubchem_get_basic_properties": pubchem_get_basic_properties,
+    "structure_add_remove_proton": structure_add_remove_proton,
     
     "state_update": lambda **kw: state_update(state, **kw),          # not so useful: applicable only when data readily to be fill into the state
     "state_get_tool_args": lambda **kw: state_get_tool_args(state, **kw),
@@ -341,6 +346,34 @@ async def main():
                     continue
                 
                 
+                if line.strip().lower() == "showspec":
+                    arts = state.get("last_artifacts") or {}
+                    spec_keys = [
+                        k for k in arts
+                        if k.lower().startswith("ir_spectrum")
+                        or k.lower().startswith("excited_states")
+                        or k.lower().startswith("scan_results")
+                    ]
+                    if not spec_keys:
+                        print("No spectrum/PES artifacts found. Run a calculation first.")
+                    else:
+                        for k in spec_keys:
+                            v = arts.get(k)
+                            if isinstance(v, list) and v:
+                                kl = k.lower()
+                                if kl.startswith("ir_spectrum"):
+                                    mol = k[len("ir_spectrum_"):] if kl.startswith("ir_spectrum_") else "molecule"
+                                    path = render_spectrum_image(v, "ir", f"IR_{mol}")
+                                elif kl.startswith("excited_states"):
+                                    mol = k[len("excited_states_"):] if kl.startswith("excited_states_") else "molecule"
+                                    path = render_spectrum_image(v, "uvvis", f"UVVis_{mol}")
+                                else:
+                                    scan_lbl = k[len("scan_results_"):] if kl.startswith("scan_results_") else "scan"
+                                    path = render_pes_plot(v, f"PES_{scan_lbl}")
+                                if path:
+                                    print(f"[spectrum] {k} → {path}  [opened]")
+                    continue
+
                 if line.strip().lower() == "run":
                     # 1) pick plan (prefer approved)
                     plan_name = state.get("approved_plan_name") or state.get("latest_plan_name")
@@ -368,6 +401,8 @@ async def main():
                     result = await graph.ainvoke(init_state)   # or graph.invoke(...)
                     print("Done:", result.get("status", "unknown"))
                     pprint(result.get("artifacts"))
+                    state["last_artifacts"] = result.get("artifacts") or {}
+                    auto_display_spectra(state["last_artifacts"])
                     user_payload = (
                         f"Original user request:\n{state.get('last_user_text','(not provided)')}\n\n"
                         f"Run result:\n{result_dict_to_prompt(result=result, user_text=state.get('last_user_text'))}"

@@ -134,6 +134,78 @@ Plan validation rules:
 """.strip()
 
 
+class TSSearchSkill(PlannerSkill):
+    """Transition-state search: relaxed scan → OptTS → freq verification."""
+
+    name = "ts_search"
+    priority = 27  # between ThermochemistrySkill (25) and SolvationSkill (30)
+
+    _KEYWORDS = (
+        "transition state", "ts search", "ts opt", "saddle point",
+        "activation barrier", "activation energy", "optts", "ts structure",
+        "find ts", "locate ts", "reaction barrier", "reaction pathway",
+        "bond breaking", "bond forming",
+    )
+
+    def matches(self, user_text: str, state: dict) -> bool:
+        low = user_text.lower()
+        return any(kw in low for kw in self._KEYWORDS)
+
+    def render(self, user_text: str, state: dict) -> str:
+        return """SKILL: Transition State (TS) Search Protocol
+────────────────────────────────────────────────────────────
+
+Workflow: scan reaction coordinate → OptTS on PES maximum → freq verification
+
+Step 1 — Relaxed PES scan (run_scan_job)
+  Scan the reaction coordinate (bond/angle/dihedral) to locate the approximate TS.
+  run_scan_job returns:
+    scan_results:     [{step, value, energy_eh}, ...]
+    geometry_xyz:     geometry at the PES MAXIMUM (TS candidate)
+  Use output_id on the scan node to store the PES-maximum geometry as the TS candidate.
+
+Step 2 — OptTS on PES maximum (run_ts_opt_job)
+  Input:     PES-maximum geometry (from scan node output_id)
+  calc_hess: ALWAYS set true (required for reliable TS optimisation)
+  Returns:   geometry_xyz (optimised TS), energy_eh, ts_converged
+  Use output_id to store the optimised TS geometry.
+
+Step 3 — Freq verification (run_freq_job or run_spectrum_job)
+  Run on the optimised TS geometry.
+  A true transition state has EXACTLY ONE negative (imaginary) frequency.
+  In ir_spectrum, imaginary modes appear as negative freq_cm1 values.
+  Use run_spectrum_job (spectrum_type="ir") to get both E/H/G and the ir_spectrum.
+
+Plan pattern (4 nodes):
+  {load_mol}
+  {scan_rc:    run_scan_job,    output_id: "ts_candidate",
+               product: {"scan_results_rc": "scan_results"}}
+  {ts_opt:     run_ts_opt_job,  input_id: "ts_candidate", output_id: "ts_structure",
+               args: {calc_hess: true},
+               product: {"ts_energy_eh": "energy_eh"}}
+  {ts_freq:    run_spectrum_job, input_id: "ts_structure",
+               product: {"ts_ir_spectrum": "ir_spectrum",
+                         "ts_gibbs_eh": "gibbs_free_energy_eh"}}
+
+scan_coords notes:
+  Choose the coordinate that changes most along the reaction path.
+  Use n_points = 10–15 for TS searches (coarser scan to locate max).
+  Do NOT set ncores > 1 for scan (MPI scan mode has known issues).
+
+CRITICAL — no kind:"llm" node:
+  The TS structure and frequencies are returned as structured data.
+  QC-CALCULATOR cannot process geometry or frequency data.
+  Confirm TS by checking ts_ir_spectrum for exactly 1 negative freq_cm1 entry
+  in the final_report fields — no LLM node needed.
+
+Artifact naming convention:
+  scan_results_rc    — PES scan results
+  ts_energy_eh       — OptTS final energy
+  ts_ir_spectrum     — IR spectrum of TS (check for 1 imaginary mode)
+  ts_gibbs_eh        — Gibbs free energy of TS (for activation barrier ΔG‡)
+""".strip()
+
+
 class SolvationSkill(PlannerSkill):
     """Microsolvation / explicit solvation protocol and nsolv guidance."""
 
@@ -302,6 +374,201 @@ LLM calc node prompt — MUST include this data integrity check:
 """.strip()
 
 
+class ScanSkill(PlannerSkill):
+    """Relaxed potential-energy-surface (PES) scan protocol."""
+
+    name = "scan"
+    priority = 21   # before SpectrumSkill (22) and TDDFTSkill (23)
+
+    _KEYWORDS = (
+        "scan", "pes scan", "potential energy surface", "reaction coordinate",
+        "bond scan", "angle scan", "dihedral scan", "surface scan",
+        "energy profile", "dissociation curve", "torsion scan", "rotational scan",
+        "scan energy", "scan bond", "scan angle",
+    )
+
+    def matches(self, user_text: str, state: Dict[str, Any]) -> bool:
+        low = user_text.lower()
+        return any(kw in low for kw in self._KEYWORDS)
+
+    def render(self, user_text: str, state: Dict[str, Any]) -> str:
+        return """SKILL: Relaxed PES Surface Scan
+────────────────────────────────────────────────────────────
+
+Tool: run_scan_job
+  Relaxed scan: ORCA optimises the geometry at each scan point (all degrees
+  of freedom relaxed except the scanned coordinate) in a SINGLE ORCA job.
+  Input: starting geometry (ideally pre-optimised).
+  Returns: scan_results list, min_energy_eh, min_value.
+
+Coordinate types (ORCA 0-based atom indices):
+  B  atoms=[i, j]       → bond length (Å)
+  A  atoms=[i, j, k]    → bond angle (degrees)
+  D  atoms=[i, j, k, l] → dihedral angle (degrees)
+
+scan_coords parameter (JSON string):
+  '[{"type":"B", "atoms":[0,1], "start":0.8, "end":1.8, "n_points":11}]'
+  n_points: total number of calculation points (inclusive of start and end).
+  Typical: 10-20 for a 1D scan.
+
+Atom indices are 0-based (first atom = 0). Check the XYZ geometry to identify
+the correct atom numbers for the coordinate of interest.
+
+Performance note:
+  Relaxed scans run one geometry optimisation per point — keep n_points ≤ 13
+  for quick jobs. Do NOT set ncores > 1 (MPI scan mode has known issues).
+
+Plan pattern (2 nodes — NO LLM node):
+  load → run_scan_job
+  product: {"scan_results_<label>": "scan_results"}
+  artifacts_to_save: ["scan_results_<label>"]
+
+  Example for O-H bond scan of water:
+    {"kind": "tool", "tool": "run_scan_job",
+     "args": {"input_geom_id": "water",
+              "scan_coords": "[{\\"type\\":\\"B\\",\\"atoms\\":[0,1],\\"start\\":0.8,\\"end\\":1.8,\\"n_points\\":11}]",
+              "method": "B3LYP", "basis": "def2-SVP"},
+     "product": {"scan_results_oh_stretch": "scan_results"}}
+
+CRITICAL — no kind:"llm" node:
+  scan_results is already structured JSON [{step, value, energy_eh}].
+  QC-CALCULATOR cannot write tables or reports — never add an LLM node.
+  The PES plot is generated automatically from the structured data.
+""".strip()
+
+
+class SpectrumSkill(PlannerSkill):
+    """IR/Raman vibrational spectrum protocol."""
+
+    name = "spectrum"
+    priority = 22
+
+    _KEYWORDS = ("spectrum", "ir spectrum", "infrared", "raman", "vibrational spectrum",
+                 "absorption band", "ir band", "vibrational mode", "spectroscop")
+
+    def matches(self, user_text: str, state: Dict[str, Any]) -> bool:
+        low = user_text.lower()
+        return any(kw in low for kw in self._KEYWORDS)
+
+    def render(self, user_text: str, state: Dict[str, Any]) -> str:
+        return """SKILL: IR/Raman Spectrum Calculation
+────────────────────────────────────────────────────────────
+
+Tool: run_spectrum_job
+  Extends run_freq_job: same E/H/G thermochemistry PLUS spectral data.
+
+spectrum_type parameter:
+  "ir"       → IR spectrum only (free; default)
+  "raman"    → IR + Raman (adds %elprop Polar 1; roughly 2× cost)
+  "ir_raman" → same as "raman"
+
+Output fields:
+  energy_eh, enthalpy_eh, gibbs_free_energy_eh  (identical to run_freq_job)
+  ir_spectrum:    list of {mode, freq_cm1, intensity_km_mol}
+  raman_spectrum: list of {mode, freq_cm1, activity, depolarization}
+                  (only present when spectrum_type="raman" or "ir_raman")
+
+IR intensity unit:  km/mol  (standard, proportional to peak area)
+Raman activity unit: Å⁴/amu (relative; depolarization ratio 0–0.75)
+
+Geometry requirement:
+  Run run_spectrum_job on an already-optimised geometry.
+  Running it on an unoptimised structure will produce meaningless frequencies
+  (including imaginary modes). Standard workflow:
+    run_opt_job → run_spectrum_job (input_id = output of opt)
+
+Typical levels of theory:
+  IR only : B3LYP/def2-SVP  (fast, qualitatively reliable)
+  IR+Raman: B3LYP/def2-SVP  (same level; Raman adds polarizability CPSCF)
+  Higher  : B3LYP/def2-TZVP for more quantitative frequencies
+
+Frequency scaling:
+  Computed harmonic frequencies are systematically too high.
+  For B3LYP/def2-SVP: scale by ~0.97 for comparison with experiment.
+  Report raw computed values; note scaling in the final_report.
+
+Plan pattern for IR spectrum (3 nodes only — NO LLM node):
+  load → run_opt_job (output_id: mol_opt) → run_spectrum_job(input_id: mol_opt, spectrum_type="ir")
+  product: {"ir_spectrum_<species>": "ir_spectrum", "gibbs_free_energy_<species>_eh": "gibbs_free_energy_eh"}
+
+CRITICAL — no kind:"llm" report node for spectrum:
+  The ir_spectrum list is already fully structured JSON from run_spectrum_job.
+  QC-CALCULATOR only handles numeric derivations (pKa, ΔG, etc.), NOT narrative text or tables.
+  Adding a kind:"llm" report node will ALWAYS fail with status "error".
+  Keep the plan to exactly 3 nodes: load, opt, spectrum.
+  The final_report section captures the artifacts automatically via its fields list.
+
+Artifact naming convention:
+  ir_spectrum_<species>           — the ir_spectrum list artifact
+  gibbs_free_energy_<species>_eh  — Gibbs free energy in Eh
+  raman_spectrum_<species>        — Raman list artifact (if requested)
+
+Do NOT put geometry strings in artifacts_to_save or product mappings.
+""".strip()
+
+
+class TDDFTSkill(PlannerSkill):
+    """TD-DFT excited-state / UV-Vis absorption protocol."""
+
+    name = "tddft"
+    priority = 23  # between SpectrumSkill (22) and ThermochemistrySkill (25)
+
+    _KEYWORDS = ("tddft", "td-dft", "excited state", "excitation energy",
+                 "uv-vis", "uv/vis", "absorption spectrum", "electronic transition",
+                 "oscillator strength", "charge transfer state", "singlet excited",
+                 "s1 state", "vertical excitation", "optical gap")
+
+    def matches(self, user_text: str, state: Dict[str, Any]) -> bool:
+        low = user_text.lower()
+        return any(kw in low for kw in self._KEYWORDS)
+
+    def render(self, user_text: str, state: Dict[str, Any]) -> str:
+        return """SKILL: TD-DFT Excited State / UV-Vis Absorption Calculation
+\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+Tool: run_tddft_job
+  Single-point TD-DFT on an already-optimised geometry.
+  Computes ground-state energy + vertical excitation energies for singlet excited states.
+
+Parameters:
+  n_states: number of excited states to compute (default 5; increase for wider coverage)
+
+Output fields:
+  energy_ground_state_eh: ground-state DFT energy (Eh)
+  excited_states: list of {state, energy_ev, wavelength_nm, oscillator_strength}
+                  sorted by state index (ascending energy)
+
+UV/Vis conventions:
+  oscillator_strength >> 0  -> bright (electric-dipole-allowed) transition
+  oscillator_strength ~  0  -> dark (symmetry-forbidden) transition
+  wavelength_nm is the vertical absorption peak for each excited state.
+
+Geometry requirement:
+  Always run on an optimised geometry (use run_opt_job first).
+  Standard workflow:
+    run_opt_job (output_id: mol_opt) -> run_tddft_job (input_id: mol_opt)
+
+Recommended levels of theory:
+  General UV/Vis:   B3LYP/def2-SVP    (fast, qualitatively correct for most organics)
+  Better accuracy:  PBE0/def2-TZVP    (~2x cost, more quantitative excitation energies)
+  Charge-transfer:  CAM-B3LYP/def2-TZVP (range-separated; needed for CT excited states)
+
+Plan pattern (3 nodes -- NO LLM node):
+  load -> run_opt_job (output_id: mol_opt) -> run_tddft_job (input_id: mol_opt, n_states=5)
+  product: {"excited_states_<species>": "excited_states",
+            "energy_<species>_ground_eh": "energy_ground_state_eh"}
+
+CRITICAL -- no kind:"llm" report node:
+  excited_states is already fully structured JSON. QC-CALCULATOR cannot write UV/Vis tables.
+  Keep the plan to exactly 3 nodes: load, opt, tddft.
+  Use final_report.fields: ["excited_states_<species>", "energy_<species>_ground_eh"]
+
+Artifact naming convention:
+  excited_states_<species>         -- the list of excited states
+  energy_<species>_ground_eh       -- ground state DFT energy (Eh)
+""".strip()
+
+
 class NBOSkill(PlannerSkill):
     """NBO analysis: what to request, what output to expect, charge transfer."""
 
@@ -354,7 +621,11 @@ SKILL_REGISTRY: List[PlannerSkill] = [
     MethodSelectionSkill(),
     ProtonationSiteSkill(),
     PKaSkill(),
+    ScanSkill(),
+    SpectrumSkill(),
+    TDDFTSkill(),
     ThermochemistrySkill(),
+    TSSearchSkill(),
     SolvationSkill(),
     NBOSkill(),
 ]

@@ -162,13 +162,14 @@ def _build_calc(
     multiplicity: int,
     method: str,
     basis: str,
-    job_type: Literal["sp", "opt", "freq"],
+    job_type: Literal["sp", "opt", "freq", "scan", "ts_opt"],
     use_ri: bool,
     scf_max_iter: int,
     opt_max_iter: int,
     nbo: bool,
     ncores: int,
     clean_workdir: bool = True,
+    raman: bool = False,
 ) -> Calculator:
     _ensure_clean_dir(workdir, clean=clean_workdir)
 
@@ -181,18 +182,32 @@ def _build_calc(
     calc.structure = structure
     _set_charge_mult(calc, charge, multiplicity)
 
-    # Keep your “same keywords” style: build one main line.
-    task_kw = "OPT" if job_type == "opt" else ("FREQ" if job_type == "freq" else "SP")
+    # Keep your "same keywords" style: build one main line.
+    # "scan" maps to OPT keyword (activates ORCA scan loop) but skips BlockGeom
+    # to avoid a second %geom block conflicting with the %geom Scan block.
+    # "ts_opt" uses OptTS keyword; caller adds its own %geom block.
+    if job_type == "ts_opt":
+        task_kw = "OptTS"
+    elif job_type in ("opt", "scan"):
+        task_kw = "OPT"
+    elif job_type == "freq":
+        task_kw = "FREQ"
+    else:
+        task_kw = "SP"
     ri_kw = "RIJCOSX" if use_ri else ""
     nbo_kw = "NBO" if nbo else ""
 
-    main_line = f"! {method} {basis} {task_kw} {ri_kw} {nbo_kw}".strip()
+    main_line = " ".join(p for p in [f"! {method}", basis, task_kw, ri_kw, nbo_kw] if p.strip())
     calc.input.add_arbitrary_string(main_line)
+
+    # Raman: requires polarizability derivatives via %elprop Polar 1
+    if raman:
+        calc.input.add_arbitrary_string("%elprop\n  Polar 1\nend")
 
     # SCF control
     calc.input.add_blocks(BlockScf(maxiter=scf_max_iter))
 
-    # OPT control
+    # OPT control (skip for "scan" and "ts_opt" — callers add their own %geom blocks)
     if job_type == "opt":
         calc.input.add_blocks(BlockGeom(maxiter=opt_max_iter))
 
@@ -320,6 +335,137 @@ def extract_gibbs_free_energy(output_text: str) -> Optional[float]:
             if v is not None:
                 return v
     return None
+
+def extract_ir_spectrum(output_text: str) -> List[Dict]:
+    """Parse IR SPECTRUM block from ORCA output.
+
+    Returns [{"mode": int, "freq_cm1": float, "intensity_km_mol": float}, ...]
+    for real vibrational modes only (|freq| > 10 cm-1).
+    Uses the last occurrence of the block.
+
+    ORCA format:
+      Mode   freq       eps      Int      T**2   TX  TY  TZ
+             cm**-1  L/(mol*cm)  km/mol   a.u.
+      6:   2078.52   0.002020   10.21  0.000303  (...)
+    """
+    lines = output_text.splitlines()
+    block_start = None
+    for i in range(len(lines) - 1, -1, -1):
+        if re.search(r'\bIR\s+SPECTRUM\b', lines[i], re.IGNORECASE):
+            block_start = i
+            break
+    if block_start is None:
+        return []
+
+    # Pattern: "  6:   2078.52   0.002020   10.21  ..."
+    # columns after "N:": freq, eps, Int(km/mol), T**2, (TX TY TZ)
+    pat = re.compile(r'^\s*(\d+):\s+([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)')
+    result = []
+    for line in lines[block_start + 1: block_start + 100]:
+        m = pat.match(line)
+        if m:
+            mode = int(m.group(1))
+            freq = float(m.group(2))
+            # m.group(3) = eps, m.group(4) = Int (km/mol)
+            intensity = float(m.group(4))
+            if abs(freq) > 10.0:
+                result.append({"mode": mode, "freq_cm1": freq, "intensity_km_mol": intensity})
+        elif result and line.strip() and not line.strip().startswith(('-', '*')):
+            if not re.match(r'\s*(mode|freq|cm\*\*)', line.strip(), re.IGNORECASE):
+                break
+    return result
+
+
+def extract_raman_spectrum(output_text: str) -> List[Dict]:
+    """Parse RAMAN SPECTRUM block from ORCA output.
+
+    Returns [{"mode": int, "freq_cm1": float, "activity": float, "depolarization": float}, ...]
+    for real vibrational modes only (|freq| > 10 cm-1).
+    Requires %elprop Polar 1 in the ORCA input.
+
+    ORCA format:
+      Mode    freq (cm**-1)   Activity   Depolarization
+      6:      2078.52      8.498849      0.722060
+    """
+    lines = output_text.splitlines()
+    block_start = None
+    for i in range(len(lines) - 1, -1, -1):
+        if re.search(r'\bRAMAN\s+SPECTRUM\b', lines[i], re.IGNORECASE):
+            block_start = i
+            break
+    if block_start is None:
+        return []
+
+    pat = re.compile(r'^\s*(\d+):\s+([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)')
+    result = []
+    for line in lines[block_start + 1: block_start + 100]:
+        m = pat.match(line)
+        if m:
+            mode = int(m.group(1))
+            freq = float(m.group(2))
+            activity = float(m.group(3))
+            depol = float(m.group(4))
+            if abs(freq) > 10.0:
+                result.append({"mode": mode, "freq_cm1": freq,
+                                "activity": activity, "depolarization": depol})
+        elif result and line.strip() and not line.strip().startswith(('-', '*')):
+            if not re.match(r'\s*(mode|freq|activity|depol)', line.strip(), re.IGNORECASE):
+                break
+    return result
+
+
+_EV_PER_CM1 = 1.0 / 8065.54439  # 1 cm⁻¹ in eV
+
+
+def extract_excited_states(output_text: str) -> List[Dict]:
+    """Parse TD-DFT excited states from ORCA absorption spectrum table.
+
+    Finds the last occurrence of the
+    "ABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS" block.
+
+    ORCA 6 format (columns: Transition | Energy(eV) | Energy(cm-1) | Wavelength(nm) | fosc(D2) | ...):
+        0-1A  ->  1-1A    4.077777   32889.5   304.0   0.000000000   ...
+        0-1A  ->  2-1A    8.200851   66144.3   151.2   0.170248747   ...
+
+    Returns list of:
+        {"state": int, "energy_ev": float, "wavelength_nm": float,
+         "oscillator_strength": float}
+    """
+    lines = output_text.splitlines()
+    block_start = None
+    for i, line in enumerate(lines):
+        if "ABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS" in line.upper():
+            block_start = i
+
+    if block_start is None:
+        return []
+
+    # Match: "  0-1A  ->  N-XA    energy_ev   energy_cm1   wavelength_nm   fosc   ..."
+    pat = re.compile(
+        r'^\s+\d+-\S+\s*->\s*(\d+)-\S+\s+'  # transition label (group 1: target state #)
+        r'([\d.]+)\s+'                         # energy_ev (group 2)
+        r'[\d.]+\s+'                           # energy_cm1 (skip)
+        r'([\d.]+)\s+'                         # wavelength_nm (group 3)
+        r'([\d.]+(?:[eE][+-]?\d+)?)'           # fosc (group 4)
+    )
+    result = []
+    for line in lines[block_start + 1: block_start + 200]:
+        m = pat.match(line)
+        if m:
+            state = int(m.group(1))
+            energy_ev = float(m.group(2))
+            wavelength_nm = float(m.group(3))
+            fosc = float(m.group(4))
+            result.append({
+                "state": state,
+                "energy_ev": round(energy_ev, 4),
+                "wavelength_nm": round(wavelength_nm, 2),
+                "oscillator_strength": round(fosc, 6),
+            })
+        elif result and re.match(r'\s*-{10,}', line):
+            break  # end-of-block separator
+    return result
+
 
 def _get_cluster_xyz_from_solvator_result(result: dict) -> Optional[str]:
     # Be defensive: different helper versions use different keys.
@@ -867,6 +1013,573 @@ async def run_freq_job(
         "enthalpy_eh": enthalpy,
         "gibbs_free_energy_eh": gibbs,
         "product": "gibbs_free_energy_eh",
+    })
+
+
+@mcp.tool()
+async def run_spectrum_job(
+    geometry_xyz: str,
+    charge: int = 0,
+    multiplicity: int = 1,
+    spectrum_type: Literal["ir", "raman", "ir_raman"] = "ir",
+    method: str = "B3LYP",
+    basis: str = "def2-SVP",
+    use_ri: bool = True,
+    scf_max_iter: int = 150,
+    wall_timeout_seconds: int = 3600,
+    job_label: Optional[str] = None,
+    ncores: int = 1,
+) -> str:
+    """Run an ORCA frequency calculation and return IR and/or Raman spectrum data.
+
+    spectrum_type:
+      "ir"       – IR spectrum only (always free with FREQ; default)
+      "raman"    – IR + Raman spectrum (adds %elprop Polar 1; ~2x cost)
+      "ir_raman" – same as "raman"
+
+    Returns E/H/G (same as run_freq_job) plus:
+      ir_spectrum:    [{mode, freq_cm1, intensity_km_mol}, ...]
+      raman_spectrum: [{mode, freq_cm1, activity, depolarization}, ...]  (if requested)
+    """
+    if not geometry_xyz.strip():
+        raise ValueError("geometry_xyz is empty")
+
+    do_raman = spectrum_type in ("raman", "ir_raman")
+
+    if job_label is None:
+        job_label = f"spec_{os.getpid()}_{int(asyncio.get_event_loop().time())}"
+    job_label = sanitize_label(job_label)
+    jobs_dir = Path(os.environ.get("ORCA_JOBS_DIR", "jobs"))
+    workdir = jobs_dir / job_label
+
+    calc = _build_calc(
+        label=job_label,
+        workdir=workdir,
+        geometry_xyz=geometry_xyz,
+        charge=charge,
+        multiplicity=multiplicity,
+        method=method,
+        basis=basis,
+        job_type="freq",
+        use_ri=use_ri,
+        scf_max_iter=scf_max_iter,
+        opt_max_iter=1,
+        nbo=False,
+        ncores=ncores,
+        raman=do_raman,
+    )
+
+    try:
+        output = await _run_calc_with_timeout(calc, wall_timeout_seconds)
+    except asyncio.TimeoutError:
+        out_text = _read_out_text(workdir, job_label)
+        return json.dumps({
+            "status": "timeout", "label": job_label,
+            "text": f"Status: TIMEOUT after {wall_timeout_seconds}s",
+            "ir_spectrum": extract_ir_spectrum(out_text),
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "label": job_label, "error": str(e)})
+
+    ok = output.terminated_normally()
+    out_text = _read_out_text(workdir, job_label)
+    if not ok:
+        return json.dumps({
+            "status": "error", "label": job_label,
+            "tail": "\n".join(out_text.splitlines()[-120:]),
+        })
+
+    energy = extract_total_energy(out_text)
+    enthalpy = extract_total_enthalpy(out_text)
+    gibbs = extract_gibbs_free_energy(out_text)
+    ir_spec = extract_ir_spectrum(out_text)
+
+    result = {
+        "status": "ok",
+        "label": job_label,
+        "energy_eh": energy,
+        "enthalpy_eh": enthalpy,
+        "gibbs_free_energy_eh": gibbs,
+        "ir_spectrum": ir_spec,
+        "spectrum_type": spectrum_type,
+        "product": "gibbs_free_energy_eh",
+    }
+    if do_raman:
+        result["raman_spectrum"] = extract_raman_spectrum(out_text)
+
+    return json.dumps(result)
+
+
+@mcp.tool()
+async def run_tddft_job(
+    geometry_xyz: str,
+    charge: int = 0,
+    multiplicity: int = 1,
+    method: str = "B3LYP",
+    basis: str = "def2-SVP",
+    n_states: int = 5,
+    use_ri: bool = True,
+    scf_max_iter: int = 150,
+    wall_timeout_seconds: int = 3600,
+    job_label: Optional[str] = None,
+    ncores: int = 1,
+) -> str:
+    """Run an ORCA TD-DFT excited-state calculation on a pre-optimised geometry.
+
+    Computes ground-state DFT energy and the lowest n_states singlet excited states.
+    The input geometry must already be optimised (run run_opt_job first).
+
+    Returns a dict with:
+        energy_ground_state_eh: float  (ground-state DFT energy in Eh)
+        excited_states: list of {state, energy_ev, wavelength_nm, oscillator_strength}
+
+    Oscillator strength (fosc) interpretation:
+        fosc >> 0  -> bright (electric-dipole-allowed) transition
+        fosc ~  0  -> dark (forbidden) transition
+    """
+    if not geometry_xyz.strip():
+        raise ValueError("geometry_xyz is empty")
+
+    if job_label is None:
+        job_label = f"tddft_{os.getpid()}_{int(asyncio.get_event_loop().time())}"
+    job_label = sanitize_label(job_label)
+    jobs_dir = Path(os.environ.get("ORCA_JOBS_DIR", "jobs"))
+    workdir = jobs_dir / job_label
+
+    calc = _build_calc(
+        label=job_label,
+        workdir=workdir,
+        geometry_xyz=geometry_xyz,
+        charge=charge,
+        multiplicity=multiplicity,
+        method=method,
+        basis=basis,
+        job_type="sp",
+        use_ri=use_ri,
+        scf_max_iter=scf_max_iter,
+        opt_max_iter=1,
+        nbo=False,
+        ncores=ncores,
+    )
+    n_states = max(1, int(n_states))
+    calc.input.add_arbitrary_string(f"%tddft\n  nroots {n_states}\nend")
+
+    try:
+        output = await _run_calc_with_timeout(calc, wall_timeout_seconds)
+    except asyncio.TimeoutError:
+        out_text = _read_out_text(workdir, job_label)
+        return json.dumps({
+            "status": "timeout",
+            "label": job_label,
+            "excited_states": extract_excited_states(out_text),
+            "text": f"Status: TIMEOUT after {wall_timeout_seconds}s",
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "label": job_label, "error": str(e)})
+
+    ok = output.terminated_normally()
+    out_text = _read_out_text(workdir, job_label)
+    if not ok:
+        return json.dumps({
+            "status": "error",
+            "label": job_label,
+            "tail": "\n".join(out_text.splitlines()[-120:]),
+        })
+
+    energy = extract_total_energy(out_text)
+    excited_states = extract_excited_states(out_text)
+
+    return json.dumps({
+        "status": "ok",
+        "label": job_label,
+        "energy_ground_state_eh": energy,
+        "excited_states": excited_states,
+        "product": "excited_states",
+        "text": (
+            f"Status: OK\nGround state energy: {energy} Eh\n"
+            f"Excited states found: {len(excited_states)}"
+        ),
+    })
+
+
+# ─── Rigid surface scan ────────────────────────────────────────────────────────
+
+def _build_scan_block(scan_coords: List[Dict]) -> str:
+    """Build ORCA %geom Scan block for a rigid scan.
+
+    scan_coords: [{"type": "B"|"A"|"D",
+                   "atoms": [i, j, ...],   # 0-based ORCA indices
+                   "start": float,         # Å for B; degrees for A/D
+                   "end":   float,
+                   "n_points": int}]       # number of calculation points
+    """
+    lines = ["%geom", "  Scan"]
+    for c in scan_coords:
+        coord_type = str(c["type"]).upper()
+        atoms = " ".join(str(int(a)) for a in c["atoms"])
+        start = float(c["start"])
+        end   = float(c["end"])
+        n     = int(c["n_points"])
+        lines.append(f"    {coord_type} {atoms} = {start:.6f}, {end:.6f}, {n}")
+    lines += ["  end", "End"]
+    return "\n".join(lines)
+
+
+def _extract_scan_results(out_text: str, scan_coords: List[Dict]) -> List[Dict]:
+    """Parse ORCA scan output (relaxed or rigid), returning [{step, value, energy_eh}, ...].
+
+    Stage 1 — summary table: ORCA end-of-scan summary (relaxed or rigid).
+    Stage 2 — per-step markers: "RELAXED SURFACE SCAN STEP N" with last energy per step.
+    Stage 3 — fallback: all FINAL SINGLE POINT ENERGY lines with computed values.
+    """
+    lines = out_text.splitlines()
+    energy_pat = re.compile(
+        r'FINAL\s+SINGLE\s+POINT\s+ENERGY\s+([-+]?\d+\.\d+)', re.IGNORECASE
+    )
+
+    def _computed_values(n_steps: int) -> List[float]:
+        c0 = scan_coords[0] if scan_coords else None
+        if c0 and int(c0.get("n_points", 0)) > 1:
+            n = int(c0["n_points"])
+            return [
+                float(c0["start"]) + i * (float(c0["end"]) - float(c0["start"])) / (n - 1)
+                for i in range(n_steps)
+            ]
+        return [float(i) for i in range(n_steps)]
+
+    def _parse_summary_table(start_idx: int) -> List[Dict]:
+        """Parse a scan summary table starting at start_idx."""
+        # Rows: "  1   1.0000   -115.70900" or "  1  B(0,1): 1.0000  -115.70900"
+        pat = re.compile(
+            r'^\s+(\d+)\s+(?:\S+:\s*)?([-+]?\d+\.?\d*)\s+([-+]?\d+\.\d+)'
+        )
+        results = []
+        for ln in lines[start_idx + 1 : start_idx + 400]:
+            m = pat.match(ln)
+            if m:
+                results.append({
+                    "step":      int(m.group(1)),
+                    "value":     round(float(m.group(2)), 6),
+                    "energy_eh": round(float(m.group(3)), 8),
+                })
+            elif results and re.match(r'\s*-{20,}', ln):
+                break
+        return results
+
+    # Stage 1: find any scan summary table (relaxed or rigid, either keyword order)
+    summary_patterns = [
+        r'(RELAXED|RIGID)\s+SURFACE\s+SCAN\s+(SUMMARY|RESULTS)',
+        r'(SUMMARY|RESULTS)\s+OF\s+(THE\s+)?(RELAXED|RIGID)\s+SURFACE\s+SCAN',
+        r'THE\s+(RELAXED|RIGID)\s+SURFACE\s+SCAN\s+RESULTS',
+    ]
+    for spat in summary_patterns:
+        for i, ln in enumerate(lines):
+            if re.search(spat, ln, re.IGNORECASE):
+                results = _parse_summary_table(i)
+                if results:
+                    return results
+
+    # Stage 2: per-step parsing via "RELAXED SURFACE SCAN STEP N" markers
+    # Each step ends just before the next step header (or EOF).
+    step_pat = re.compile(r'RELAXED\s+SURFACE\s+SCAN\s+STEP\s+(\d+)', re.IGNORECASE)
+    step_indices: List[tuple] = []  # (line_index, step_number)
+    for i, ln in enumerate(lines):
+        m = step_pat.search(ln)
+        if m:
+            step_indices.append((i, int(m.group(1))))
+
+    if step_indices:
+        results = []
+        for k, (step_line_idx, step_num) in enumerate(step_indices):
+            next_idx = step_indices[k + 1][0] if k + 1 < len(step_indices) else len(lines)
+            # Collect the LAST FINAL SINGLE POINT ENERGY in this step's range
+            step_energies = [
+                float(m.group(1))
+                for ln in lines[step_line_idx:next_idx]
+                for m in [energy_pat.search(ln)] if m
+            ]
+            if step_energies:
+                results.append({"step": step_num, "energy_eh": round(step_energies[-1], 8)})
+        if results:
+            vals = _computed_values(len(results))
+            for k, r in enumerate(results):
+                r["value"] = round(vals[k], 6)
+            return results
+
+    # Stage 3: fallback — all FINAL SINGLE POINT ENERGY lines with computed values
+    energies = [float(m.group(1)) for m in energy_pat.finditer(out_text)]
+    if not energies:
+        return []
+    vals = _computed_values(len(energies))
+    return [
+        {"step": i + 1, "value": round(vals[i], 6), "energy_eh": round(e, 8)}
+        for i, e in enumerate(energies)
+    ]
+
+
+def _extract_scan_geometries(out_text: str, n_steps: int) -> List[str]:
+    """Extract per-step optimised geometries from a relaxed scan output.
+
+    Splits the output by "RELAXED SURFACE SCAN STEP N" markers and calls
+    extract_final_geometry_from_out on each chunk.
+    Returns a list of XYZ strings (atom-lines only, no header), indexed by (step-1).
+    Steps with no parseable geometry return an empty string.
+    """
+    step_pat = re.compile(r'RELAXED\s+SURFACE\s+SCAN\s+STEP\s+(\d+)', re.IGNORECASE)
+    lines = out_text.splitlines()
+
+    step_indices: List[tuple] = []  # (line_idx, step_num)
+    for i, ln in enumerate(lines):
+        m = step_pat.search(ln)
+        if m:
+            step_indices.append((i, int(m.group(1))))
+
+    if not step_indices:
+        return []
+
+    geometries = []
+    for k, (start_idx, _step_num) in enumerate(step_indices):
+        end_idx = step_indices[k + 1][0] if k + 1 < len(step_indices) else len(lines)
+        chunk = "\n".join(lines[start_idx:end_idx])
+        geom = extract_final_geometry_from_out(chunk)
+        geometries.append(geom)
+    return geometries
+
+
+@mcp.tool()
+async def run_scan_job(
+    geometry_xyz: str,
+    scan_coords: str,
+    charge: int = 0,
+    multiplicity: int = 1,
+    method: str = "B3LYP",
+    basis: str = "def2-SVP",
+    use_ri: bool = True,
+    scf_max_iter: int = 150,
+    wall_timeout_seconds: int = 7200,
+    job_label: Optional[str] = None,
+    ncores: int = 1,
+) -> str:
+    """Run a relaxed ORCA surface scan (geometry optimization at each scan point).
+
+    scan_coords: JSON string with a list of coordinate dicts, e.g.:
+        '[{"type":"B","atoms":[0,1],"start":0.8,"end":1.8,"n_points":11}]'
+        type: "B" = bond (Å), "A" = angle (degrees), "D" = dihedral (degrees)
+        atoms: 0-based ORCA atom indices (2 for B, 3 for A, 4 for D)
+        n_points: total number of calculation points (inclusive)
+
+    Returns:
+        scan_results: [{step, value, energy_eh}, ...]
+        min_energy_eh: float   (lowest energy found)
+        min_value:     float   (coordinate value at minimum)
+        n_points:      int
+        scan_coords:   list    (echo of input coords)
+    """
+    if not geometry_xyz.strip():
+        raise ValueError("geometry_xyz is empty")
+
+    try:
+        coords = json.loads(scan_coords)
+    except (json.JSONDecodeError, TypeError) as e:
+        return json.dumps({"status": "error", "error": f"scan_coords JSON parse failed: {e}"})
+    if not isinstance(coords, list) or not coords:
+        return json.dumps({"status": "error", "error": "scan_coords must be a non-empty JSON array"})
+
+    if job_label is None:
+        job_label = f"scan_{os.getpid()}_{int(asyncio.get_event_loop().time())}"
+    job_label = sanitize_label(job_label)
+    jobs_dir = Path(os.environ.get("ORCA_JOBS_DIR", "jobs"))
+    workdir  = jobs_dir / job_label
+
+    calc = _build_calc(
+        label=job_label,
+        workdir=workdir,
+        geometry_xyz=geometry_xyz,
+        charge=charge,
+        multiplicity=multiplicity,
+        method=method,
+        basis=basis,
+        job_type="scan",   # OPT keyword activates scan loop; no extra %geom block
+        use_ri=use_ri,
+        scf_max_iter=scf_max_iter,
+        opt_max_iter=1,
+        nbo=False,
+        ncores=ncores,
+    )
+    calc.input.add_arbitrary_string(_build_scan_block(coords))
+
+    try:
+        output = await _run_calc_with_timeout(calc, wall_timeout_seconds)
+    except asyncio.TimeoutError:
+        out_text = _read_out_text(workdir, job_label)
+        partial = _extract_scan_results(out_text, coords)
+        return json.dumps({
+            "status":      "timeout",
+            "label":       job_label,
+            "scan_results": partial,
+            "text":        f"Status: TIMEOUT after {wall_timeout_seconds}s ({len(partial)} steps collected)",
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "label": job_label, "error": str(e)})
+
+    ok = output.terminated_normally()
+    out_text = _read_out_text(workdir, job_label)
+    if not ok:
+        return json.dumps({
+            "status": "error",
+            "label":  job_label,
+            "tail":   "\n".join(out_text.splitlines()[-120:]),
+        })
+
+    scan_results = _extract_scan_results(out_text, coords)
+
+    min_energy = min((p["energy_eh"] for p in scan_results), default=None)
+    min_value  = next(
+        (p["value"] for p in scan_results if p["energy_eh"] == min_energy), None
+    ) if min_energy is not None else None
+
+    max_energy = max((p["energy_eh"] for p in scan_results), default=None)
+    max_value  = next(
+        (p["value"] for p in scan_results if p["energy_eh"] == max_energy), None
+    ) if max_energy is not None else None
+
+    # Extract geometry at the PES maximum (for TS candidate seeding)
+    max_geom = ""
+    if scan_results and max_energy is not None:
+        step_geoms = _extract_scan_geometries(out_text, len(scan_results))
+        max_step_idx = next(
+            (k for k, r in enumerate(scan_results) if r["energy_eh"] == max_energy), None
+        )
+        if max_step_idx is not None and max_step_idx < len(step_geoms):
+            max_geom = step_geoms[max_step_idx]
+
+    return json.dumps({
+        "status":           "ok",
+        "label":            job_label,
+        "scan_results":     scan_results,
+        "n_points":         len(scan_results),
+        "min_energy_eh":    min_energy,
+        "min_value":        min_value,
+        "max_energy_eh":    max_energy,
+        "max_value":        max_value,
+        "geometry_xyz":     max_geom,       # PES maximum geometry (TS candidate)
+        "max_geometry_xyz": max_geom,       # alias
+        "scan_coords":      coords,
+        "product":          "scan_results",
+        "text": (
+            f"Status: OK\n{len(scan_results)} scan points\n"
+            f"Min energy: {min_energy} Eh at value {min_value}\n"
+            f"Max energy: {max_energy} Eh at value {max_value}"
+        ),
+    })
+
+
+@mcp.tool()
+async def run_ts_opt_job(
+    geometry_xyz: str,
+    charge: int = 0,
+    multiplicity: int = 1,
+    method: str = "B3LYP",
+    basis: str = "def2-SVP",
+    use_ri: bool = True,
+    scf_max_iter: int = 150,
+    opt_max_iter: int = 100,
+    calc_hess: bool = True,
+    wall_timeout_seconds: int = 3600,
+    job_label: Optional[str] = None,
+    ncores: int = 1,
+) -> str:
+    """Run an ORCA transition-state optimisation (OptTS).
+
+    Requires a starting geometry near the transition state (e.g., the PES maximum
+    from run_scan_job). calc_hess=True (default) adds Calc_Hess true to the %geom
+    block, which is strongly recommended for reliable TS optimisation.
+
+    Returns:
+        status:       "ok" | "not_converged" | "error" | "timeout"
+        geometry_xyz: optimised TS geometry (atom lines, no header)
+        energy_eh:    final energy in Hartree
+        ts_converged: bool — whether ORCA reported a converged optimisation
+    """
+    if not geometry_xyz.strip():
+        raise ValueError("geometry_xyz is empty")
+
+    if job_label is None:
+        job_label = f"tsopt_{os.getpid()}_{int(asyncio.get_event_loop().time())}"
+    job_label = sanitize_label(job_label)
+    jobs_dir = Path(os.environ.get("ORCA_JOBS_DIR", "jobs"))
+    workdir = jobs_dir / job_label
+
+    calc = _build_calc(
+        label=job_label,
+        workdir=workdir,
+        geometry_xyz=geometry_xyz,
+        charge=charge,
+        multiplicity=multiplicity,
+        method=method,
+        basis=basis,
+        job_type="ts_opt",
+        use_ri=use_ri,
+        scf_max_iter=scf_max_iter,
+        opt_max_iter=opt_max_iter,
+        nbo=False,
+        ncores=ncores,
+    )
+
+    # Build a single %geom block with maxiter and optional Calc_Hess
+    geom_lines = ["%geom", f"  maxiter {opt_max_iter}"]
+    if calc_hess:
+        geom_lines.append("  Calc_Hess true")
+    geom_lines.append("end")
+    calc.input.add_arbitrary_string("\n".join(geom_lines))
+
+    try:
+        output = await _run_calc_with_timeout(calc, wall_timeout_seconds)
+    except asyncio.TimeoutError:
+        out_text = _read_out_text(workdir, job_label)
+        return json.dumps({
+            "status":       "timeout",
+            "label":        job_label,
+            "energy_eh":    extract_total_energy(out_text),
+            "geometry_xyz": extract_final_geometry_from_out(out_text),
+            "text":         f"Status: TIMEOUT after {wall_timeout_seconds}s",
+        })
+    except Exception as e:
+        out_text = _read_out_text(workdir, job_label)
+        return json.dumps({
+            "status": "error",
+            "label":  job_label,
+            "error":  str(e),
+            "tail":   "\n".join(out_text.splitlines()[-80:]),
+        })
+
+    ok = output.terminated_normally()
+    out_text = _read_out_text(workdir, job_label)
+    ts_converged = "THE OPTIMIZATION HAS CONVERGED" in out_text.upper()
+    energy = extract_total_energy(out_text)
+    final_xyz = extract_final_geometry_from_out(out_text)
+
+    if not ok:
+        return json.dumps({
+            "status":       "error",
+            "label":        job_label,
+            "ts_converged": ts_converged,
+            "energy_eh":    energy,
+            "geometry_xyz": final_xyz,
+            "tail":         "\n".join(out_text.splitlines()[-120:]),
+            "text":         "ORCA did not terminate normally.",
+        })
+
+    status = "ok" if ts_converged else "not_converged"
+    return json.dumps({
+        "status":       status,
+        "label":        job_label,
+        "ts_converged": ts_converged,
+        "energy_eh":    energy,
+        "geometry_xyz": final_xyz,
+        "provenance":   {"geometry": "orca_tsopt"},
+        "tail":         "\n".join(out_text.splitlines()[-60:]),
+        "text":         f"Status: {status.upper()}\nTS energy: {energy} Eh",
     })
 
 

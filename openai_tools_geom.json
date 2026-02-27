@@ -123,46 +123,93 @@
                     "wall_timeout_seconds": {"type": "integer", "default": 3600}},
                 "required": ["input_geom_id"]}}},
 
-    "build_reaction_coordinate_scan": {
+    "run_spectrum_job": {
         "type": "function",
         "function": {
-            "name": "build_reaction_coordinate_scan",
-            "description": "Construct an ORCA %geom scan block using internal coordinates (B/A/D).",
+            "name": "run_spectrum_job",
+            "description": "Run an ORCA frequency + vibrational spectrum calculation. Returns the same E/H/G as run_freq_job PLUS ir_spectrum (list of {mode, freq_cm1, intensity_km_mol}) and optionally raman_spectrum (list of {mode, freq_cm1, activity, depolarization}). Use on an already-optimised geometry.",
             "parameters": {
-            "type": "object",
-            "properties": {
-                "coords": {
-                "type": "array",
-                "description": "Up to 3 coordinates to scan.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                    "type": {"type": "string", "enum": ["B", "A", "D"]},
-                    "atoms": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Atom indices (ORCA is typically 0-based). Length: 2 for B, 3 for A, 4 for D."
+                "type": "object",
+                "properties": {
+                    "input_geom_id": { "type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from." },
+                    "spectrum_type": {
+                        "type": "string",
+                        "enum": ["ir", "raman", "ir_raman"],
+                        "default": "ir",
+                        "description": "ir = IR only; raman / ir_raman = IR + Raman (adds %elprop Polar 1, roughly 2x cost)."
                     },
-                    "start": {"type": "number"},
-                    "end": {"type": "number"},
-                    "nsteps": {"type": "integer"}
+                    "method": {"type": "string", "default": "B3LYP"},
+                    "basis": {"type": "string", "default": "def2-SVP"},
+                    "use_ri": {"type": "boolean", "default": true},
+                    "scf_max_iter": {"type": "integer", "default": 150},
+                    "wall_timeout_seconds": {"type": "integer", "default": 3600}},
+                "required": ["input_geom_id"]}}},
+
+    "run_tddft_job": {
+        "type": "function",
+        "function": {
+            "name": "run_tddft_job",
+            "description": "Run an ORCA TD-DFT excited-state calculation on an already-optimised geometry. Returns ground-state energy (energy_ground_state_eh) and a list of excited states (excited_states) with energy_ev, wavelength_nm, and oscillator_strength for each state. Use run_opt_job first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input_geom_id": {"type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from."},
+                    "n_states": {"type": "integer", "default": 5, "description": "Number of excited singlet states to compute (default 5; increase for broader spectral coverage)."},
+                    "method": {"type": "string", "default": "B3LYP"},
+                    "basis": {"type": "string", "default": "def2-SVP"},
+                    "use_ri": {"type": "boolean", "default": true},
+                    "scf_max_iter": {"type": "integer", "default": 150},
+                    "wall_timeout_seconds": {"type": "integer", "default": 3600}},
+                "required": ["input_geom_id"]}}},
+
+    "run_scan_job": {
+        "type": "function",
+        "function": {
+            "name": "run_scan_job",
+            "description": "Run a rigid ORCA surface scan: vary one or more internal coordinates (bond/angle/dihedral) and compute SP energy at each point. Returns scan_results list with {step, value, energy_eh} for every geometry, plus min_energy_eh and min_value.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input_geom_id": {
+                        "type": "string",
+                        "description": "GeometryRegistry id of the starting geometry."
                     },
-                    "required": ["type", "atoms", "start", "end", "nsteps"]
-                }
+                    "scan_coords": {
+                        "type": "string",
+                        "description": "JSON array of scan coordinate dicts. Each dict: {\"type\":\"B\"|\"A\"|\"D\", \"atoms\":[i,j,...], \"start\":float, \"end\":float, \"n_points\":int}. type: B=bond(Å), A=angle(deg), D=dihedral(deg). atoms: 0-based ORCA indices (2 for B, 3 for A, 4 for D). Example: '[{\"type\":\"B\",\"atoms\":[0,1],\"start\":0.8,\"end\":1.8,\"n_points\":11}]'"
+                    },
+                    "method":               {"type": "string",  "default": "B3LYP"},
+                    "basis":                {"type": "string",  "default": "def2-SVP"},
+                    "use_ri":               {"type": "boolean", "default": true},
+                    "scf_max_iter":         {"type": "integer", "default": 150},
+                    "wall_timeout_seconds": {"type": "integer", "default": 7200}
                 },
-                "simul_scan": {
-                "type": "boolean",
-                "description": "If true, vary all scan coords simultaneously (cheaper than nested loops).",
-                "default": false
+                "required": ["input_geom_id", "scan_coords"]
+            }
+        }
+    },
+    "run_ts_opt_job": {
+        "type": "function",
+        "function": {
+            "name": "run_ts_opt_job",
+            "description": "Run an ORCA transition-state optimisation (OptTS) on a geometry near the TS (e.g., the PES maximum from run_scan_job). calc_hess=true (default) adds Calc_Hess true, strongly recommended for reliable TS searches. Returns geometry_xyz (optimised TS structure), energy_eh, and ts_converged.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input_geom_id": {
+                        "type": "string",
+                        "description": "GeometryRegistry id of the TS candidate geometry (e.g., PES maximum from run_scan_job)."
+                    },
+                    "method":               {"type": "string",  "default": "B3LYP"},
+                    "basis":                {"type": "string",  "default": "def2-SVP"},
+                    "use_ri":               {"type": "boolean", "default": true},
+                    "scf_max_iter":         {"type": "integer", "default": 150},
+                    "opt_max_iter":         {"type": "integer", "default": 100},
+                    "calc_hess":            {"type": "boolean", "default": true,
+                                             "description": "Add Calc_Hess true to %geom block. Required for reliable OptTS; set false only if Hessian already provided."},
+                    "wall_timeout_seconds": {"type": "integer", "default": 3600}
                 },
-                "index_base": {
-                "type": "integer",
-                "enum": [0, 1],
-                "description": "If 1, convert given atom indices to 0-based for ORCA blocks.",
-                "default": 0
-                }
-            },
-            "required": ["coords"]
+                "required": ["input_geom_id"]
             }
         }
     },

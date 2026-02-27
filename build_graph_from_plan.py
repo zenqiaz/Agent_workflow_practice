@@ -270,17 +270,22 @@ def build_graph_from_plan(
 
         # Convention: tools may return a primary output via a "product" field.
         # Example: {"status":"ok","product":"energy","energy":-76.32,...}
-        product = result.get("product")#product key of result dict
-        product_spec = spec.get("product") or {}# artifact key to store the product
-        print("product:", product,"result:", result, "product_spec:",product_spec)
+        product = result.get("product")  # primary output key of result dict
+        product_spec = spec.get("product") or {}  # artifact key → result field path
         if isinstance(product_spec, dict):
             for out_key, src in product_spec.items():
-                v = _get_by_path(result, product)
-                if v is not None:
-                    artifacts[out_key] = v
+                if isinstance(src, dict):
+                    # src is {artifact_subkey: result_field_path, ...} → collect as dict
+                    sub = {k: _get_by_path(result, p) for k, p in src.items()}
+                    sub = {k: v for k, v in sub.items() if v is not None}
+                    if sub:
+                        artifacts[out_key] = sub
+                else:
+                    v = _get_by_path(result, src)
+                    if v is not None:
+                        artifacts[out_key] = v
 
         upd["artifacts"] = artifacts
-        print("artifacts:", artifacts)
         return upd
     
     def _set_by_path_root_update(state: State, path: str, value: Any) -> Dict[str, Any]:
@@ -412,6 +417,7 @@ def build_graph_from_plan(
                     updates["node_results"] = node_results
 
                     # 3) standard bookkeeping
+                    print(f"  [tool_status] node={node_id!r} status={status!r}")
                     updates.update({
                         "last_status": status,
                         "last_tool_result": tool_payload,
@@ -447,6 +453,7 @@ def build_graph_from_plan(
                                 gathered[key] = val
 
                         if missing:
+                            print(f"  [llm_missing] node={node_id!r} missing={missing!r} available={list(artifacts.keys())}")
                             out = {"status": "error", "error": f"missing artifacts: {missing}"}
                         else:
                             # Build context for the calculator LLM
@@ -572,6 +579,7 @@ def build_graph_from_plan(
 
                 else:
                     status = "error"
+                    print(f"  [unknown_kind] node={node_id!r} kind={kind!r}")
 
                     ended_utc = datetime.now(timezone.utc).isoformat()
                     duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -602,6 +610,7 @@ def build_graph_from_plan(
                     goto = FINAL_NODE_ID
 
                 if isinstance(goto, str) and goto not in nodes_by_id and goto != FINAL_NODE_ID:
+                    print(f"  [unknown_goto] node={node_id!r} goto={goto!r} known={list(nodes_by_id.keys())}")
                     updates["last_status"] = "error"
                     updates["run_log"] = state.get("run_log", []) + [{"node": node_id, "status": "error", "error": f"unknown next node: {goto!r}"}]
                     goto = FINAL_NODE_ID
@@ -610,6 +619,8 @@ def build_graph_from_plan(
 
             except Exception as e:
                 # Unexpected runtime exception: persist a bug report and force-finalize.
+                print(f"  [node_exception] node={node_id!r} kind={spec.get('kind')!r} error={e!r}")
+                import traceback; traceback.print_exc()
                 node_spec = dict(spec)
                 node_spec["id"] = node_id
 
