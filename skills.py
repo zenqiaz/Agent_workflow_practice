@@ -65,6 +65,8 @@ Recommended levels of theory by task:
   Thermochemistry (G/H) : run_freq_job at the same level as opt
   Microsolvation cluster: r2scan-3c (good accuracy/cost ratio for freq on clusters)
   NBO analysis          : B3LYP/def2-SVP with NBO keyword
+  HOMO-LUMO gap (KS)    : run_sp_energy at PBE0/def2-TZVP; returns homo_lumo_gap_ev
+  HOMO-LUMO + UV-Vis    : run_tddft_job; returns homo_lumo_gap_ev + excited_states
 
 Basis set guidance:
   def2-SVP   → cheap, opt/freq, qualitative
@@ -74,6 +76,15 @@ Basis set guidance:
 Performance flags:
   use_ri=True  reduces cost of hybrid DFT significantly (RIJCOSX in ORCA)
   ncores: default 1; increase for large molecules if VM allows
+
+Wall-time limits (always set wall_timeout_seconds for every calc node):
+  run_sp_energy         :  600 s
+  run_opt_job           : 1200 s
+  run_freq_job          : 1800 s
+  run_scan_job          : 3600 s
+  run_ts_opt_job        : 1800 s
+  run_casscf_job        : 3600 s
+  run_solvator_cluster_thermo: 3600 s
 """.strip()
 
 
@@ -203,6 +214,76 @@ Artifact naming convention:
   ts_energy_eh       — OptTS final energy
   ts_ir_spectrum     — IR spectrum of TS (check for 1 imaginary mode)
   ts_gibbs_eh        — Gibbs free energy of TS (for activation barrier ΔG‡)
+""".strip()
+
+
+class CasscfSkill(PlannerSkill):
+    """CASSCF / SA-CASSCF single-point protocol."""
+
+    name = "casscf"
+    priority = 24
+
+    _KEYWORDS = [
+        "casscf", "cas(", "cas (", "active space", "multireference",
+        "multi-reference", "sa-casscf", "state-averaged", "state averaged",
+        "complete active space", "mcscf",
+    ]
+
+    def matches(self, user_text: str, state: Dict[str, Any]) -> bool:
+        lt = user_text.lower()
+        return any(kw in lt for kw in self._KEYWORDS)
+
+    def render(self, user_text: str, state: Dict[str, Any]) -> str:
+        return _CASSCF_SKILL_TEXT
+
+
+_CASSCF_SKILL_TEXT = """
+SKILL: CASSCF / SA-CASSCF calculations
+
+Tool
+  run_casscf_job
+  Required: nel (active electrons), norb (active orbitals)
+  Optional: nroots (default 1), basis (default def2-SVP)
+  Returns: energy_eh (total or SA-average), energies_eh list (only when nroots > 1)
+
+Active space selection guide
+  - Fe(III) d5 system:        CAS(5,5)  — 5 d-electrons in 5 d-orbitals
+  - Fe(II)  d6 system:        CAS(6,5)  — 6 d-electrons in 5 d-orbitals
+  - Ni(II)  d8 system:        CAS(8,5)  — 8 d-electrons in 5 d-orbitals
+  - Simple bond dissociation: CAS(2,2)  — bonding + antibonding pair
+  - Aromatic pi system:       CAS(N,N)  — N electrons in N pi orbitals (benzene: CAS(6,6))
+  If unsure, ask the user or use the minimal valence active space.
+
+Spin state comparison (SA-CASSCF)
+  - To compare multiple spin states simultaneously, set nroots to the number of states.
+  - The multiplicity parameter controls the spin of root 0; SA averages over all roots.
+  - For spin-state energy differences, prefer running separate CASSCF jobs with the
+    correct multiplicity for each state (single-state CASSCF, nroots=1).
+
+Basis sets
+  - def2-SVP: good starting point; affordable
+  - def2-TZVP or cc-pVTZ: better accuracy for final results
+  - ANO-RCC or def2-TZVPP recommended for high-accuracy metal active spaces
+
+Typical plan pattern (spin-state gap)
+  nodes:
+    - {id: casscf_hs, kind: tool, tool: run_casscf_job,
+       input_id: mol_hs, args: {nel: 5, norb: 5, nroots: 1},
+       product: {e_hs_eh: energy_eh}}
+    - {id: casscf_ls, kind: tool, tool: run_casscf_job,
+       input_id: mol_ls, args: {nel: 5, norb: 5, nroots: 1},
+       product: {e_ls_eh: energy_eh}}
+    - {id: calc_gap, kind: llm, task: compute_spin_gap,
+       needs: [casscf_hs, casscf_ls], needs_artifacts: [e_hs_eh, e_ls_eh],
+       product: {delta_E_kcal: delta_E_kcal}}
+
+No geometry optimization with CASSCF
+  run_casscf_job is SP-only. If you need CASSCF-optimised geometry,
+  first optimize with DFT (run_opt_job), then run run_casscf_job on the
+  DFT-optimized structure.
+
+on_error rules
+  - SCF_NOT_CONVERGED → patch: {scf_max_iter: 500}, max_attempts: 1
 """.strip()
 
 
@@ -516,7 +597,8 @@ class TDDFTSkill(PlannerSkill):
     _KEYWORDS = ("tddft", "td-dft", "excited state", "excitation energy",
                  "uv-vis", "uv/vis", "absorption spectrum", "electronic transition",
                  "oscillator strength", "charge transfer state", "singlet excited",
-                 "s1 state", "vertical excitation", "optical gap")
+                 "s1 state", "vertical excitation", "optical gap",
+                 "homo-lumo", "homo lumo", "frontier orbital", "band gap")
 
     def matches(self, user_text: str, state: Dict[str, Any]) -> bool:
         low = user_text.lower()
@@ -535,8 +617,16 @@ Parameters:
 
 Output fields:
   energy_ground_state_eh: ground-state DFT energy (Eh)
+  homo_lumo_gap_ev: KS orbital gap in eV (LUMO_ev - HOMO_ev from SCF; null if not parsed)
   excited_states: list of {state, energy_ev, wavelength_nm, oscillator_strength}
                   sorted by state index (ascending energy)
+
+HOMO-LUMO gap:
+  homo_lumo_gap_ev is the KS (Kohn-Sham) orbital energy gap — available from run_tddft_job
+  AND from run_sp_energy (both parse ORBITAL ENERGIES block automatically).
+  For the KS gap only (no excited states needed): use run_sp_energy, product homo_lumo_gap_ev.
+  For the optical gap (S1 excitation energy): use excited_states[0].energy_ev from run_tddft_job.
+  The KS gap underestimates the true gap; PBE0/def2-TZVP is more reliable than B3LYP.
 
 UV/Vis conventions:
   oscillator_strength >> 0  -> bright (electric-dipole-allowed) transition
@@ -556,16 +646,22 @@ Recommended levels of theory:
 Plan pattern (3 nodes -- NO LLM node):
   load -> run_opt_job (output_id: mol_opt) -> run_tddft_job (input_id: mol_opt, n_states=5)
   product: {"excited_states_<species>": "excited_states",
-            "energy_<species>_ground_eh": "energy_ground_state_eh"}
+            "energy_<species>_ground_eh": "energy_ground_state_eh",
+            "homo_lumo_gap_<species>_ev": "homo_lumo_gap_ev"}
 
 CRITICAL -- no kind:"llm" report node:
   excited_states is already fully structured JSON. QC-CALCULATOR cannot write UV/Vis tables.
   Keep the plan to exactly 3 nodes: load, opt, tddft.
-  Use final_report.fields: ["excited_states_<species>", "energy_<species>_ground_eh"]
+  Use final_report.fields: ["excited_states_<species>", "homo_lumo_gap_<species>_ev"]
 
 Artifact naming convention:
   excited_states_<species>         -- the list of excited states
   energy_<species>_ground_eh       -- ground state DFT energy (Eh)
+  homo_lumo_gap_<species>_ev       -- KS HOMO-LUMO gap in eV
+
+For HOMO-LUMO gap only (no UV-Vis needed):
+  Use run_sp_energy with product: {"homo_lumo_gap_<species>_ev": "homo_lumo_gap_ev"}
+  Plan: load -> run_sp_energy  (2 nodes, fast)
 """.strip()
 
 
@@ -614,16 +710,82 @@ product field for NBO node:
 
 
 # ---------------------------------------------------------------------------
+# Coordination chemistry skill (priority 18 — before pKa/scan)
+# ---------------------------------------------------------------------------
+
+class CoordinationChemistrySkill(PlannerSkill):
+    """Injected when the user asks about metal complexes or coordination compounds."""
+    name     = "coordination_chemistry"
+    priority = 18
+
+    _KEYWORDS = {
+        "complex", "coordination", "ligand", "metal", "octahedral", "tetrahedral",
+        "square planar", "square_planar", "bipyridine", "bipy", "en ", "ethylenediamine",
+        "ammonia complex", "transition metal", "cobalt", "iron", "ruthenium", "platinum",
+        "copper", "nickel", "zinc", "chromium", "manganese", "palladium", "rhodium",
+        "iridium", "molybdenum", "tungsten", "fe(", "co(", "ru(", "pt(", "cu(", "ni(",
+    }
+
+    def matches(self, user_text: str, state: dict) -> bool:
+        t = user_text.lower()
+        return any(kw in t for kw in self._KEYWORDS)
+
+    def render(self, user_text: str, state: dict) -> str:
+        return """
+Coordination complex workflow
+─────────────────────────────
+Use build_coordination_complex (client-side) to generate the starting geometry, then
+pipe it into run_opt_job via output_id/input_id.
+
+build_coordination_complex parameters:
+  metal        – element symbol: "Fe", "Ru", "Co", "Pt", "Cu", …
+  ligands      – list of ligand names or SMILES (one entry per binding unit)
+  geometry     – "linear" | "trigonal_planar" | "tetrahedral" | "square_planar"
+               | "trigonal_bipyramidal" | "octahedral"
+  charge       – total complex charge (integer)
+  multiplicity – spin multiplicity 2S+1 (integer; use high spin for first-row TMs unless told otherwise)
+  bond_length  – M–donor bond length in Å (optional, default 2.0)
+
+Denticity rules:
+  Monodentate ligands (NH3, H2O, Cl, CO, CN, SCN) → one entry per site.
+  Bidentate ligands (en, bipyridine, acac, ox) → one entry per ligand; the tool
+  auto-detects two donor atoms and fills two adjacent sites.
+  Total denticity must equal coordination number:
+    linear=2, trigonal_planar=3, tetrahedral/square_planar=4,
+    trigonal_bipyramidal=5, octahedral=6.
+
+Common bond lengths (Å):
+  M–N  2.0 (first-row TM, e.g. Fe–NH3, Co–en)
+  M–O  2.1 (e.g. Fe–H2O)
+  M–Cl 2.3, M–P 2.3, M–C 1.9 (for CO/CN)
+  Second-row TMs (Ru, Pd, Rh): add ~0.1 Å.
+
+Multiplicity guidance:
+  Fe(II) octahedral: 5 (high spin, d6 t2g4 eg2) or 1 (low spin, d6 t2g6) — depends on ligand field.
+  Strong-field ligands (CO, CN, bipy) → low spin; weak-field (H2O, Cl, NH3) → high spin for Fe/Co.
+
+Typical plan pattern:
+  build_coordination_complex (output_id: complex_start)
+    → run_opt_job            (input_id: complex_start, output_id: complex_opt)
+    → run_sp_energy or run_freq_job
+
+Geometry note: the template geometry is approximate. Always follow with run_opt_job.
+""".strip()
+
+
+# ---------------------------------------------------------------------------
 # Registry and dispatcher
 # ---------------------------------------------------------------------------
 
 SKILL_REGISTRY: List[PlannerSkill] = [
     MethodSelectionSkill(),
+    CoordinationChemistrySkill(),
     ProtonationSiteSkill(),
     PKaSkill(),
     ScanSkill(),
     SpectrumSkill(),
     TDDFTSkill(),
+    CasscfSkill(),
     ThermochemistrySkill(),
     TSSearchSkill(),
     SolvationSkill(),

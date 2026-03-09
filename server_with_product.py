@@ -162,7 +162,7 @@ def _build_calc(
     multiplicity: int,
     method: str,
     basis: str,
-    job_type: Literal["sp", "opt", "freq", "scan", "ts_opt"],
+    job_type: Literal["sp", "opt", "freq", "scan", "ts_opt", "casscf"],
     use_ri: bool,
     scf_max_iter: int,
     opt_max_iter: int,
@@ -192,6 +192,8 @@ def _build_calc(
         task_kw = "OPT"
     elif job_type == "freq":
         task_kw = "FREQ"
+    elif job_type == "casscf":
+        task_kw = ""   # CASSCF keyword is the method itself; no separate task keyword
     else:
         task_kw = "SP"
     ri_kw = "RIJCOSX" if use_ri else ""
@@ -283,6 +285,20 @@ def _error_summary(out_text: str) -> str:
             hits.append(ln)
     return "\n".join(hits[-60:])
 
+def _classify_orca_error_code(out_text: str) -> Optional[str]:
+    """Return a structured error code by scanning ORCA output text.
+
+    Used to populate the 'code' field in error payloads so the client-side
+    patch_and_retry logic can match on_error rules without text-parsing.
+    """
+    upper = out_text.upper()
+    if "SCF NOT CONVERGED" in upper or "FAILED TO CONVERGE" in upper:
+        return "SCF_NOT_CONVERGED"
+    if "***IMAGINARY MODE***" in upper:
+        return "IMAG_FREQ"
+    return None
+
+
 async def _run_calc_with_timeout(calc: Calculator, wall_timeout_seconds: int):
     def _run_sync():
         calc.write_input()
@@ -336,44 +352,133 @@ def extract_gibbs_free_energy(output_text: str) -> Optional[float]:
                 return v
     return None
 
+def extract_casscf_root_energies(output_text: str) -> List[float]:
+    """Extract per-root CASSCF energies from SA-CASSCF output.
+
+    Handles two ORCA 6 formats:
+      "E[SA-CASSCF] ROOT  N :  -XXX.XXXXXX Eh"
+      "ROOT N: E = -XXX.XXXXXX Eh"
+    Returns a list sorted by root index (empty if none found).
+    """
+    import re
+    patterns = [
+        re.compile(r"E\[SA-CASSCF\]\s+ROOT\s+(\d+)\s*:\s*(-\d+\.\d+)\s*Eh", re.IGNORECASE),
+        re.compile(r"\bROOT\s+(\d+)\s*:\s*E\s*=\s*(-\d+\.\d+)\s*Eh", re.IGNORECASE),
+    ]
+    root_energies: Dict[int, float] = {}
+    for line in output_text.splitlines():
+        for pat in patterns:
+            m = pat.search(line)
+            if m:
+                root_energies[int(m.group(1))] = float(m.group(2))
+                break
+    return [root_energies[i] for i in sorted(root_energies)]
+
+
+def extract_homo_lumo_gap(output_text: str) -> Optional[float]:
+    """Parse HOMO and LUMO orbital energies from ORCA output and return the gap in eV.
+
+    ORCA prints an ORBITAL ENERGIES block for all job types:
+
+        ORBITAL ENERGIES
+        ----------------
+          NO   OCC          E(Eh)            E(eV)
+           0   2.0000      -20.5680...      -559.8...
+           ...
+           4   2.0000       -0.4444...       -12.09...   <- HOMO (last OCC>0)
+           5   0.0000        0.1764...         4.80...   <- LUMO (first OCC==0)
+
+    Returns gap in eV, or None if block not found / fewer than 2 MOs parsed.
+    """
+    # Find the last ORBITAL ENERGIES block (TDDFT runs SCF first; take the last)
+    lines = output_text.splitlines()
+    block_start = None
+    for i, line in enumerate(lines):
+        if "ORBITAL ENERGIES" in line.upper():
+            block_start = i
+
+    if block_start is None:
+        return None
+
+    # Parse MO lines: index  occ  E(Eh)  E(eV)
+    pat = re.compile(r'^\s*(\d+)\s+([\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s*$')
+    homo_ev = None
+    lumo_ev = None
+    for line in lines[block_start + 1: block_start + 500]:
+        m = pat.match(line)
+        if not m:
+            continue
+        occ = float(m.group(2))
+        e_ev = float(m.group(4))
+        if occ > 0.0:
+            homo_ev = e_ev       # keep updating; last occupied = HOMO
+        elif homo_ev is not None and lumo_ev is None:
+            lumo_ev = e_ev       # first unoccupied after HOMO = LUMO
+            break
+
+    if homo_ev is None or lumo_ev is None:
+        return None
+    return round(lumo_ev - homo_ev, 6)
+
+
 def extract_ir_spectrum(output_text: str) -> List[Dict]:
-    """Parse IR SPECTRUM block from ORCA output.
+    """Parse IR spectrum from ORCA output, including imaginary modes.
+
+    In ORCA 6, the IR SPECTRUM block only lists real (positive frequency) modes.
+    Imaginary modes appear only in the VIBRATIONAL FREQUENCIES block with a
+    '***imaginary mode***' marker.  This function combines both sources so that
+    TS calculations report their imaginary mode(s) with negative freq_cm1 values.
 
     Returns [{"mode": int, "freq_cm1": float, "intensity_km_mol": float}, ...]
-    for real vibrational modes only (|freq| > 10 cm-1).
-    Uses the last occurrence of the block.
-
-    ORCA format:
-      Mode   freq       eps      Int      T**2   TX  TY  TZ
-             cm**-1  L/(mol*cm)  km/mol   a.u.
-      6:   2078.52   0.002020   10.21  0.000303  (...)
+    sorted by mode number. Imaginary modes have intensity_km_mol = 0.0.
+    Modes with |freq| <= 10 cm-1 (translations/rotations) are excluded.
     """
     lines = output_text.splitlines()
+    result: List[Dict] = []
+
+    # --- Step 1: Imaginary modes from VIBRATIONAL FREQUENCIES block ---
+    # ORCA 6 format: "   6:      -205.12 cm**-1 ***imaginary mode***"
+    imag_pat = re.compile(
+        r'^\s+(\d+):\s+([-+]?\d+\.?\d*)\s+cm\*\*-1\s+\*+imaginary', re.IGNORECASE
+    )
+    for line in lines:
+        m = imag_pat.match(line)
+        if m:
+            mode = int(m.group(1))
+            freq = float(m.group(2))
+            if abs(freq) > 10.0:
+                result.append({"mode": mode, "freq_cm1": freq, "intensity_km_mol": 0.0})
+
+    # --- Step 2: Real modes from IR SPECTRUM block (last occurrence) ---
+    # ORCA format:
+    #   Mode   freq       eps      Int      T**2   TX  TY  TZ
+    #           cm**-1  L/(mol*cm)  km/mol   a.u.
+    #   7:   948.32   0.000456   3.14  ...
     block_start = None
     for i in range(len(lines) - 1, -1, -1):
         if re.search(r'\bIR\s+SPECTRUM\b', lines[i], re.IGNORECASE):
             block_start = i
             break
-    if block_start is None:
-        return []
+    if block_start is not None:
+        pat = re.compile(
+            r'^\s*(\d+):\s+([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)'
+        )
+        seen_modes = {r["mode"] for r in result}
+        for line in lines[block_start + 1 : block_start + 200]:
+            m = pat.match(line)
+            if m:
+                mode = int(m.group(1))
+                freq = float(m.group(2))
+                intensity = float(m.group(4))   # group(3)=eps, group(4)=Int km/mol
+                if abs(freq) > 10.0 and mode not in seen_modes:
+                    result.append({"mode": mode, "freq_cm1": freq,
+                                   "intensity_km_mol": intensity})
+                    seen_modes.add(mode)
+            elif result and line.strip() and not line.strip().startswith(('-', '*')):
+                if not re.match(r'\s*(mode|freq|cm\*\*)', line.strip(), re.IGNORECASE):
+                    break
 
-    # Pattern: "  6:   2078.52   0.002020   10.21  ..."
-    # columns after "N:": freq, eps, Int(km/mol), T**2, (TX TY TZ)
-    pat = re.compile(r'^\s*(\d+):\s+([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)')
-    result = []
-    for line in lines[block_start + 1: block_start + 100]:
-        m = pat.match(line)
-        if m:
-            mode = int(m.group(1))
-            freq = float(m.group(2))
-            # m.group(3) = eps, m.group(4) = Int (km/mol)
-            intensity = float(m.group(4))
-            if abs(freq) > 10.0:
-                result.append({"mode": mode, "freq_cm1": freq, "intensity_km_mol": intensity})
-        elif result and line.strip() and not line.strip().startswith(('-', '*')):
-            if not re.match(r'\s*(mode|freq|cm\*\*)', line.strip(), re.IGNORECASE):
-                break
-    return result
+    return sorted(result, key=lambda x: x["mode"])
 
 
 def extract_raman_spectrum(output_text: str) -> List[Dict]:
@@ -749,6 +854,7 @@ async def run_opt_job(
             "label": job_label,
             "workdir": str(workdir),
             "error": str(e),
+            "code": _classify_orca_error_code(out_text),
             "tail": _tail_lines(out_text, debug_tail_lines),
             "error_summary": _error_summary(out_text),
         }
@@ -773,6 +879,7 @@ async def run_opt_job(
             "opt_converged": opt_converged,
             "energy": energy,
             "final_geometry_xyz": final_xyz,
+            "code": _classify_orca_error_code(out_text),
             "tail": _tail_lines(out_text, debug_tail_lines),
             "error_summary": _error_summary(out_text),
             "text": "ORCA did not terminate normally.",
@@ -938,15 +1045,20 @@ async def run_sp_energy(
         )
     except Exception as e:
         out_text = _read_out_text(workdir, job_label)
-        return json.dumps({"status": "error", "label": job_label, "error": str(e)})
+        return json.dumps({"status": "error", "label": job_label, "error": str(e),
+                           "code": _classify_orca_error_code(out_text)})
 
     ok = output.terminated_normally()
     out_text = _read_out_text(workdir, job_label)
     if not ok:
-        return json.dumps({"status": "error", "label": job_label, "tail": "\n".join(out_text.splitlines()[-120:])})
+        return json.dumps({"status": "error", "label": job_label,
+                           "code": _classify_orca_error_code(out_text),
+                           "tail": "\n".join(out_text.splitlines()[-120:])})
 
     energy = extract_total_energy(out_text)
-    return json.dumps({"status": "ok", "label": job_label, "energy": energy, "product": "energy"})
+    gap_ev = extract_homo_lumo_gap(out_text)
+    return json.dumps({"status": "ok", "label": job_label, "energy_eh": energy,
+                       "homo_lumo_gap_ev": gap_ev, "product": "energy_eh"})
 
 
 @mcp.tool()
@@ -995,25 +1107,33 @@ async def run_freq_job(
             {"status": "timeout", "label": job_label, "text": f"Status: TIMEOUT after {wall_timeout_seconds}s"}
         )
     except Exception as e:
-        return json.dumps({"status": "error", "label": job_label, "error": str(e)})
+        out_text = _read_out_text(workdir, job_label)
+        return json.dumps({"status": "error", "label": job_label, "error": str(e),
+                           "code": _classify_orca_error_code(out_text)})
 
     ok = output.terminated_normally()
     out_text = _read_out_text(workdir, job_label)
     if not ok:
-        return json.dumps({"status": "error", "label": job_label, "tail": "\n".join(out_text.splitlines()[-120:])})
+        return json.dumps({"status": "error", "label": job_label,
+                           "code": _classify_orca_error_code(out_text),
+                           "tail": "\n".join(out_text.splitlines()[-120:])})
 
     energy = extract_total_energy(out_text)
     enthalpy = extract_total_enthalpy(out_text)
     gibbs = extract_gibbs_free_energy(out_text)
 
-    return json.dumps({
-        "status": "ok",
+    imag_code = _classify_orca_error_code(out_text)  # "IMAG_FREQ" or None
+    ret: dict = {
+        "status": "warning" if imag_code == "IMAG_FREQ" else "ok",
         "label": job_label,
-        "energy": energy,
+        "energy_eh": energy,
         "enthalpy_eh": enthalpy,
         "gibbs_free_energy_eh": gibbs,
         "product": "gibbs_free_energy_eh",
-    })
+    }
+    if imag_code:
+        ret["code"] = imag_code
+    return json.dumps(ret)
 
 
 @mcp.tool()
@@ -1079,13 +1199,16 @@ async def run_spectrum_job(
             "ir_spectrum": extract_ir_spectrum(out_text),
         })
     except Exception as e:
-        return json.dumps({"status": "error", "label": job_label, "error": str(e)})
+        out_text = _read_out_text(workdir, job_label)
+        return json.dumps({"status": "error", "label": job_label, "error": str(e),
+                           "code": _classify_orca_error_code(out_text)})
 
     ok = output.terminated_normally()
     out_text = _read_out_text(workdir, job_label)
     if not ok:
         return json.dumps({
             "status": "error", "label": job_label,
+            "code": _classify_orca_error_code(out_text),
             "tail": "\n".join(out_text.splitlines()[-120:]),
         })
 
@@ -1093,9 +1216,11 @@ async def run_spectrum_job(
     enthalpy = extract_total_enthalpy(out_text)
     gibbs = extract_gibbs_free_energy(out_text)
     ir_spec = extract_ir_spectrum(out_text)
+    imag_modes = [e for e in ir_spec
+                  if isinstance(e.get("freq_cm1"), (int, float)) and e["freq_cm1"] < -10]
 
     result = {
-        "status": "ok",
+        "status": "warning" if imag_modes else "ok",
         "label": job_label,
         "energy_eh": energy,
         "enthalpy_eh": enthalpy,
@@ -1104,6 +1229,9 @@ async def run_spectrum_job(
         "spectrum_type": spectrum_type,
         "product": "gibbs_free_energy_eh",
     }
+    if imag_modes:
+        result["code"] = "IMAG_FREQ"
+        result["imaginary_modes"] = imag_modes
     if do_raman:
         result["raman_spectrum"] = extract_raman_spectrum(out_text)
 
@@ -1175,7 +1303,9 @@ async def run_tddft_job(
             "text": f"Status: TIMEOUT after {wall_timeout_seconds}s",
         })
     except Exception as e:
-        return json.dumps({"status": "error", "label": job_label, "error": str(e)})
+        out_text = _read_out_text(workdir, job_label)
+        return json.dumps({"status": "error", "label": job_label, "error": str(e),
+                           "code": _classify_orca_error_code(out_text)})
 
     ok = output.terminated_normally()
     out_text = _read_out_text(workdir, job_label)
@@ -1183,20 +1313,24 @@ async def run_tddft_job(
         return json.dumps({
             "status": "error",
             "label": job_label,
+            "code": _classify_orca_error_code(out_text),
             "tail": "\n".join(out_text.splitlines()[-120:]),
         })
 
     energy = extract_total_energy(out_text)
     excited_states = extract_excited_states(out_text)
+    gap_ev = extract_homo_lumo_gap(out_text)
 
     return json.dumps({
         "status": "ok",
         "label": job_label,
         "energy_ground_state_eh": energy,
+        "homo_lumo_gap_ev": gap_ev,
         "excited_states": excited_states,
         "product": "excited_states",
         "text": (
             f"Status: OK\nGround state energy: {energy} Eh\n"
+            f"HOMO-LUMO gap: {gap_ev} eV\n"
             f"Excited states found: {len(excited_states)}"
         ),
     })
@@ -1420,7 +1554,9 @@ async def run_scan_job(
             "text":        f"Status: TIMEOUT after {wall_timeout_seconds}s ({len(partial)} steps collected)",
         })
     except Exception as e:
-        return json.dumps({"status": "error", "label": job_label, "error": str(e)})
+        out_text = _read_out_text(workdir, job_label)
+        return json.dumps({"status": "error", "label": job_label, "error": str(e),
+                           "code": _classify_orca_error_code(out_text)})
 
     ok = output.terminated_normally()
     out_text = _read_out_text(workdir, job_label)
@@ -1428,6 +1564,7 @@ async def run_scan_job(
         return json.dumps({
             "status": "error",
             "label":  job_label,
+            "code":   _classify_orca_error_code(out_text),
             "tail":   "\n".join(out_text.splitlines()[-120:]),
         })
 
@@ -1550,6 +1687,7 @@ async def run_ts_opt_job(
             "status": "error",
             "label":  job_label,
             "error":  str(e),
+            "code":   _classify_orca_error_code(out_text),
             "tail":   "\n".join(out_text.splitlines()[-80:]),
         })
 
@@ -1566,6 +1704,7 @@ async def run_ts_opt_job(
             "ts_converged": ts_converged,
             "energy_eh":    energy,
             "geometry_xyz": final_xyz,
+            "code":         _classify_orca_error_code(out_text),
             "tail":         "\n".join(out_text.splitlines()[-120:]),
             "text":         "ORCA did not terminate normally.",
         })
@@ -1581,6 +1720,84 @@ async def run_ts_opt_job(
         "tail":         "\n".join(out_text.splitlines()[-60:]),
         "text":         f"Status: {status.upper()}\nTS energy: {energy} Eh",
     })
+
+
+@mcp.tool()
+async def run_casscf_job(
+    geometry_xyz: str,
+    charge: int = 0,
+    multiplicity: int = 1,
+    nel: int = 2,
+    norb: int = 2,
+    nroots: int = 1,
+    basis: str = "def2-SVP",
+    scf_max_iter: int = 200,
+    wall_timeout_seconds: int = 3600,
+    job_label: Optional[str] = None,
+    ncores: int = 1,
+) -> str:
+    """Run a CASSCF single-point calculation with ORCA.
+
+    Requires active space: nel (active electrons) and norb (active orbitals).
+    Set nroots > 1 for state-averaged SA-CASSCF.
+    Returns energy_eh (total or SA-average) and energies_eh list (nroots > 1).
+    """
+    if not geometry_xyz.strip():
+        raise ValueError("geometry_xyz is empty")
+    if job_label is None:
+        job_label = f"casscf_{os.getpid()}_{int(asyncio.get_event_loop().time())}"
+    job_label = sanitize_label(job_label)
+    workdir = Path(os.environ.get("ORCA_JOBS_DIR", "jobs")) / job_label
+
+    calc = _build_calc(
+        label=job_label, workdir=workdir, geometry_xyz=geometry_xyz,
+        charge=charge, multiplicity=multiplicity,
+        method="CASSCF", basis=basis,
+        job_type="casscf", use_ri=False,
+        scf_max_iter=scf_max_iter, opt_max_iter=1,
+        nbo=False, ncores=ncores,
+    )
+    casscf_block = (
+        f"%casscf\n"
+        f"  nel    {nel}\n"
+        f"  norb   {norb}\n"
+        f"  nroots {nroots}\n"
+        f"  maxiter 500\n"
+        f"end"
+    )
+    calc.input.add_arbitrary_string(casscf_block)
+
+    try:
+        output = await _run_calc_with_timeout(calc, wall_timeout_seconds)
+    except asyncio.TimeoutError:
+        return json.dumps({"status": "timeout", "label": job_label})
+    except Exception as e:
+        return json.dumps({"status": "error", "label": job_label, "error": str(e)})
+
+    ok = output.terminated_normally()
+    out_text = _read_out_text(workdir, job_label)
+    if not ok:
+        code = _classify_orca_error_code(out_text)
+        result: dict = {
+            "status": "error",
+            "label": job_label,
+            "tail": "\n".join(out_text.splitlines()[-120:]),
+        }
+        if code:
+            result["code"] = code
+        return json.dumps(result)
+
+    energy = extract_total_energy(out_text)
+    root_energies = extract_casscf_root_energies(out_text)
+    ret: dict = {
+        "status": "ok",
+        "label": job_label,
+        "energy_eh": energy,
+        "product": "energy_eh",
+    }
+    if root_energies:
+        ret["energies_eh"] = root_energies
+    return json.dumps(ret)
 
 
 @mcp.tool()

@@ -30,10 +30,11 @@ def _state_get_dict(state: Any, key: str) -> Dict[str, Any]:
     v = _state_get(state, key, {})
     return v if isinstance(v, dict) else {}
 
-NEEDS_GEOM_SINGLE = {'run_solvator_cluster_thermo', 'run_opt_job', 'run_nbo_job', 'run_sp_energy', 'run_freq_job', 'run_spectrum_job', 'run_tddft_job', 'run_scan_job', 'run_ts_opt_job', 'run_solvator_cluster', 'structure_add_remove_proton'}
+NEEDS_GEOM_SINGLE = {'run_solvator_cluster_thermo', 'run_opt_job', 'run_nbo_job', 'run_sp_energy', 'run_freq_job', 'run_spectrum_job', 'run_tddft_job', 'run_scan_job', 'run_ts_opt_job', 'run_solvator_cluster', 'structure_add_remove_proton', 'run_casscf_job'}
 
 TOOLS_RETURNING_STRUCTURE = {
     "name_to_geometry_xyz",
+    "build_coordination_complex",
     "run_opt_job",
     "structure_add_remove_proton",
     "run_solvator_cluster_thermo",  # if it returns cluster geometry
@@ -319,12 +320,113 @@ def _pubchem_name_to_sdf3d(name: str, timeout=30) -> str | None:
         return r.text
     return None
 
+_ELEMENT_RE = __import__("re").compile(
+    r"^([A-Z][a-z]?)(?:(\d+)?([+-]))?$"
+)
+
+# Common element names and ion names → (symbol, charge)
+_ION_NAME_MAP: dict = {
+    # Halide anions (multiple name variants)
+    "chloride": ("Cl", -1), "chloride ion": ("Cl", -1), "chloride anion": ("Cl", -1),
+    "fluoride": ("F", -1), "fluoride ion": ("F", -1), "fluoride anion": ("F", -1),
+    "bromide": ("Br", -1), "bromide ion": ("Br", -1), "bromide anion": ("Br", -1),
+    "iodide": ("I", -1), "iodide ion": ("I", -1), "iodide anion": ("I", -1),
+    # Oxide-family anions
+    "oxide": ("O", -2), "sulfide": ("S", -2),
+    # Common cation names
+    "ferrous": ("Fe", +2), "ferric": ("Fe", +3),
+    "ferrous ion": ("Fe", +2), "ferric ion": ("Fe", +3),
+    "iron(ii)": ("Fe", +2), "iron(iii)": ("Fe", +3),
+    "cobalt(ii)": ("Co", +2), "cobalt(iii)": ("Co", +3),
+    "nickel(ii)": ("Ni", +2), "copper(ii)": ("Cu", +2), "zinc(ii)": ("Zn", +2),
+    "manganese(ii)": ("Mn", +2), "manganese(iii)": ("Mn", +3),
+    # Neutral element names (common ones used in QC)
+    "iron atom": ("Fe", 0), "iron": ("Fe", 0),
+    "cobalt atom": ("Co", 0), "nickel atom": ("Ni", 0),
+    "copper atom": ("Cu", 0), "zinc atom": ("Zn", 0),
+    "chlorine atom": ("Cl", 0), "bromine atom": ("Br", 0),
+    "sodium ion": ("Na", +1), "potassium ion": ("K", +1), "lithium ion": ("Li", +1),
+    "magnesium ion": ("Mg", +2), "calcium ion": ("Ca", +2),
+}
+
+# Atomic numbers for elements commonly used as bare ions in QC calculations
+_ATOMIC_NUMBERS: dict = {
+    "H":1,"He":2,"Li":3,"Be":4,"B":5,"C":6,"N":7,"O":8,"F":9,"Ne":10,
+    "Na":11,"Mg":12,"Al":13,"Si":14,"P":15,"S":16,"Cl":17,"Ar":18,
+    "K":19,"Ca":20,"Sc":21,"Ti":22,"V":23,"Cr":24,"Mn":25,"Fe":26,
+    "Co":27,"Ni":28,"Cu":29,"Zn":30,"Ga":31,"Ge":32,"As":33,"Se":34,
+    "Br":35,"Kr":36,"Rb":37,"Sr":38,"Y":39,"Zr":40,"Nb":41,"Mo":42,
+    "Ru":44,"Rh":45,"Pd":46,"Ag":47,"Cd":48,"I":53,"Cs":55,"Ba":56,
+    "La":57,"Ce":58,"Gd":64,"Ir":77,"Pt":78,"Au":79,"Hg":80,"Pb":82,
+}
+
+
+def _try_bare_ion_geometry(name: str):
+    """Return single-atom xyz dict for bare elements/ions like 'Fe', 'Fe3+', 'Cl-', or None.
+
+    Multiplicity is set to the minimum allowed by electron count parity:
+    odd electrons → doublet (2), even electrons → singlet (1).
+    """
+    m = _ELEMENT_RE.match(name.strip())
+    if m is None:
+        return None
+    elem, mag, sign = m.group(1), m.group(2), m.group(3)
+    charge = 0
+    if sign:
+        charge = int(mag or 1) * (1 if sign == "+" else -1)
+    Z = _ATOMIC_NUMBERS.get(elem)
+    if Z is None:
+        return None  # unknown element — fall through to PubChem
+    n_electrons = Z - charge
+    if n_electrons < 0:
+        return None  # unphysical
+    # Minimum spin multiplicity consistent with electron count parity
+    mult = (n_electrons % 2) + 1
+    xyz = f"{elem}  0.000  0.000  0.000"
+    return {"status": "ok", "name": name, "geometry_xyz": xyz,
+            "charge": charge, "multiplicity": mult,
+            "provenance": {"geometry": "single_atom"}}
+
+
+def _bare_ion_from_elem_charge(elem: str, charge: int) -> Optional[dict]:
+    """Build single-atom geometry dict from element symbol + charge, or None if unknown."""
+    Z = _ATOMIC_NUMBERS.get(elem)
+    if Z is None:
+        return None
+    n_electrons = Z - charge
+    if n_electrons < 0:
+        return None
+    mult = (n_electrons % 2) + 1
+    xyz = f"{elem}  0.000  0.000  0.000"
+    return {"status": "ok", "name": f"{elem}{charge:+d}" if charge else elem,
+            "geometry_xyz": xyz, "charge": charge, "multiplicity": mult,
+            "provenance": {"geometry": "single_atom"}}
+
+
 def name_to_geometry_xyz(name: str) -> dict:
     name = (name or "").strip()
     if not name:
         return {"status": "error", "error": "empty name"}
     default_charge = 0
     default_multiplicity = 1
+    # 0a) bare element symbol / simple ion notation: Fe, Fe3+, Cl-, Na+, etc.
+    bare = _try_bare_ion_geometry(name)
+    if bare is not None:
+        return bare
+    # 0b) common ion/element names: "chloride", "iron atom", "ferric ion", etc.
+    name_lower = name.lower()
+    ion = _ION_NAME_MAP.get(name_lower)
+    if ion is not None:
+        result = _bare_ion_from_elem_charge(ion[0], ion[1])
+        if result is not None:
+            result["name"] = name
+            return result
+    # 0c) "<Symbol> atom" pattern: "Fe atom", "Cl atom", etc.
+    if name_lower.endswith(" atom"):
+        elem_sym = name[:-5].strip()
+        bare = _try_bare_ion_geometry(elem_sym)
+        if bare is not None:
+            return bare
     # 1) try PubChem 3D directly by name first
     sdf = _pubchem_name_to_sdf3d(name)
     if sdf:
@@ -356,6 +458,261 @@ def name_to_geometry_xyz(name: str) -> dict:
                 return {"status": "error", "name": name, "cid": cid, "error": f"sdf_to_xyz failed: {e}", "identifiers": ids}
 
     return {"status": "not_found", "name": name, "identifiers": ids, "error": "No PubChem 3D SDF found"}
+
+
+# ── Coordination complex builder ──────────────────────────────────────────────
+
+import numpy as np
+from rdkit.Chem import AllChem
+
+# Cartesian direction vectors for each coordination geometry
+_COORD_TEMPLATES: dict = {
+    "linear":               [[0,0,1],[0,0,-1]],
+    "trigonal_planar":      [[1,0,0],[-0.5,0.866,0],[-0.5,-0.866,0]],
+    "tetrahedral":          [[0.816,0,0.577],[-0.816,0,0.577],[0,0.816,-0.577],[0,-0.816,-0.577]],
+    "square_planar":        [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0]],
+    "trigonal_bipyramidal": [[1,0,0],[-0.5,0.866,0],[-0.5,-0.866,0],[0,0,1],[0,0,-1]],
+    "octahedral":           [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]],
+}
+
+# Donor atom preference (lower = preferred)
+_DONOR_PRIORITY: dict = {"N":1,"O":2,"S":3,"P":4,"Cl":5,"Br":6,"I":7,"F":8,"C":9}
+
+# Common ligand name → canonical SMILES (bypasses OPSIN/wchar_t encoding issues on Windows)
+_LIGAND_SMILES: dict = {
+    "chloride": "[Cl-]", "fluoride": "[F-]", "bromide": "[Br-]", "iodide": "[I-]",
+    "cyanide": "[C-]#N", "hydroxide": "[OH-]", "oxide": "[O-2]",
+    "water": "O", "aqua": "O",
+    "ammonia": "N", "amine": "N",
+    "carbon monoxide": "[C-]#[O+]", "carbonyl": "[C-]#[O+]",
+    "nitrosyl": "[N+]#[O-]", "nitric oxide": "[N+]#[O-]",
+    "thiocyanate": "[S-]C#N",
+}
+
+
+def _generate_ligand_3d(name_or_smiles: str) -> "Chem.Mol":
+    """Return an RDKit Mol with 3D coordinates for the given ligand name or SMILES."""
+    # Check known-SMILES table first (avoids Windows wchar_t encoding issues with OPSIN)
+    canonical = _LIGAND_SMILES.get(name_or_smiles.lower().strip())
+    if canonical:
+        mol = Chem.MolFromSmiles(canonical)
+        if mol is not None:
+            mol = Chem.AddHs(mol)
+            params = AllChem.ETKDGv3()
+            params.randomSeed = 42
+            if AllChem.EmbedMolecule(mol, params) >= 0:
+                return mol
+    mol = Chem.MolFromSmiles(name_or_smiles)
+    if mol is None:
+        sdf = _pubchem_name_to_sdf3d(name_or_smiles)
+        if sdf:
+            mol = Chem.MolFromMolBlock(sdf, removeHs=False)
+            if mol is not None and mol.GetNumConformers() > 0:
+                return mol
+        smiles = opsin_resolve(name_or_smiles)
+        if smiles:
+            mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Cannot resolve ligand {name_or_smiles!r}")
+    mol = Chem.AddHs(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = 42
+    if AllChem.EmbedMolecule(mol, params) < 0:
+        raise ValueError(f"3D embedding failed for {name_or_smiles!r}")
+    AllChem.MMFFOptimizeMolecule(mol)
+    return mol
+
+
+def _get_donor_atoms(mol: "Chem.Mol") -> list:
+    """Return atom indices of potential donor atoms, best candidates first.
+
+    Special case: linear C-donor ligands (CO, CN⁻, CNR).
+    In these molecules the C is the coordinating atom, not the N/O.
+    Detected when: exactly 2 heavy atoms, one is C with a triple bond to N or O.
+    """
+    heavy = [a for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
+    if len(heavy) == 2:
+        syms = {a.GetSymbol() for a in heavy}
+        if syms in ({"C", "N"}, {"C", "O"}):
+            # CO or CN type — C is the donor
+            c_idx = next(a.GetIdx() for a in heavy if a.GetSymbol() == "C")
+            other = [a.GetIdx() for a in heavy if a.GetSymbol() != "C"]
+            return [c_idx] + other
+
+    candidates = [(a.GetIdx(), _DONOR_PRIORITY[a.GetSymbol()])
+                  for a in mol.GetAtoms() if a.GetSymbol() in _DONOR_PRIORITY]
+    candidates.sort(key=lambda x: x[1])
+    return [idx for idx, _ in candidates]
+
+
+def _rotation_align(from_vec: np.ndarray, to_vec: np.ndarray) -> np.ndarray:
+    """Rodrigues rotation matrix that rotates unit from_vec onto unit to_vec."""
+    a = from_vec / np.linalg.norm(from_vec)
+    b = to_vec   / np.linalg.norm(to_vec)
+    axis = np.cross(a, b)
+    s = np.linalg.norm(axis)
+    c = np.dot(a, b)
+    if s < 1e-8:
+        if c > 0:
+            return np.eye(3)
+        # anti-parallel: 180° around any perpendicular axis
+        perp = np.array([1,0,0]) if abs(a[0]) < 0.9 else np.array([0,1,0])
+        axis = np.cross(a, perp); axis /= np.linalg.norm(axis)
+        K = np.array([[0,-axis[2],axis[1]],[axis[2],0,-axis[0]],[-axis[1],axis[0],0]])
+        return np.eye(3) + 2*(K @ K)
+    axis /= s
+    K = np.array([[0,-axis[2],axis[1]],[axis[2],0,-axis[0]],[-axis[1],axis[0],0]])
+    return np.eye(3) + s*K + (1-c)*(K @ K)
+
+
+def _mol_atom_positions(mol: "Chem.Mol") -> list:
+    """Return [(symbol, np.ndarray), ...] for all atoms in the mol's conformer."""
+    conf = mol.GetConformer()
+    return [(mol.GetAtomWithIdx(i).GetSymbol(),
+             np.array(conf.GetAtomPosition(i))) for i in range(mol.GetNumAtoms())]
+
+
+def _place_monodentate(mol: "Chem.Mol", donor_idx: int,
+                       direction: np.ndarray, bond_length: float) -> list:
+    """Place ligand so donor_idx lands at direction*bond_length from the metal at origin."""
+    atoms = _mol_atom_positions(mol)
+    donor_pos = atoms[donor_idx][1].copy()
+    atoms = [(s, p - donor_pos) for s, p in atoms]          # donor → origin
+
+    # Find ligand's "bulk" direction (away from metal)
+    others = [p for i, (s, p) in enumerate(atoms) if i != donor_idx]
+    away = np.mean(others, axis=0) if others else np.array([0., 0., 1.])
+    if np.linalg.norm(away) < 1e-8:
+        away = np.array([0., 0., 1.])
+
+    # Rotate so "away" aligns with template direction
+    d_unit = direction / np.linalg.norm(direction)
+    R = _rotation_align(away / np.linalg.norm(away), d_unit)
+    atoms = [(s, R @ p) for s, p in atoms]
+
+    shift = d_unit * bond_length
+    return [(s, p + shift) for s, p in atoms]
+
+
+def _place_bidentate(mol: "Chem.Mol", donor_idxs: tuple,
+                     dir1: np.ndarray, dir2: np.ndarray, bond_length: float) -> list:
+    """Place a bidentate ligand so its two donors land at dir1/dir2 * bond_length."""
+    atoms = _mol_atom_positions(mol)
+    t1 = dir1 / np.linalg.norm(dir1) * bond_length
+    t2 = dir2 / np.linalg.norm(dir2) * bond_length
+
+    d1 = atoms[donor_idxs[0]][1].copy()
+    d2 = atoms[donor_idxs[1]][1].copy()
+
+    # Scale ligand so donor–donor distance matches target distance
+    lig_d = np.linalg.norm(d2 - d1)
+    tgt_d = np.linalg.norm(t2 - t1)
+    scale = tgt_d / lig_d if lig_d > 1e-8 else 1.0
+    centroid_lig = (d1 + d2) / 2
+    atoms = [(s, (p - centroid_lig) * scale) for s, p in atoms]
+
+    # Translate centroid to target centroid
+    centroid_tgt = (t1 + t2) / 2
+    atoms = [(s, p + centroid_tgt) for s, p in atoms]
+
+    # Rotate to align donor axis
+    d1n = atoms[donor_idxs[0]][1]
+    d2n = atoms[donor_idxs[1]][1]
+    lig_axis = d2n - d1n
+    tgt_axis = t2 - t1
+    R = _rotation_align(lig_axis / np.linalg.norm(lig_axis),
+                        tgt_axis / np.linalg.norm(tgt_axis))
+    return [(s, R @ (p - centroid_tgt) + centroid_tgt) for s, p in atoms]
+
+
+def build_coordination_complex(
+    metal: str,
+    ligands: list,
+    geometry: str = "octahedral",
+    charge: int = 0,
+    multiplicity: int = 1,
+    bond_length: float = 2.0,
+) -> dict:
+    """Build a coordination complex XYZ from a metal center and list of ligands.
+
+    Monodentate ligands (NH3, H2O, Cl, CO …) each occupy one coordination site.
+    Bidentate ligands (en, bipyridine, acac …) are auto-detected (two donor atoms
+    within 1.8–5.0 Å) and consume two adjacent sites.  Total denticity must equal
+    the coordination number implied by `geometry`.
+
+    Args:
+        metal:        Element symbol, e.g. "Fe", "Ru", "Co".
+        ligands:      List of ligand names or SMILES strings.
+        geometry:     One of: linear, trigonal_planar, tetrahedral, square_planar,
+                      trigonal_bipyramidal, octahedral.
+        charge:       Total complex charge.
+        multiplicity: Spin multiplicity.
+        bond_length:  Metal–donor bond length in Å (default 2.0, suitable for first-row TM).
+
+    Returns:
+        dict with status, geometry_xyz (no-header XYZ), n_atoms, charge, multiplicity.
+    """
+    geometry = geometry.lower().replace("-", "_").replace(" ", "_")
+    if geometry not in _COORD_TEMPLATES:
+        return {"status": "error",
+                "error": f"Unknown geometry {geometry!r}. Choose from: {list(_COORD_TEMPLATES)}"}
+
+    vertices = [np.array(v, dtype=float) for v in _COORD_TEMPLATES[geometry]]
+    n_sites  = len(vertices)
+
+    # Resolve and characterise each ligand
+    lig_info = []
+    for i, lig in enumerate(ligands):
+        try:
+            mol = _generate_ligand_3d(lig)
+        except Exception as e:
+            return {"status": "error", "error": f"Ligand {i} ({lig!r}): {e}"}
+        donors = _get_donor_atoms(mol)
+        if not donors:
+            return {"status": "error", "error": f"Ligand {i} ({lig!r}): no donor atom found"}
+        # Auto-detect bidentate: two donors within a chelate-like distance
+        denticity = 1
+        if len(donors) >= 2:
+            conf = mol.GetConformer()
+            p1 = np.array(conf.GetAtomPosition(donors[0]))
+            p2 = np.array(conf.GetAtomPosition(donors[1]))
+            if 1.8 < np.linalg.norm(p2 - p1) < 5.0:
+                denticity = 2
+        lig_info.append((mol, donors, denticity, lig))
+
+    total_sites = sum(d for _, _, d, _ in lig_info)
+    if total_sites != n_sites:
+        denticities = [d for _, _, d, _ in lig_info]
+        return {"status": "error",
+                "error": (f"geometry={geometry!r} needs {n_sites} sites but ligands provide "
+                          f"{total_sites} (per-ligand denticities: {denticities}). "
+                          f"Adjust the ligand list or choose a different geometry.")}
+
+    # Place each ligand at its assigned vertex/vertices
+    all_atoms: list = [(metal, np.zeros(3))]
+    v_idx = 0
+    for mol, donors, denticity, _ in lig_info:
+        if denticity == 1:
+            placed = _place_monodentate(mol, donors[0], vertices[v_idx], bond_length)
+            v_idx += 1
+        else:
+            placed = _place_bidentate(mol, (donors[0], donors[1]),
+                                      vertices[v_idx], vertices[v_idx + 1], bond_length)
+            v_idx += 2
+        all_atoms.extend(placed)
+
+    xyz_lines = [f"{sym:<4s}{pos[0]:>14.6f}{pos[1]:>14.6f}{pos[2]:>14.6f}"
+                 for sym, pos in all_atoms]
+    return {
+        "status":       "ok",
+        "geometry_xyz": "\n".join(xyz_lines),
+        "metal":        metal,
+        "geometry":     geometry,
+        "n_atoms":      len(all_atoms),
+        "charge":       charge,
+        "multiplicity": multiplicity,
+        "provenance":   {"geometry": "template_builder"},
+    }
 
 
 def print_tool_output(text: str, limit: int = 8000):
@@ -850,18 +1207,32 @@ def display_and_confirm_compound(card: Dict[str, Any], openai_client: Any, _dept
             print("  Please type y, n, or 'rename to <name>'.")
 
 
-def compounds_to_planner_context(compounds: List[Dict[str, Any]]) -> str:
-    """Format a list of confirmed compound cards as a planner system-message string."""
-    if not compounds:
+def compounds_to_planner_context(compounds: List[Dict[str, Any]], mode: str = "full") -> str:
+    """Format a list of confirmed compound cards as a planner system-message string.
+
+    mode controls what fields are included in CONFIRMED_COMPOUNDS:
+      "full"   (default): name, formula, SMILES, MW, CID, charge
+      "smiles": name, SMILES, charge only
+      "name":   name, charge only
+      "xyz":    returns "" (planner reasons from geometry state only)
+    """
+    if not compounds or mode == "xyz":
         return ""
     lines = ["CONFIRMED COMPOUNDS (verified by user before planning):"]
     for c in compounds:
-        parts = [f"formula={c['formula']}" if c.get("formula") else None,
-                 f"SMILES={c['smiles']}" if c.get("smiles") else None,
-                 f"charge={c.get('charge', 0)}",
-                 f"MW={c['mw']} g/mol" if c.get("mw") else None,
-                 f"CID={c['cid']}" if c.get("cid") else None]
-        detail = ", ".join(p for p in parts if p)
+        if mode == "name":
+            detail = f"charge={c.get('charge', 0)}"
+        elif mode == "smiles":
+            parts = [f"SMILES={c['smiles']}" if c.get("smiles") else None,
+                     f"charge={c.get('charge', 0)}"]
+            detail = ", ".join(p for p in parts if p)
+        else:  # "full"
+            parts = [f"formula={c['formula']}" if c.get("formula") else None,
+                     f"SMILES={c['smiles']}" if c.get("smiles") else None,
+                     f"charge={c.get('charge', 0)}",
+                     f"MW={c['mw']} g/mol" if c.get("mw") else None,
+                     f"CID={c['cid']}" if c.get("cid") else None]
+            detail = ", ".join(p for p in parts if p)
         lines.append(f"  - {c['name']}: {detail}")
     lines.append("Use these confirmed identities when assigning geom_ids and charge/multiplicity.")
     return "\n".join(lines)
@@ -2272,12 +2643,28 @@ async def execute_tool_from_node_spec(*, state: Dict[str, Any], node_spec: Dict[
         client_side_tools = {}
 
     # ---------------- client-side tool ----------------
+    # MCP-only parameters that client-side functions never accept
+    _MCP_ONLY_PARAMS = {"wall_timeout_seconds", "ncores", "job_label"}
+
     if tool_name in client_side_tools:
         fn = client_side_tools[tool_name]
+        import inspect as _inspect
         try:
-            out = fn(**args)
+            sig = _inspect.signature(fn)
+            has_var_keyword = any(
+                p.kind == _inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+        except (ValueError, TypeError):
+            has_var_keyword = True
+        if not has_var_keyword:
+            _client_args = {k: v for k, v in args.items() if k not in _MCP_ONLY_PARAMS}
+        else:
+            _client_args = args
+        try:
+            out = fn(**_client_args)
         except TypeError:
-            out = fn(state, **args)
+            out = fn(state, **_client_args)
 
         if isinstance(out, dict):
             payload = out

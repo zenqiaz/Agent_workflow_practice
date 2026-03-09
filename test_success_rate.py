@@ -31,6 +31,8 @@ Usage
   python test_success_rate.py --mode full --runs 3
   python test_success_rate.py --checker pka --runs 10
   python test_success_rate.py --compound-context "acetic acid: formula=C2H4O2, SMILES=CC(O)=O, charge=0"
+  python test_success_rate.py --compound-mode xyz --preload "acetic acid:ha_neutral" --preload "acetate:a_anion"
+  python test_success_rate.py --compound-mode xyz --preload "molecule.xyz:mol"
 """
 
 from __future__ import annotations
@@ -65,8 +67,11 @@ from client_helpers import (
     summarize_workflow_state,
     parse_json_only,
     name_to_geometry_xyz,
+    load_xyz_as_geometry,
+    geom_key_from_path,
     pubchem_get_basic_properties,
     structure_add_remove_proton,
+    build_coordination_complex,
     run_tool_node,
     state_get_tool_args,
     auto_display_spectra,
@@ -101,7 +106,50 @@ CLIENT_SIDE_TOOL_FUNCS = {
     "name_to_geometry_xyz": name_to_geometry_xyz,
     "pubchem_get_basic_properties": pubchem_get_basic_properties,
     "structure_add_remove_proton": structure_add_remove_proton,
+    "build_coordination_complex": build_coordination_complex,
 }
+
+
+# ─── Geometry pre-loading ──────────────────────────────────────────────────────
+
+def _preload_geometries(specs: List[str], state: dict) -> None:
+    """Resolve preload specs into state['geometries'] / state['geom_meta'].
+
+    Each spec is either:
+      "name:geom_id"       — call name_to_geometry_xyz(name), store as geom_id
+      "path/to/file.xyz:geom_id" — load XYZ file, store as geom_id
+      "path/to/file.xyz"   — load XYZ file, use filename stem as geom_id
+
+    On error the spec is skipped with a warning; it never raises.
+    """
+    for spec in specs:
+        if ":" in spec:
+            src, geom_id = spec.rsplit(":", 1)
+            geom_id = geom_id.strip()
+            src     = src.strip()
+        else:
+            src     = spec.strip()
+            geom_id = geom_key_from_path(src) if os.path.exists(src) else src
+
+        if os.path.exists(src):
+            try:
+                xyz = load_xyz_as_geometry(src)
+                state.setdefault("geometries", {})[geom_id] = xyz
+                state.setdefault("geom_meta", {}).setdefault(geom_id, {})
+                print(f"  [preload] {geom_id!r} ← file {src!r}")
+            except Exception as exc:
+                print(f"  [preload] WARNING: could not load {src!r}: {exc}")
+        else:
+            result = name_to_geometry_xyz(src)
+            if result.get("status") == "ok":
+                xyz = result["geometry_xyz"]
+                state.setdefault("geometries", {})[geom_id] = xyz
+                meta = state.setdefault("geom_meta", {}).setdefault(geom_id, {})
+                meta.setdefault("charge", result.get("charge", 0))
+                meta.setdefault("multiplicity", result.get("multiplicity", 1))
+                print(f"  [preload] {geom_id!r} ← name {src!r} (charge={meta['charge']})")
+            else:
+                print(f"  [preload] WARNING: name_to_geometry_xyz({src!r}) failed: {result.get('error')}")
 
 
 # ─── Checker functions ─────────────────────────────────────────────────────────
@@ -313,6 +361,23 @@ def check_ts(plan: dict) -> Dict[str, bool]:
     }
 
 
+def check_casscf(plan: dict) -> Dict[str, bool]:
+    """CASSCF plan: run_casscf_job with nel/norb args."""
+    nodes     = plan.get("nodes", [])
+    tools_set = {n.get("tool") for n in nodes if n.get("kind") == "tool"}
+    all_keys  = set(plan.get("artifacts_to_save") or []) | _all_product_keys(plan)
+    casscf_nodes = [n for n in nodes if n.get("tool") == "run_casscf_job"]
+    has_active_space = all(
+        n.get("args", {}).get("nel") is not None and n.get("args", {}).get("norb") is not None
+        for n in casscf_nodes
+    ) if casscf_nodes else False
+    return {
+        "has_casscf_node":   "run_casscf_job" in tools_set,
+        "has_active_space":  has_active_space,
+        "has_energy_artifact": any("energy" in k.lower() for k in all_keys),
+    }
+
+
 _CHECKER_MAP = {
     "pka":          check_pka,
     "sp":           check_sp,
@@ -321,6 +386,7 @@ _CHECKER_MAP = {
     "protonation":  check_protonation,
     "spectrum":     check_spectrum,
     "ts":           check_ts,
+    "casscf":       check_casscf,
     "tddft":        check_tddft,
     "scan":         check_scan,
     "struct":       lambda _: {},   # only struct checks apply
@@ -343,6 +409,9 @@ _AUTO_KEYWORDS = {
     "ts":           ["transition state", "ts search", "ts opt", "saddle point",
                      "activation barrier", "activation energy", "optts",
                      "ts structure", "find ts", "locate ts", "reaction barrier"],
+    "casscf":       ["casscf", "cas(", "active space", "multireference",
+                     "multi-reference", "sa-casscf", "state-averaged",
+                     "complete active space", "mcscf"],
 }
 
 
@@ -483,9 +552,12 @@ def run_plan_once(
     checker_name: str,
     with_skills: bool,
     compound_context: str,
+    preload_specs: Optional[List[str]] = None,
 ) -> RunResult:
     """One planning run. Returns pass/fail + per-check breakdown."""
     state = dict(EMPTY_STATE)
+    if preload_specs:
+        _preload_geometries(preload_specs, state)
     t0    = time.monotonic()
     error = ""
     plan  = {}
@@ -527,11 +599,14 @@ async def run_full_once(
     checker_name: str,
     with_skills: bool,
     compound_context: str,
+    preload_specs: Optional[List[str]] = None,
 ) -> RunResult:
     """One full run: plan → execute → check artifacts."""
     from build_graph_from_plan import build_graph_from_plan, build_state
 
     state = dict(EMPTY_STATE)
+    if preload_specs:
+        _preload_geometries(preload_specs, state)
     t0    = time.monotonic()
     error = ""
     plan  = {}
@@ -560,7 +635,12 @@ async def run_full_once(
         )
         init_state  = build_state(
             plan, session,
-            seed={"client_side_tools": CLIENT_SIDE_TOOL_FUNCS},
+            seed={
+                "client_side_tools": CLIENT_SIDE_TOOL_FUNCS,
+                "geometries":  dict(state.get("geometries") or {}),
+                "geom_meta":   dict(state.get("geom_meta") or {}),
+                "name_to_geom": dict(state.get("name_to_geom") or {}),
+            },
             client_side_tools=CLIENT_SIDE_TOOL_FUNCS,
         )
         result      = await graph.ainvoke(init_state)
@@ -588,6 +668,61 @@ async def run_full_once(
         "duration_ms": duration_ms,
         "plan":        plan,
     }
+
+
+# ─── Logging ───────────────────────────────────────────────────────────────────
+
+def save_test_log(
+    message: str,
+    mode: str,
+    checker_name: str,
+    with_skills: bool,
+    results: List[RunResult],
+    log_dir: str = "test_logs",
+    compound_mode: Optional[str] = None,
+) -> str:
+    """Save test suite results to test_logs/<timestamp>_<checker>_<mode>.json.
+
+    Returns the path of the saved file.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+
+    now    = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    fname  = f"test_{now}_{checker_name}_{mode}.json"
+    path   = os.path.join(log_dir, fname)
+
+    n      = len(results)
+    n_pass = sum(1 for r in results if r["passed"])
+    rate   = round(n_pass / n * 100, 1) if n else 0.0
+
+    log = {
+        "type":          "test_run",
+        "timestamp_utc": now,
+        "message":       message,
+        "mode":          mode,
+        "checker":       checker_name,
+        "with_skills":   with_skills,
+        "compound_mode": compound_mode,
+        "n_runs":        n,
+        "n_pass":        n_pass,
+        "rate":          rate,
+        "runs": [
+            {
+                "run":         i + 1,
+                "passed":      r["passed"],
+                "duration_ms": r["duration_ms"],
+                "checks":      r["checks"],
+                "error":       r["error"],
+                "plan":        r["plan"],
+            }
+            for i, r in enumerate(results)
+        ],
+    }
+
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(log, fh, indent=2, ensure_ascii=False)
+
+    return path
 
 
 # ─── Reporting ─────────────────────────────────────────────────────────────────
@@ -688,10 +823,26 @@ def parse_args():
     p.add_argument("--mode",             choices=["plan", "full"], default=None)
     p.add_argument("--checker",          choices=["auto", "pka", "sp", "nbo",
                                                    "solvation", "protonation", "spectrum",
-                                                   "tddft", "scan", "ts", "struct"], default=None)
+                                                   "tddft", "scan", "ts", "casscf", "struct"], default=None)
     p.add_argument("--no-skills",        action="store_true", help="Disable skill injection")
     p.add_argument("--compound-context", default=None,
                    help="Pre-confirmed compound context string injected into every run")
+    p.add_argument("--compound-mode", choices=["full", "name", "smiles", "xyz"],
+                   default=None,
+                   help=(
+                       "Compound information mode for contrast experiments. "
+                       "'xyz': force empty compound context (planner sees geometry only). "
+                       "'name'/'smiles'/'full': use --compound-context as-is; "
+                       "caller is responsible for providing the appropriately filtered context."
+                   ))
+    p.add_argument("--preload", metavar="SPEC", action="append", default=None,
+                   help=(
+                       "Pre-load a geometry into state before planning. "
+                       "Format: 'name:geom_id' (fetch by name) or "
+                       "'path/to/file.xyz:geom_id' (load file). "
+                       "The geom_id is the key used in the plan. "
+                       "Can be repeated: --preload ethanol:mol1 --preload water:solvent"
+                   ))
     p.add_argument("--env-file", "--env", default=None,
                    help="Dotenv file to load (default: .env). "
                         "Use .env.local for lab server / qwen2.5:32b. "
@@ -726,12 +877,18 @@ async def _run_full_suite(args):
     n_runs           = args.runs    or N_RUNS
     with_skills      = not args.no_skills if args.no_skills else WITH_SKILLS
     compound_context = args.compound_context if args.compound_context is not None else COMPOUND_CONTEXT
+    if getattr(args, "compound_mode", None) == "xyz":
+        compound_context = ""  # planner reasons from geometry state only
     checker_name     = (args.checker or CHECKER)
     if checker_name == "auto":
         checker_name = detect_checker(message)
+    preload_specs    = getattr(args, "preload", None) or []
 
     _client_kwargs = {"base_url": _LLM_BASE_URL} if _LLM_BASE_URL else {}
     client = OpenAI(**_client_kwargs)
+
+    if preload_specs:
+        print(f"  Preload specs: {preload_specs}")
 
     print(f"\nConnecting to MCP server...")
     async with stdio_client(server_params) as (read, write):
@@ -746,7 +903,8 @@ async def _run_full_suite(args):
             for i in range(n_runs):
                 print(f"  Run {i+1}/{n_runs}...", end=" ", flush=True)
                 r = await run_full_once(
-                    session, client, message, checker_name, with_skills, compound_context
+                    session, client, message, checker_name, with_skills, compound_context,
+                    preload_specs=preload_specs,
                 )
                 tag = "PASS" if r["passed"] else "FAIL"
                 print(f"{tag}  ({r['duration_ms']} ms)")
@@ -755,6 +913,9 @@ async def _run_full_suite(args):
                 results.append(r)
 
     print_report(message, "full", checker_name, with_skills, results)
+    log_path = save_test_log(message, "full", checker_name, with_skills, results,
+                             compound_mode=getattr(args, "compound_mode", None))
+    print(f"  Log saved: {log_path}")
 
 
 def _run_plan_suite(args):
@@ -762,9 +923,12 @@ def _run_plan_suite(args):
     n_runs           = args.runs    or N_RUNS
     with_skills      = not args.no_skills if args.no_skills else WITH_SKILLS
     compound_context = args.compound_context if args.compound_context is not None else COMPOUND_CONTEXT
+    if getattr(args, "compound_mode", None) == "xyz":
+        compound_context = ""  # planner reasons from geometry state only
     checker_name     = (args.checker or CHECKER)
     if checker_name == "auto":
         checker_name = detect_checker(message)
+    preload_specs    = getattr(args, "preload", None) or []
 
     _client_kwargs = {"base_url": _LLM_BASE_URL} if _LLM_BASE_URL else {}
     client = OpenAI(**_client_kwargs)
@@ -779,12 +943,16 @@ def _run_plan_suite(args):
                    if s.matches(message, dummy_state)]
         print(f"Skills matched: {matched}\n")
 
+    if preload_specs:
+        print(f"  Preload specs: {preload_specs}")
+
     verbose = getattr(args, "verbose", False)
 
     results: List[RunResult] = []
     for i in range(n_runs):
         print(f"  Run {i+1:>3}/{n_runs}...", end=" ", flush=True)
-        r = run_plan_once(client, message, checker_name, with_skills, compound_context)
+        r = run_plan_once(client, message, checker_name, with_skills, compound_context,
+                          preload_specs=preload_specs)
         tag = "PASS" if r["passed"] else "FAIL"
         print(f"{tag}  ({r['duration_ms']:>5} ms)")
         if verbose and r["plan"]:
@@ -792,6 +960,9 @@ def _run_plan_suite(args):
         results.append(r)
 
     print_report(message, "plan", checker_name, with_skills, results)
+    log_path = save_test_log(message, "plan", checker_name, with_skills, results,
+                             compound_mode=getattr(args, "compound_mode", None))
+    print(f"  Log saved: {log_path}")
     return results
 
 

@@ -125,10 +125,12 @@ Tool result field names (use EXACTLY these paths in product mappings):
                              min_energy_eh, min_value, n_points,
                              geometry_xyz (geometry at PES maximum — TS candidate)
   run_ts_opt_job:            energy_eh, geometry_xyz (optimised TS), ts_converged
+  run_casscf_job:            energy_eh (total or SA-average), energies_eh (list per root, only when nroots > 1)
   run_nbo_job:               nbo_section
   run_solvator_cluster_thermo: energy_eh, enthalpy_eh, gibbs_free_energy_eh
   structure_add_remove_proton: geometry_xyz (geometry stored via output_id)
   name_to_geometry_xyz:      geometry_xyz (geometry stored via output_id)
+  build_coordination_complex: geometry_xyz (geometry stored via output_id)
 
 Geometry via input_id/output_id:
 - Geometry strings are NEVER artifacts. Do NOT put them in artifacts_to_save or product.
@@ -145,6 +147,7 @@ Artifacts contract
 Geometry rules
 - First, check state to see if the user has added geometries manually.
 - If the user tells the directory of the xyz file, choose load_xyz_as_geometry to retrieve the geometry.
+- For coordination complexes (metal + ligands): use build_coordination_complex with args {metal: "Fe", ligands: ["chloride","chloride",...], geometry: "octahedral", charge: N, multiplicity: M}. Do NOT pass geometry IDs as metal/ligands args — pass element symbols and ligand names directly.
 - Else, choose name_to_geometry_xyz to retrieve the geometry.
 
 Reference and templating rules
@@ -154,13 +157,21 @@ Reference and templating rules
 - "expect" MUST be present for every tool node to enable deterministic validation.
 - For every tool node that is critical to the goal, include at least one on_error rule for common failures.
 
-Error handling policy (custodian-like)
-- Prefer deterministic fixes (patch_and_retry) for predictable errors:
-  - SCF_NOT_CONVERGED (increase maxiter, add damping/level shift, change guess, etc.)
-  - GEOM_INVALID (pre-opt with cheaper method, constrain, rebuild, etc.)
-  - RESOURCE_LIMIT (downshift method/basis, reduce parallelism, etc.)
-- Cap retries (max_attempts). If exhausted, stop with a clear reason OR branch to a predeclared deterministic fallback.
-- Do NOT escalate to an LLM for error fixing.
+Error handling policy
+- For every critical tool node add at least one on_error rule using this EXACT schema:
+    on_error:
+      - if: {code_in: [SCF_NOT_CONVERGED]}   # use "if", not "when"; NO "then" wrapper
+        action: patch_and_retry
+        patch:
+          scf_max_iter: 500          # supported: scf_max_iter, method, basis, use_ri,
+                                     #            opt_max_iter, ncores, wall_timeout_seconds
+        max_attempts: 2
+- Supported error codes: SCF_NOT_CONVERGED, GEOM_INVALID, RESOURCE_LIMIT, IMAG_FREQ
+- Common recipes:
+    SCF_NOT_CONVERGED → patch: {scf_max_iter: 500}   (max_attempts: 2)
+    RESOURCE_LIMIT    → patch: {ncores: 1}            (max_attempts: 1)
+    GEOM_INVALID      → patch: {method: "PBE", basis: "def2-SVP", use_ri: true}  (max_attempts: 1)
+- Cap retries with max_attempts. Do NOT escalate to an LLM for error fixing.
 
 LLM node policy (kind: "llm")
 - LLM nodes (QC-CALCULATOR) are ONLY for computing numeric derived quantities from tool artifacts.

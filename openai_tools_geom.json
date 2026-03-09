@@ -52,6 +52,26 @@
 		}
 		}
 	},
+
+	"build_coordination_complex": {
+		"type": "function",
+		"function": {
+		"name": "build_coordination_complex",
+		"description": "Build a starting 3D geometry for a coordination complex from a metal center and a list of ligands. Monodentate ligands (NH3, H2O, Cl, CO) each occupy one site. Bidentate ligands (en, bipyridine, acac) are auto-detected and consume two adjacent sites. Total denticity must match the coordination number of the chosen geometry. Use output_id to route the geometry to the next node (run_opt_job).",
+		"parameters": {
+			"type": "object",
+			"properties": {
+			"metal":        { "type": "string", "description": "Element symbol of the metal center, e.g. 'Fe', 'Ru', 'Co', 'Pt'." },
+			"ligands":      { "type": "array",  "items": { "type": "string" }, "description": "List of ligand names or SMILES. Monodentate ligands each occupy one site; bidentate ones (two donors within 1.8-5 A) occupy two adjacent sites. The total denticity must equal the coordination number." },
+			"geometry":     { "type": "string", "enum": ["linear","trigonal_planar","tetrahedral","square_planar","trigonal_bipyramidal","octahedral"], "description": "Coordination geometry. Determines the coordination number: linear=2, trigonal_planar=3, tetrahedral/square_planar=4, trigonal_bipyramidal=5, octahedral=6." },
+			"charge":       { "type": "integer", "description": "Total charge of the complex." },
+			"multiplicity": { "type": "integer", "description": "Spin multiplicity (2S+1). Use 1 for closed-shell, higher for open-shell metals." },
+			"bond_length":  { "type": "number",  "description": "Metal-donor bond length in Angstrom (default 2.0, suitable for first-row transition metals with N/O donors)." }
+			},
+			"required": ["metal", "ligands", "geometry", "charge", "multiplicity"]
+		}
+		}
+	},
 	
     "run_opt_job": {
         "type": "function",
@@ -95,7 +115,7 @@
         "type": "function",
         "function": {
             "name": "run_sp_energy",
-            "description": "Run a single-point energy calculation.",
+            "description": "Run a single-point energy calculation. Returns energy_eh and homo_lumo_gap_ev (KS orbital gap in eV; null if not parsed).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -149,7 +169,7 @@
         "type": "function",
         "function": {
             "name": "run_tddft_job",
-            "description": "Run an ORCA TD-DFT excited-state calculation on an already-optimised geometry. Returns ground-state energy (energy_ground_state_eh) and a list of excited states (excited_states) with energy_ev, wavelength_nm, and oscillator_strength for each state. Use run_opt_job first.",
+            "description": "Run an ORCA TD-DFT excited-state calculation on an already-optimised geometry. Returns energy_ground_state_eh, homo_lumo_gap_ev (KS orbital gap in eV), and excited_states list with energy_ev, wavelength_nm, oscillator_strength per state. Use run_opt_job first.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -287,6 +307,26 @@
 			}
 		}
 	},
+    "run_casscf_job": {
+        "type": "function",
+        "function": {
+            "name": "run_casscf_job",
+            "description": "Run a CASSCF single-point calculation with ORCA. Requires specifying the active space: nel (number of active electrons) and norb (number of active orbitals). Set nroots > 1 for state-averaged SA-CASSCF over multiple roots. Returns energy_eh (total or SA-average energy) and energies_eh list when nroots > 1. Use after geometry optimization.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input_geom_id": { "type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from." },
+                    "nel":   { "type": "integer", "description": "Number of active electrons in the CAS active space, e.g. 5 for Fe(III) d5." },
+                    "norb":  { "type": "integer", "description": "Number of active orbitals in the CAS active space, e.g. 5 for Fe d-orbitals." },
+                    "nroots": { "type": "integer", "default": 1, "description": "Number of roots for state-averaged SA-CASSCF (default 1 = single-state CASSCF)." },
+                    "basis":           { "type": "string",  "default": "def2-SVP" },
+                    "scf_max_iter":    { "type": "integer", "default": 200 },
+                    "wall_timeout_seconds": { "type": "integer", "default": 3600 }
+                },
+                "required": ["input_geom_id", "nel", "norb"]
+            }
+        }
+    },
 	"geom_update":{
 		"type": "function",
 		"function": {

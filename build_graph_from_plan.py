@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import TypedDict, Any, Dict, Callable, List, Awaitable, Optional
+from typing import TypedDict, Annotated, Any, Dict, Callable, List, Awaitable, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 import ast
@@ -31,9 +31,10 @@ class State(TypedDict, total=False):
     node_results: Dict[str, Any]
 
     # GeometryRegistry-backed storage (dict-state)
-    geometries: Dict[str, str]
-    geom_meta: Dict[str, Any]
-    name_to_geom: Dict[str, str]
+    # Annotated with merge reducer so parallel nodes don't overwrite each other's geometry entries.
+    geometries:   Annotated[Dict[str, str],  lambda a, b: {**(a or {}), **(b or {})}]
+    geom_meta:    Annotated[Dict[str, Any],  lambda a, b: {**(a or {}), **(b or {})}]
+    name_to_geom: Annotated[Dict[str, str],  lambda a, b: {**(a or {}), **(b or {})}]
     current_geom: Optional[str]
     final_report: Dict[str, Any]
     result: Any
@@ -166,6 +167,90 @@ def compile_expr(expr: str) -> Callable[[Dict[str, float]], float]:
         return float(eval(code, safe_globals, safe_locals))
 
     return f
+
+# ─── patch_and_retry helpers ───────────────────────────────────────────────────
+
+# Tool parameter names safe to patch (all ORCA tools expose these)
+_PATCHABLE_TOOL_ARGS: set = {
+    "method", "basis", "use_ri", "scf_max_iter", "opt_max_iter",
+    "ncores", "wall_timeout_seconds", "n_states", "calc_hess",
+}
+
+
+def _infer_error_code(tool_payload: Dict[str, Any]) -> Optional[str]:
+    """Return a structured error code from a failed tool result.
+
+    Checks tool_payload["code"] first (server-supplied), then falls back to
+    pattern-matching text fields so retries work even when the server predates
+    the structured code field.
+    """
+    code = (tool_payload or {}).get("code")
+    if code:
+        return str(code)
+    if (tool_payload or {}).get("status") == "timeout":
+        return "RESOURCE_LIMIT"
+    text = " ".join([
+        str(tool_payload.get("error_summary") or ""),
+        str(tool_payload.get("error") or ""),
+        str(tool_payload.get("tail") or ""),
+    ]).upper()
+    if "SCF NOT CONVERGED" in text:
+        return "SCF_NOT_CONVERGED"
+    if "IMAGINARY" in text and ("MODE" in text or "FREQ" in text):
+        return "IMAG_FREQ"
+    if "GEOM" in text and ("INVALID" in text or "FAILED" in text or "BAD" in text):
+        return "GEOM_INVALID"
+    if "RESOURCE" in text or "TIME LIMIT" in text:
+        return "RESOURCE_LIMIT"
+    # Client-side fallback: check ir_spectrum list for imaginary modes
+    ir_spectrum = (tool_payload or {}).get("ir_spectrum")
+    if isinstance(ir_spectrum, list):
+        if any(isinstance(e.get("freq_cm1"), (int, float)) and e["freq_cm1"] < -10
+               for e in ir_spectrum):
+            return "IMAG_FREQ"
+    return None
+
+
+def _normalize_on_error_rule(rule: dict) -> Dict[str, Any]:
+    """Normalize one on_error entry to canonical form.
+
+    Handles three planner schema variants:
+      A: {"if": {cond}, "action": ..., "patch": ..., "max_attempts": N}
+      B: {"when": {cond}, "action": ..., "patch": ..., "max_attempts": N}
+      C: {"if": {cond}, "then": {"action": ..., "patch": ..., "max_attempts": N}}
+    """
+    condition = rule.get("if") or rule.get("when") or {}
+    inner     = rule.get("then") if "then" in rule else rule
+    return {
+        "codes":        list(condition.get("code_in") or []),
+        "action":       str(inner.get("action") or ""),
+        "patch":        dict(inner.get("patch") or {}),
+        "max_attempts": int(inner.get("max_attempts") or 1),
+    }
+
+
+def _apply_patch_to_args(current_args: dict, patch: dict) -> dict:
+    """Merge a patch dict into tool args, mapping nested structures to param names.
+
+    Safe: only known tool parameter names are applied; unknown keys are silently
+    dropped to avoid TypeError in strict MCP tool signatures.
+    """
+    new_args = dict(current_args)
+    for key, val in patch.items():
+        if key == "scf" and isinstance(val, dict):
+            # Only scf_max_iter is a real tool param today
+            if "maxiter" in val:
+                new_args["scf_max_iter"] = int(val["maxiter"])
+        elif key == "resources" and isinstance(val, dict):
+            if "ncores" in val:
+                new_args["ncores"] = int(val["ncores"])
+        elif key in _PATCHABLE_TOOL_ARGS:
+            new_args[key] = val
+        # else: silently drop (not a known tool parameter)
+    return new_args
+
+# ───────────────────────────────────────────────────────────────────────────────
+
 
 def build_graph_from_plan(
     plan: Dict[str, Any],
@@ -380,33 +465,68 @@ def build_graph_from_plan(
                         node_args = spec.get("overrides")
                     node_args = node_args or {}
 
-                    if run_tool_node is not None:
-                        # Delegate to your existing OpenAI-tool-loop executor (LLM decides tool calls),
-                        # or any higher-level runner you provide.
-                        node_spec = dict(spec)
-                        node_spec["id"] = node_id
-                        # Inject plan settings so execute_tool_from_node_spec can expand $(settings.KEY)
-                        node_spec["_plan_settings"] = plan.get("settings") or {}
-                        result = await _maybe_await(run_tool_node(state, node_spec))
-                        if not isinstance(result, dict):
-                            result = {"status": "error", "error": "tool node runner returned non-dict"}
-                    else:
-                        args = get_tool_args(state["session"], tool_name, node_args)
-                        result = call_tool(tool_name, args) or {}
-                    if isinstance(result, str):
-                        try:
-                            result = json.loads(result)
-                        except Exception:
-                            result = {"status": "error", "error": "tool returned non-JSON string", "raw": result}
+                    # --- patch_and_retry setup ---
+                    on_error_rules = [
+                        _normalize_on_error_rule(r)
+                        for r in (spec.get("on_error") or [])
+                    ]
+                    on_error_rules = [r for r in on_error_rules if r["action"] == "patch_and_retry"]
 
-                    status = (result.get("status") or "error")
+                    attempt       = 0
+                    attempt_args  = dict(node_args)
+                    current_state = state
 
-                    ended_utc = datetime.now(timezone.utc).isoformat()
+                    while True:
+                        retry_spec = dict(spec)
+                        retry_spec["id"]             = node_id
+                        retry_spec["args"]           = attempt_args
+                        retry_spec["_plan_settings"] = plan.get("settings") or {}
+
+                        if run_tool_node is not None:
+                            result = await _maybe_await(run_tool_node(current_state, retry_spec))
+                            if not isinstance(result, dict):
+                                result = {"status": "error", "error": "tool node runner returned non-dict"}
+                        else:
+                            args = get_tool_args(state["session"], tool_name, attempt_args)
+                            result = call_tool(tool_name, args) or {}
+
+                        if isinstance(result, str):
+                            try:
+                                result = json.loads(result)
+                            except Exception:
+                                result = {"status": "error", "error": "tool returned non-JSON string", "raw": result}
+
+                        tool_payload = result.get("last_tool_result", result)
+                        status = result.get(
+                            "last_status",
+                            tool_payload.get("status") if isinstance(tool_payload, dict) else None,
+                        ) or "unknown"
+
+                        if status == "ok" or not on_error_rules:
+                            break
+
+                        error_code   = _infer_error_code(tool_payload if isinstance(tool_payload, dict) else {})
+                        matched_rule = next(
+                            (r for r in on_error_rules
+                             if error_code in r["codes"] and attempt < r["max_attempts"]),
+                            None,
+                        )
+                        if matched_rule is None:
+                            break  # no rule matches or max_attempts exhausted
+
+                        attempt      += 1
+                        attempt_args  = _apply_patch_to_args(attempt_args, matched_rule["patch"])
+                        current_state = {**state, **{
+                            k: result[k]
+                            for k in ("geometries", "geom_meta", "name_to_geom", "current_geom")
+                            if k in result
+                        }}
+                        print(f"  [retry] node={node_id!r} attempt={attempt} "
+                              f"code={error_code!r} patch_keys={list(matched_rule['patch'].keys())}")
+                    # --- end retry loop ---
+
+                    ended_utc  = datetime.now(timezone.utc).isoformat()
                     duration_ms = int((time.perf_counter() - t0) * 1000)
-
-                    tool_payload = result.get("last_tool_result", result)
-                    status = result.get("last_status", tool_payload.get("status") if isinstance(tool_payload, dict) else None) or "unknown"
-                    #print("result:", result)
 
                     # 1) merge the returned state updates first (this is what makes geometry persistent)
                     updates.update(result)
@@ -417,19 +537,23 @@ def build_graph_from_plan(
                     updates["node_results"] = node_results
 
                     # 3) standard bookkeeping
-                    print(f"  [tool_status] node={node_id!r} status={status!r}")
+                    print(f"  [tool_status] node={node_id!r} status={status!r}"
+                          + (f" (after {attempt} retr{'y' if attempt==1 else 'ies'})" if attempt else ""))
+                    log_entry: Dict[str, Any] = {
+                        "node":         node_id,
+                        "kind":         kind,
+                        "tool":         tool_name,
+                        "status":       status,
+                        "started_utc":  node_started_utc,
+                        "ended_utc":    ended_utc,
+                        "duration_ms":  duration_ms,
+                    }
+                    if attempt:
+                        log_entry["retry_attempts"] = attempt
                     updates.update({
-                        "last_status": status,
+                        "last_status":      status,
                         "last_tool_result": tool_payload,
-                        "run_log": (state.get("run_log") or []) + [{
-                            "node": node_id,
-                            "kind": kind,
-                            "tool": tool_name,
-                            "status": status,
-                            "started_utc": node_started_utc,
-                            "ended_utc": ended_utc,
-                            "duration_ms": duration_ms,
-                        }],
+                        "run_log":          (state.get("run_log") or []) + [log_entry],
                     })
                     if isinstance(result, dict):
                         updates.update(_stash_artifacts(node_id, spec, result, state))

@@ -1,4 +1,5 @@
 # nbo_agent_repl.py
+import argparse
 import asyncio
 import json
 import os
@@ -24,6 +25,7 @@ from client_helpers import (
     summarize_geometries_prompt,
     geom_key_from_path,
     name_to_geometry_xyz,
+    build_coordination_complex,
     structure_add_remove_proton,
     print_tool_output,
     get_trivial_properties,
@@ -68,6 +70,7 @@ _LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip() or None
 OPENAI_TOOLS = json.loads(Path("openai_tools_geom.json").read_text(encoding="utf-8"))
 CLIENT_SIDE_TOOL_FUNCS = {
     "name_to_geometry_xyz": name_to_geometry_xyz,
+    "build_coordination_complex": build_coordination_complex,
     "pubchem_get_basic_properties": pubchem_get_basic_properties,
     "structure_add_remove_proton": structure_add_remove_proton,
     
@@ -178,63 +181,92 @@ def _cache_confirmed_card(state: AgentState, name: str, card: dict) -> None:
         }
 
 
+_COMPOUND_MODES = ("full", "name", "smiles", "xyz")
+
+
 async def identify_and_confirm_compounds(
-    user_text: str, client, state: AgentState
+    user_text: str, client, state: AgentState, mode: str = "full"
 ) -> list:
     """Pre-planning phase: identify all compounds (by name and/or loaded geometries).
 
-    Two sources:
-      1. Compound names extracted from user_text via LLM → PubChem/OPSIN lookup.
-      2. Geometries already in state that have no identity cached yet → XYZ-derived
-         SMILES + PubChem lookup, displayed for user confirmation.
-
-    Returns list of confirmed compound cards cached in state['cached_props'] /
-    state['identifiers'].
+    mode:
+      "full"   (default) — LLM extracts names → PubChem → structure image → user confirms.
+                           CONFIRMED_COMPOUNDS includes formula, SMILES, MW, CID, charge.
+      "name"   — LLM extracts names only; no PubChem lookup, no image, no confirmation.
+                 CONFIRMED_COMPOUNDS has name + charge only.
+      "smiles" — LLM extracts names → PubChem to get SMILES; no image, auto-confirmed.
+                 CONFIRMED_COMPOUNDS has name + SMILES + charge.
+      "xyz"    — Skip all identification. Planner reasons from geometry state only.
+                 CONFIRMED_COMPOUNDS is empty.
     """
-    print("\n[Identifying compounds...]")
+    if mode == "xyz":
+        return []
+
+    print(f"\n[Identifying compounds... mode={mode}]")
     confirmed = []
 
     # --- Source 1: names mentioned in the planning request ---
     names = extract_compound_names_llm(user_text, client)
     for name in names:
-        card = fetch_compound_card(name)
-        result = display_and_confirm_compound(card, client)
-        if result is None:
-            continue
-        confirmed.append(result)
-        _cache_confirmed_card(state, name, result)
+        if mode == "name":
+            card = {"name": name, "formula": None, "smiles": None,
+                    "mw": None, "cid": None, "charge": 0, "source": "name_only"}
+            print(f"  {name}  (name only)")
+            confirmed.append(card)
+            _cache_confirmed_card(state, name, card)
+        elif mode == "smiles":
+            card = fetch_compound_card(name)
+            smiles_info = f"SMILES={card['smiles']}" if card.get("smiles") else "SMILES not found"
+            print(f"  {name}: {smiles_info}")
+            confirmed.append(card)
+            _cache_confirmed_card(state, name, card)
+        else:  # "full"
+            card = fetch_compound_card(name)
+            result = display_and_confirm_compound(card, client)
+            if result is None:
+                continue
+            confirmed.append(result)
+            _cache_confirmed_card(state, name, result)
 
     # --- Source 2: geometries loaded in state with no cached identity ---
-    geometries = state.get("geometries") or {}
-    identifiers = state.get("identifiers") or {}
-    cached_props = state.get("cached_props") or {}
-    geom_meta = state.get("geom_meta") or {}
+    if mode != "name":  # name mode skips geometry identification
+        geometries = state.get("geometries") or {}
+        identifiers = state.get("identifiers") or {}
+        cached_props = state.get("cached_props") or {}
+        geom_meta = state.get("geom_meta") or {}
 
-    unidentified = [
-        gid for gid in geometries
-        if gid not in identifiers and gid not in cached_props
-    ]
+        unidentified = [
+            gid for gid in geometries
+            if gid not in identifiers and gid not in cached_props
+        ]
 
-    if unidentified:
-        print(f"\n[{len(unidentified)} loaded geometry/geometries not yet identified]")
+        if unidentified and mode == "smiles":
+            print(f"\n[{len(unidentified)} loaded geometry/geometries — deriving SMILES]")
+        elif unidentified and mode == "full":
+            print(f"\n[{len(unidentified)} loaded geometry/geometries not yet identified]")
 
-    for geom_id in unidentified:
-        xyz = geometries[geom_id]
-        charge = (geom_meta.get(geom_id) or {}).get("charge", 0) or 0
+        for geom_id in unidentified:
+            xyz = geometries[geom_id]
+            charge = (geom_meta.get(geom_id) or {}).get("charge", 0) or 0
 
-        print(f"\n── Loaded geometry: {geom_id} ──")
-        # Derive card from XYZ (bond detection + PubChem by SMILES)
-        card = fetch_compound_card_from_xyz(xyz, geom_id, charge=charge)
-        if card.get("smiles"):
-            print(f"  Detected SMILES : {card['smiles']}")
-        if card.get("formula"):
-            print(f"  Detected formula: {card['formula']}")
+            card = fetch_compound_card_from_xyz(xyz, geom_id, charge=charge)
 
-        result = display_and_confirm_compound(card, client)
-        if result is None:
-            continue
-        confirmed.append(result)
-        _cache_confirmed_card(state, geom_id, result)
+            if mode == "smiles":
+                if card.get("smiles"):
+                    print(f"  Loaded {geom_id}: SMILES={card['smiles']}")
+                confirmed.append(card)
+                _cache_confirmed_card(state, geom_id, card)
+            else:  # "full"
+                print(f"\n── Loaded geometry: {geom_id} ──")
+                if card.get("smiles"):
+                    print(f"  Detected SMILES : {card['smiles']}")
+                if card.get("formula"):
+                    print(f"  Detected formula: {card['formula']}")
+                result = display_and_confirm_compound(card, client)
+                if result is None:
+                    continue
+                confirmed.append(result)
+                _cache_confirmed_card(state, geom_id, result)
 
     if not confirmed:
         print("[No compounds identified — proceeding to planning with geometry state only]")
@@ -243,6 +275,22 @@ async def identify_and_confirm_compounds(
 
 
 async def main():
+    parser = argparse.ArgumentParser(description="QC Agent REPL")
+    parser.add_argument(
+        "--compound-mode",
+        choices=_COMPOUND_MODES,
+        default="full",
+        help=(
+            "Compound identification mode for contrast experiments. "
+            "'full' (default): name + PubChem + image + user confirm. "
+            "'name': name only, no lookup. "
+            "'smiles': name + SMILES, no image. "
+            "'xyz': skip identification, planner reasons from geometry state only."
+        ),
+    )
+    args = parser.parse_args()
+    compound_mode: str = args.compound_mode
+
     _mcp_ssh_bin  = os.getenv("MCP_SSH_BIN",  "ssh")
     _mcp_ssh_key  = os.getenv("MCP_SSH_KEY",  "C:/Users/zrqrc/.ssh/droplet1")
     _mcp_ssh_host = os.getenv("MCP_SSH_HOST", "root@188.166.232.163")
@@ -282,6 +330,8 @@ async def main():
             tools = await session.list_tools()
             tool_names = [t.name for t in tools.tools]
             print("MCP tools available:", tool_names)
+            print(f"Compound mode: {compound_mode}  "
+                  f"(change with: mode full|name|smiles|xyz)")
             tool_names_for_model = [n for n in tool_names if n in OPENAI_TOOLS]
             for n in CLIENT_SIDE_TOOL_FUNCS:
                 if n in OPENAI_TOOLS and n not in tool_names_for_model:
@@ -295,6 +345,16 @@ async def main():
                     continue
                 if line.lower() in {"quit", "exit"}:
                     break
+
+                if line.lower().startswith("mode "):
+                    parts = line.split()
+                    if len(parts) == 2 and parts[1] in _COMPOUND_MODES:
+                        compound_mode = parts[1]
+                        print(f"Compound mode set to: {compound_mode}")
+                    else:
+                        print(f"Usage: mode <{'|'.join(_COMPOUND_MODES)}>  "
+                              f"(current: {compound_mode})")
+                    continue
 
                 if line.lower().startswith("load "):
                     path = line.split(maxsplit=1)[1]
@@ -421,8 +481,8 @@ async def main():
                     #print(json.dumps(result, ensure_ascii=False, indent=2))
                     continue
                 
-                compounds = await identify_and_confirm_compounds(line, client, state)
-                compound_context = compounds_to_planner_context(compounds)
+                compounds = await identify_and_confirm_compounds(line, client, state, mode=compound_mode)
+                compound_context = compounds_to_planner_context(compounds, mode=compound_mode)
                 skill_contexts = run_planning_skills(line, state)
                 await handle_user_turn(session, client, state, line, tools_for_this_call,
                                        compound_context=compound_context,
