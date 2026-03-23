@@ -35,6 +35,8 @@ NEEDS_GEOM_SINGLE = {'run_solvator_cluster_thermo', 'run_opt_job', 'run_nbo_job'
 TOOLS_RETURNING_STRUCTURE = {
     "name_to_geometry_xyz",
     "build_coordination_complex",
+    "build_dimer_xyz",
+    "set_geometry_xyz",
     "run_opt_job",
     "structure_add_remove_proton",
     "run_solvator_cluster_thermo",  # if it returns cluster geometry
@@ -187,7 +189,27 @@ def summarize_geometries_prompt(state: Dict[str, Any]) -> str:
         chg = meta.get("charge", None)
         mult = meta.get("multiplicity", None)
         mark = "  (current)" if (cur and gid == cur) else ""
-        parts.append(f"- {gid}: {nm}  q={chg}, mult={mult}{mark}")
+        xyz = reg.geometries.get(gid, "")
+        natoms_str = ""
+        try:
+            if xyz:
+                coord_lines = [l for l in xyz.strip().splitlines() if l.strip() and l.split()[0].isalpha()]
+                n_atoms = len(coord_lines)
+                # Group by element, preserving index order: e.g. "C[0-5] H[6-11]"
+                from collections import OrderedDict as _OD
+                groups: _OD = _OD()
+                for idx, l in enumerate(coord_lines):
+                    el = l.split()[0]
+                    groups.setdefault(el, []).append(idx)
+                def _fmt_range(idxs):
+                    if len(idxs) == 1:
+                        return f"{idxs[0]}"
+                    return f"{idxs[0]}-{idxs[-1]}"
+                atom_str = " ".join(f"{el}[{_fmt_range(idxs)}]" for el, idxs in groups.items())
+                natoms_str = f"  n_atoms={n_atoms}  atoms: {atom_str}"
+        except Exception:
+            pass
+        parts.append(f"- {gid}: {nm}  q={chg}, mult={mult}{natoms_str}{mark}")
 
     parts.append(
         f"Defaults (fallback only): charge={_state_get(state,'default_charge',0)}, "
@@ -409,6 +431,13 @@ def name_to_geometry_xyz(name: str) -> dict:
         return {"status": "error", "error": "empty name"}
     default_charge = 0
     default_multiplicity = 1
+    # Infer charge from ion suffix in name: "NO2+" → +1, "OH-" → -1, "Fe3+" → +3
+    import re as _re
+    _ion_suffix = _re.search(r'([+-])(\d*)$', name.strip())
+    if _ion_suffix:
+        sign = 1 if _ion_suffix.group(1) == '+' else -1
+        mag  = int(_ion_suffix.group(2)) if _ion_suffix.group(2) else 1
+        default_charge = sign * mag
     # 0a) bare element symbol / simple ion notation: Fe, Fe3+, Cl-, Na+, etc.
     bare = _try_bare_ion_geometry(name)
     if bare is not None:
@@ -460,259 +489,8 @@ def name_to_geometry_xyz(name: str) -> dict:
     return {"status": "not_found", "name": name, "identifiers": ids, "error": "No PubChem 3D SDF found"}
 
 
-# ── Coordination complex builder ──────────────────────────────────────────────
-
-import numpy as np
-from rdkit.Chem import AllChem
-
-# Cartesian direction vectors for each coordination geometry
-_COORD_TEMPLATES: dict = {
-    "linear":               [[0,0,1],[0,0,-1]],
-    "trigonal_planar":      [[1,0,0],[-0.5,0.866,0],[-0.5,-0.866,0]],
-    "tetrahedral":          [[0.816,0,0.577],[-0.816,0,0.577],[0,0.816,-0.577],[0,-0.816,-0.577]],
-    "square_planar":        [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0]],
-    "trigonal_bipyramidal": [[1,0,0],[-0.5,0.866,0],[-0.5,-0.866,0],[0,0,1],[0,0,-1]],
-    "octahedral":           [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]],
-}
-
-# Donor atom preference (lower = preferred)
-_DONOR_PRIORITY: dict = {"N":1,"O":2,"S":3,"P":4,"Cl":5,"Br":6,"I":7,"F":8,"C":9}
-
-# Common ligand name → canonical SMILES (bypasses OPSIN/wchar_t encoding issues on Windows)
-_LIGAND_SMILES: dict = {
-    "chloride": "[Cl-]", "fluoride": "[F-]", "bromide": "[Br-]", "iodide": "[I-]",
-    "cyanide": "[C-]#N", "hydroxide": "[OH-]", "oxide": "[O-2]",
-    "water": "O", "aqua": "O",
-    "ammonia": "N", "amine": "N",
-    "carbon monoxide": "[C-]#[O+]", "carbonyl": "[C-]#[O+]",
-    "nitrosyl": "[N+]#[O-]", "nitric oxide": "[N+]#[O-]",
-    "thiocyanate": "[S-]C#N",
-}
-
-
-def _generate_ligand_3d(name_or_smiles: str) -> "Chem.Mol":
-    """Return an RDKit Mol with 3D coordinates for the given ligand name or SMILES."""
-    # Check known-SMILES table first (avoids Windows wchar_t encoding issues with OPSIN)
-    canonical = _LIGAND_SMILES.get(name_or_smiles.lower().strip())
-    if canonical:
-        mol = Chem.MolFromSmiles(canonical)
-        if mol is not None:
-            mol = Chem.AddHs(mol)
-            params = AllChem.ETKDGv3()
-            params.randomSeed = 42
-            if AllChem.EmbedMolecule(mol, params) >= 0:
-                return mol
-    mol = Chem.MolFromSmiles(name_or_smiles)
-    if mol is None:
-        sdf = _pubchem_name_to_sdf3d(name_or_smiles)
-        if sdf:
-            mol = Chem.MolFromMolBlock(sdf, removeHs=False)
-            if mol is not None and mol.GetNumConformers() > 0:
-                return mol
-        smiles = opsin_resolve(name_or_smiles)
-        if smiles:
-            mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError(f"Cannot resolve ligand {name_or_smiles!r}")
-    mol = Chem.AddHs(mol)
-    params = AllChem.ETKDGv3()
-    params.randomSeed = 42
-    if AllChem.EmbedMolecule(mol, params) < 0:
-        raise ValueError(f"3D embedding failed for {name_or_smiles!r}")
-    AllChem.MMFFOptimizeMolecule(mol)
-    return mol
-
-
-def _get_donor_atoms(mol: "Chem.Mol") -> list:
-    """Return atom indices of potential donor atoms, best candidates first.
-
-    Special case: linear C-donor ligands (CO, CN⁻, CNR).
-    In these molecules the C is the coordinating atom, not the N/O.
-    Detected when: exactly 2 heavy atoms, one is C with a triple bond to N or O.
-    """
-    heavy = [a for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
-    if len(heavy) == 2:
-        syms = {a.GetSymbol() for a in heavy}
-        if syms in ({"C", "N"}, {"C", "O"}):
-            # CO or CN type — C is the donor
-            c_idx = next(a.GetIdx() for a in heavy if a.GetSymbol() == "C")
-            other = [a.GetIdx() for a in heavy if a.GetSymbol() != "C"]
-            return [c_idx] + other
-
-    candidates = [(a.GetIdx(), _DONOR_PRIORITY[a.GetSymbol()])
-                  for a in mol.GetAtoms() if a.GetSymbol() in _DONOR_PRIORITY]
-    candidates.sort(key=lambda x: x[1])
-    return [idx for idx, _ in candidates]
-
-
-def _rotation_align(from_vec: np.ndarray, to_vec: np.ndarray) -> np.ndarray:
-    """Rodrigues rotation matrix that rotates unit from_vec onto unit to_vec."""
-    a = from_vec / np.linalg.norm(from_vec)
-    b = to_vec   / np.linalg.norm(to_vec)
-    axis = np.cross(a, b)
-    s = np.linalg.norm(axis)
-    c = np.dot(a, b)
-    if s < 1e-8:
-        if c > 0:
-            return np.eye(3)
-        # anti-parallel: 180° around any perpendicular axis
-        perp = np.array([1,0,0]) if abs(a[0]) < 0.9 else np.array([0,1,0])
-        axis = np.cross(a, perp); axis /= np.linalg.norm(axis)
-        K = np.array([[0,-axis[2],axis[1]],[axis[2],0,-axis[0]],[-axis[1],axis[0],0]])
-        return np.eye(3) + 2*(K @ K)
-    axis /= s
-    K = np.array([[0,-axis[2],axis[1]],[axis[2],0,-axis[0]],[-axis[1],axis[0],0]])
-    return np.eye(3) + s*K + (1-c)*(K @ K)
-
-
-def _mol_atom_positions(mol: "Chem.Mol") -> list:
-    """Return [(symbol, np.ndarray), ...] for all atoms in the mol's conformer."""
-    conf = mol.GetConformer()
-    return [(mol.GetAtomWithIdx(i).GetSymbol(),
-             np.array(conf.GetAtomPosition(i))) for i in range(mol.GetNumAtoms())]
-
-
-def _place_monodentate(mol: "Chem.Mol", donor_idx: int,
-                       direction: np.ndarray, bond_length: float) -> list:
-    """Place ligand so donor_idx lands at direction*bond_length from the metal at origin."""
-    atoms = _mol_atom_positions(mol)
-    donor_pos = atoms[donor_idx][1].copy()
-    atoms = [(s, p - donor_pos) for s, p in atoms]          # donor → origin
-
-    # Find ligand's "bulk" direction (away from metal)
-    others = [p for i, (s, p) in enumerate(atoms) if i != donor_idx]
-    away = np.mean(others, axis=0) if others else np.array([0., 0., 1.])
-    if np.linalg.norm(away) < 1e-8:
-        away = np.array([0., 0., 1.])
-
-    # Rotate so "away" aligns with template direction
-    d_unit = direction / np.linalg.norm(direction)
-    R = _rotation_align(away / np.linalg.norm(away), d_unit)
-    atoms = [(s, R @ p) for s, p in atoms]
-
-    shift = d_unit * bond_length
-    return [(s, p + shift) for s, p in atoms]
-
-
-def _place_bidentate(mol: "Chem.Mol", donor_idxs: tuple,
-                     dir1: np.ndarray, dir2: np.ndarray, bond_length: float) -> list:
-    """Place a bidentate ligand so its two donors land at dir1/dir2 * bond_length."""
-    atoms = _mol_atom_positions(mol)
-    t1 = dir1 / np.linalg.norm(dir1) * bond_length
-    t2 = dir2 / np.linalg.norm(dir2) * bond_length
-
-    d1 = atoms[donor_idxs[0]][1].copy()
-    d2 = atoms[donor_idxs[1]][1].copy()
-
-    # Scale ligand so donor–donor distance matches target distance
-    lig_d = np.linalg.norm(d2 - d1)
-    tgt_d = np.linalg.norm(t2 - t1)
-    scale = tgt_d / lig_d if lig_d > 1e-8 else 1.0
-    centroid_lig = (d1 + d2) / 2
-    atoms = [(s, (p - centroid_lig) * scale) for s, p in atoms]
-
-    # Translate centroid to target centroid
-    centroid_tgt = (t1 + t2) / 2
-    atoms = [(s, p + centroid_tgt) for s, p in atoms]
-
-    # Rotate to align donor axis
-    d1n = atoms[donor_idxs[0]][1]
-    d2n = atoms[donor_idxs[1]][1]
-    lig_axis = d2n - d1n
-    tgt_axis = t2 - t1
-    R = _rotation_align(lig_axis / np.linalg.norm(lig_axis),
-                        tgt_axis / np.linalg.norm(tgt_axis))
-    return [(s, R @ (p - centroid_tgt) + centroid_tgt) for s, p in atoms]
-
-
-def build_coordination_complex(
-    metal: str,
-    ligands: list,
-    geometry: str = "octahedral",
-    charge: int = 0,
-    multiplicity: int = 1,
-    bond_length: float = 2.0,
-) -> dict:
-    """Build a coordination complex XYZ from a metal center and list of ligands.
-
-    Monodentate ligands (NH3, H2O, Cl, CO …) each occupy one coordination site.
-    Bidentate ligands (en, bipyridine, acac …) are auto-detected (two donor atoms
-    within 1.8–5.0 Å) and consume two adjacent sites.  Total denticity must equal
-    the coordination number implied by `geometry`.
-
-    Args:
-        metal:        Element symbol, e.g. "Fe", "Ru", "Co".
-        ligands:      List of ligand names or SMILES strings.
-        geometry:     One of: linear, trigonal_planar, tetrahedral, square_planar,
-                      trigonal_bipyramidal, octahedral.
-        charge:       Total complex charge.
-        multiplicity: Spin multiplicity.
-        bond_length:  Metal–donor bond length in Å (default 2.0, suitable for first-row TM).
-
-    Returns:
-        dict with status, geometry_xyz (no-header XYZ), n_atoms, charge, multiplicity.
-    """
-    geometry = geometry.lower().replace("-", "_").replace(" ", "_")
-    if geometry not in _COORD_TEMPLATES:
-        return {"status": "error",
-                "error": f"Unknown geometry {geometry!r}. Choose from: {list(_COORD_TEMPLATES)}"}
-
-    vertices = [np.array(v, dtype=float) for v in _COORD_TEMPLATES[geometry]]
-    n_sites  = len(vertices)
-
-    # Resolve and characterise each ligand
-    lig_info = []
-    for i, lig in enumerate(ligands):
-        try:
-            mol = _generate_ligand_3d(lig)
-        except Exception as e:
-            return {"status": "error", "error": f"Ligand {i} ({lig!r}): {e}"}
-        donors = _get_donor_atoms(mol)
-        if not donors:
-            return {"status": "error", "error": f"Ligand {i} ({lig!r}): no donor atom found"}
-        # Auto-detect bidentate: two donors within a chelate-like distance
-        denticity = 1
-        if len(donors) >= 2:
-            conf = mol.GetConformer()
-            p1 = np.array(conf.GetAtomPosition(donors[0]))
-            p2 = np.array(conf.GetAtomPosition(donors[1]))
-            if 1.8 < np.linalg.norm(p2 - p1) < 5.0:
-                denticity = 2
-        lig_info.append((mol, donors, denticity, lig))
-
-    total_sites = sum(d for _, _, d, _ in lig_info)
-    if total_sites != n_sites:
-        denticities = [d for _, _, d, _ in lig_info]
-        return {"status": "error",
-                "error": (f"geometry={geometry!r} needs {n_sites} sites but ligands provide "
-                          f"{total_sites} (per-ligand denticities: {denticities}). "
-                          f"Adjust the ligand list or choose a different geometry.")}
-
-    # Place each ligand at its assigned vertex/vertices
-    all_atoms: list = [(metal, np.zeros(3))]
-    v_idx = 0
-    for mol, donors, denticity, _ in lig_info:
-        if denticity == 1:
-            placed = _place_monodentate(mol, donors[0], vertices[v_idx], bond_length)
-            v_idx += 1
-        else:
-            placed = _place_bidentate(mol, (donors[0], donors[1]),
-                                      vertices[v_idx], vertices[v_idx + 1], bond_length)
-            v_idx += 2
-        all_atoms.extend(placed)
-
-    xyz_lines = [f"{sym:<4s}{pos[0]:>14.6f}{pos[1]:>14.6f}{pos[2]:>14.6f}"
-                 for sym, pos in all_atoms]
-    return {
-        "status":       "ok",
-        "geometry_xyz": "\n".join(xyz_lines),
-        "metal":        metal,
-        "geometry":     geometry,
-        "n_atoms":      len(all_atoms),
-        "charge":       charge,
-        "multiplicity": multiplicity,
-        "provenance":   {"geometry": "template_builder"},
-    }
+# build_coordination_complex is a server-side MCP tool (molSimplify on pod).
+# Kept in TOOLS_RETURNING_STRUCTURE so the REPL handles its geometry_xyz output.
 
 
 def print_tool_output(text: str, limit: int = 8000):
@@ -750,6 +528,358 @@ def _xyz_no_header_to_species_coords(xyz: str):
         species.append(parts[0])
         coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
     return species, coords
+
+
+def build_dimer_xyz(
+    state: dict,
+    geom_a_id: str,
+    geom_b_id: str,
+    distance_ang: float = 3.5,
+    ref_atom_b: int = 0,
+    axis: str = "z",
+    output_id: str = None,
+) -> dict:
+    """Assemble two molecules into a dimer starting geometry for an interaction scan.
+
+    Centers molecule A at its centroid. Translates molecule B along `axis` so that
+    atom `ref_atom_b` of B is placed at `distance_ang` from the centroid of A.
+
+    Args:
+        geom_a_id:     Geometry registry key for molecule A (host / larger molecule).
+        geom_b_id:     Geometry registry key for molecule B (guest).
+        distance_ang:  Initial distance in Å between centroid of A and ref_atom_b of B.
+        ref_atom_b:    0-based atom index in B to use as the approach reference (default 0).
+        axis:          Approach axis: 'x', 'y', or 'z' (default 'z').
+        output_id:     Key under which to store the assembled geometry in state.
+        state:         Session state dict (injected by executor).
+
+    Returns:
+        dict with status, geometry_xyz, n_atoms_a, n_atoms_b, offset_b,
+        scan_atom_b (index of ref_atom_b in the combined geometry),
+        charge_a, charge_b.
+    """
+    import numpy as _np
+
+    if not isinstance(state, dict):
+        return {"status": "error", "error": "state dict is required"}
+
+    reg = get_geometry_registry(state)
+    xyz_a = reg.get_xyz(geom_a_id)
+    xyz_b = reg.get_xyz(geom_b_id)
+    if not xyz_a:
+        return {"status": "error", "error": f"Geometry not found: {geom_a_id!r}"}
+    if not xyz_b:
+        return {"status": "error", "error": f"Geometry not found: {geom_b_id!r}"}
+
+    sp_a, co_a = _xyz_no_header_to_species_coords(xyz_a)
+    sp_b, co_b = _xyz_no_header_to_species_coords(xyz_b)
+    if not sp_a or not sp_b:
+        return {"status": "error", "error": "Could not parse one or both geometries"}
+
+    n_a = len(sp_a)
+    n_b = len(sp_b)
+    ref_atom_b   = int(ref_atom_b)
+    distance_ang = float(distance_ang)
+    if ref_atom_b >= n_b:
+        return {"status": "error",
+                "error": f"ref_atom_b={ref_atom_b} out of range (B has {n_b} atoms)"}
+
+    co_a = _np.array(co_a, dtype=float)
+    co_b = _np.array(co_b, dtype=float)
+
+    # Center A at its centroid
+    centroid_a = co_a.mean(axis=0)
+    co_a -= centroid_a
+
+    # Center B at its centroid, then shift so ref_atom_b lands at distance_ang along axis
+    centroid_b = co_b.mean(axis=0)
+    co_b -= centroid_b                       # center B
+    ref_pos_b = co_b[ref_atom_b].copy()     # position of ref atom after centering
+
+    ax_vec = {"x": _np.array([1., 0., 0.]),
+              "y": _np.array([0., 1., 0.]),
+              "z": _np.array([0., 0., 1.])}.get(axis.lower())
+    if ax_vec is None:
+        return {"status": "error", "error": f"axis must be 'x', 'y', or 'z', got {axis!r}"}
+
+    # Translate B so ref_atom_b ends up at distance_ang along the approach axis from origin
+    shift = ax_vec * distance_ang - ref_pos_b
+    co_b += shift
+
+    # Build combined XYZ string
+    lines = []
+    for s, c in zip(sp_a, co_a):
+        lines.append(f"{s:4s}  {c[0]:12.6f}  {c[1]:12.6f}  {c[2]:12.6f}")
+    for s, c in zip(sp_b, co_b):
+        lines.append(f"{s:4s}  {c[0]:12.6f}  {c[1]:12.6f}  {c[2]:12.6f}")
+    xyz_combined = "\n".join(lines)
+
+    # Determine combined charge/multiplicity
+    meta_a = _state_get_dict(state, "geom_meta").get(geom_a_id, {})
+    meta_b = _state_get_dict(state, "geom_meta").get(geom_b_id, {})
+    charge_a = int(meta_a.get("charge", 0))
+    charge_b = int(meta_b.get("charge", 0))
+    total_charge = charge_a + charge_b
+    # Multiplicity: assume singlet/doublet based on electron count parity
+    n_elec = sum(
+        _ATOMIC_NUMBERS.get(s, 0) for s in (sp_a + sp_b)
+    ) - total_charge
+    total_mult = 1 if (n_elec % 2 == 0) else 2
+
+    # Store in state
+    geom_out = output_id or f"{geom_a_id}_{geom_b_id}_dimer"
+    _store_new_geometry(
+        state,
+        xyz=xyz_combined,
+        charge=total_charge,
+        multiplicity=total_mult,
+        geom_id=geom_out,
+        overwrite=True,
+    )
+
+    scan_atom_b = n_a + ref_atom_b   # 0-based index in combined geometry
+
+    return {
+        "status": "ok",
+        "geometry_xyz": xyz_combined,
+        "n_atoms_a": n_a,
+        "n_atoms_b": n_b,
+        "offset_b": n_a,
+        "scan_atom_b": scan_atom_b,
+        "ref_atom_b_local": ref_atom_b,
+        "charge": total_charge,
+        "multiplicity": total_mult,
+        "charge_a": charge_a,
+        "charge_b": charge_b,
+        "output_id": geom_out,
+        "description": (
+            f"Atoms 0–{n_a - 1}: {geom_a_id} | "
+            f"Atoms {n_a}–{n_a + n_b - 1}: {geom_b_id} | "
+            f"Scan: B atom {scan_atom_b} ({sp_b[ref_atom_b]}) "
+            f"vs centroid of A along {axis.upper()}-axis"
+        ),
+    }
+
+def set_geometry_xyz(
+    state: dict,
+    geom_id: str,
+    geometry_xyz: str,
+    charge: int = 0,
+    multiplicity: int = 1,
+) -> dict:
+    """Store a literal XYZ coordinate block directly into the geometry registry.
+
+    Use this when the planner computes a custom dimer geometry (tilted approach,
+    off-centre target atom, EAS starting geometry, etc.) and needs to inject it
+    into state for downstream tool nodes.
+
+    Args:
+        geom_id:      Key to store the geometry under in state.
+        geometry_xyz: Raw coordinate block — NO natoms/comment header.
+                      One 'El  x  y  z' line per atom.
+        charge:       Total charge of the molecule (default 0).
+        multiplicity: Spin multiplicity (default 1).
+        state:        Session state dict (injected by executor).
+
+    Returns:
+        dict with status, geom_id, n_atoms.
+    """
+    if not isinstance(state, dict):
+        return {"status": "error", "error": "state dict is required"}
+
+    lines = [l for l in geometry_xyz.strip().splitlines() if l.strip()]
+    coord_lines = [l for l in lines if l.split() and l.split()[0].isalpha()]
+    n_atoms = len(coord_lines)
+    if n_atoms == 0:
+        return {"status": "error", "error": "no valid coordinate lines found in geometry_xyz"}
+
+    _store_new_geometry(
+        state,
+        xyz="\n".join(coord_lines),
+        charge=int(charge),
+        multiplicity=int(multiplicity),
+        geom_id=geom_id,
+        overwrite=True,
+    )
+    return {
+        "status": "ok",
+        "geom_id": geom_id,
+        "n_atoms": n_atoms,
+        "geometry_xyz": "\n".join(coord_lines),
+    }
+
+
+def build_approach_scan_geometries(
+    state: dict,
+    mol_a_id: str = None,
+    mol_b_id: str = None,
+    n_steps: int = None,
+    step_ang: float = None,
+    output_prefix: str = None,
+    # common planner aliases
+    host_geom_id: str = None,
+    guest_geom_id: str = None,
+    fixed_geom_id: str = None,
+    moving_geom_id: str = None,
+    geom_a_id: str = None,
+    geom_b_id: str = None,
+    n_points: int = None,
+    step_size_ang: float = None,
+    label_prefix: str = None,
+    geom_prefix: str = None,
+    prefix: str = None,
+    ref_atom_a: int = None,   # 0-based atom index in mol_a to aim toward (default: centroid)
+    target_atom: int = None,  # alias for ref_atom_a
+    **kwargs,  # absorb any other planner-invented aliases
+) -> dict:
+    """Generate a series of dimer geometries by rigidly translating mol_b toward mol_a.
+
+    Reads mol_a (fixed) and mol_b (moving) from the geometry registry.
+    Computes the approach vector as centroid_b → centroid_a (normalized).
+    At step i, mol_b is displaced by step_ang * i Å along that vector and
+    combined with mol_a into a dimer geometry stored as {output_prefix}_{i:02d}.
+
+    Use this for rigid-body approach scans (no ORCA constraints needed).
+    Follow with parallel run_sp_energy nodes on each generated geometry ID.
+
+    Args:
+        mol_a_id:       Geometry key for the fixed molecule (host).
+        mol_b_id:       Geometry key for the moving molecule (guest).
+                        Its current position in state sets the starting geometry.
+        n_steps:        Number of geometries to generate (step 0 = starting position).
+        step_ang:       Step size in Angstrom. mol_b moves this far per step.
+        output_prefix:  Prefix for generated geometry IDs.
+                        Default: "{mol_a_id}_{mol_b_id}_approach"
+        state:          Session state dict (injected by executor).
+
+    Returns:
+        dict with status, geom_ids (list), n_steps, step_ang,
+        start_distance_ang, end_distance_ang, charge, multiplicity.
+    """
+    import numpy as _np
+
+    if not isinstance(state, dict):
+        return {"status": "error", "error": "state dict is required"}
+
+    # Resolve aliases
+    mol_a_id     = mol_a_id or host_geom_id or fixed_geom_id or geom_a_id
+    mol_b_id     = mol_b_id or guest_geom_id or moving_geom_id or geom_b_id
+    n_steps      = n_steps or n_points
+    step_ang     = step_ang or step_size_ang
+    output_prefix = output_prefix or label_prefix or geom_prefix or prefix
+
+    if not mol_a_id:
+        return {"status": "error", "error": "mol_a_id (or host_geom_id) is required"}
+    if not mol_b_id:
+        return {"status": "error", "error": "mol_b_id (or guest_geom_id) is required"}
+    if n_steps is None:
+        return {"status": "error", "error": "n_steps is required"}
+    if step_ang is None:
+        return {"status": "error", "error": "step_ang is required"}
+
+    n_steps  = int(n_steps)
+    step_ang = float(step_ang)
+    if n_steps < 2:
+        return {"status": "error", "error": "n_steps must be at least 2"}
+    if step_ang <= 0:
+        return {"status": "error", "error": "step_ang must be positive"}
+
+    reg   = get_geometry_registry(state)
+    xyz_a = reg.get_xyz(mol_a_id)
+    xyz_b = reg.get_xyz(mol_b_id)
+    if not xyz_a:
+        return {"status": "error", "error": f"Geometry not found: {mol_a_id!r}"}
+    if not xyz_b:
+        return {"status": "error", "error": f"Geometry not found: {mol_b_id!r}"}
+
+    sp_a, co_a = _xyz_no_header_to_species_coords(xyz_a)
+    sp_b, co_b = _xyz_no_header_to_species_coords(xyz_b)
+    if not sp_a or not sp_b:
+        return {"status": "error", "error": "Could not parse one or both geometries"}
+
+    co_a = _np.array(co_a, dtype=float)
+    co_b = _np.array(co_b, dtype=float)
+
+    centroid_a = co_a.mean(axis=0)
+    centroid_b = co_b.mean(axis=0)
+
+    # Target point on mol_a: specific atom if ref_atom_a given, else centroid
+    _ref_a = ref_atom_a if ref_atom_a is not None else target_atom
+    if _ref_a is not None:
+        _ref_a = int(_ref_a)
+        if _ref_a >= len(co_a):
+            return {"status": "error",
+                    "error": f"ref_atom_a={_ref_a} out of range (mol_a has {len(co_a)} atoms)"}
+        target_a = co_a[_ref_a]
+    else:
+        target_a = centroid_a
+
+    # Approach vector: from mol_b centroid toward target point on mol_a
+    raw_vec = target_a - centroid_b
+    dist0   = float(_np.linalg.norm(raw_vec))
+    if dist0 < 1e-6:
+        return {"status": "error", "error": "mol_a target and mol_b centroid are coincident — cannot determine approach direction"}
+    approach_vec = raw_vec / dist0   # unit vector
+
+    # Combined charge/multiplicity
+    meta_a = _state_get_dict(state, "geom_meta").get(mol_a_id, {})
+    meta_b = _state_get_dict(state, "geom_meta").get(mol_b_id, {})
+    charge_a    = int(meta_a.get("charge", 0))
+    charge_b    = int(meta_b.get("charge", 0))
+    total_charge = charge_a + charge_b
+    n_elec = sum(_ATOMIC_NUMBERS.get(s, 0) for s in (sp_a + sp_b)) - total_charge
+    total_mult = 1 if (n_elec % 2 == 0) else 2
+
+    prefix = (output_prefix or f"{mol_a_id}_{mol_b_id}_approach").rstrip("_- ")
+    geom_ids = []
+
+    def _fmt_xyz(species, coords):
+        return "\n".join(
+            f"{s:4s}  {c[0]:12.6f}  {c[1]:12.6f}  {c[2]:12.6f}"
+            for s, c in zip(species, coords)
+        )
+
+    for i in range(n_steps):
+        displacement = approach_vec * step_ang * i
+        co_b_shifted = co_b + displacement
+        xyz_combined = _fmt_xyz(sp_a, co_a) + "\n" + _fmt_xyz(sp_b, co_b_shifted)
+        geom_id = f"{prefix}_{i:02d}"
+        _store_new_geometry(
+            state,
+            xyz=xyz_combined,
+            charge=total_charge,
+            multiplicity=total_mult,
+            geom_id=geom_id,
+            overwrite=True,
+        )
+        geom_ids.append(geom_id)
+
+    end_dist = dist0 - step_ang * (n_steps - 1)
+
+    # Return new geometries and geom_meta explicitly so the LangGraph executor
+    # propagates them to downstream nodes via the merge reducer.
+    new_geometries = {gid: state["geometries"][gid] for gid in geom_ids if gid in state.get("geometries", {})}
+    new_geom_meta  = {gid: state["geom_meta"][gid]  for gid in geom_ids if gid in state.get("geom_meta",  {})}
+
+    return {
+        "status":             "ok",
+        "geom_ids":           geom_ids,
+        "n_steps":            n_steps,
+        "step_ang":           step_ang,
+        "start_distance_ang": round(dist0, 4),
+        "end_distance_ang":   round(end_dist, 4),
+        "charge":             total_charge,
+        "multiplicity":       total_mult,
+        "output_prefix":      prefix,
+        # Propagate new geometries into LangGraph state
+        "geometries":         new_geometries,
+        "geom_meta":          new_geom_meta,
+        "description": (
+            f"{n_steps} dimer geometries: {mol_b_id} approaches {mol_a_id} "
+            f"from {dist0:.2f} Ang to {end_dist:.2f} Ang in {step_ang} Ang steps"
+        ),
+    }
+
 
 def get_trivial_properties(state, name: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -1971,6 +2101,11 @@ def print_session_state(
     if isinstance(cached_props, dict) and cached_props:
         print("\nCached props keys:", list(cached_props.keys())[:20])
 
+    tu = state.get("token_usage")
+    if isinstance(tu, dict) and tu.get("total", 0) > 0:
+        parts = [f"{k}={v}" for k, v in tu.items() if k != "total" and v]
+        print(f"\nToken usage (session): {' | '.join(parts)} | total={tu.get('total', 0)}")
+
     if show_full_current and reg.current_geom and reg.current_geom in reg.geometries:
         xyz = (reg.get_xyz(reg.current_geom) or "").strip().splitlines()
         print("\nCurrent geometry full XYZ:")
@@ -2625,6 +2760,7 @@ async def execute_tool_from_node_spec(*, state: Dict[str, Any], node_spec: Dict[
                 overrides["charge"] = chg
             if mult is not None and ("multiplicity" not in overrides):
                 overrides["multiplicity"] = mult
+
     except Exception as e:
         return {"status": "error", "tool": tool_name, "error": f"Failed to inject geometry from registry: {e}", "args": overrides}
 
@@ -2663,8 +2799,11 @@ async def execute_tool_from_node_spec(*, state: Dict[str, Any], node_spec: Dict[
             _client_args = args
         try:
             out = fn(**_client_args)
-        except TypeError:
-            out = fn(state, **_client_args)
+        except TypeError as _e1:
+            try:
+                out = fn(state, **_client_args)
+            except TypeError as _e2:
+                raise TypeError(f"{_e1}") from None
 
         if isinstance(out, dict):
             payload = out

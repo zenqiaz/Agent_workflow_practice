@@ -208,6 +208,7 @@ _SEMANTIC_SELECTORS = {
     "oxygen_terminal", "oxygen_terminal_not_hydroxyl", "o_terminal", "o_nonhydroxyl",
     "oxygen_hydroxyl", "o_hydroxyl", "oh",
     "nitrogen", "n_atom", "n",
+    "alpha_carbon", "alpha_to_carbonyl", "alpha_h", "alpha_ch", "carbonyl_alpha", "alpha_c",
 }
 
 
@@ -283,7 +284,7 @@ def pick_protonation_site_by_selector(
             f"Unknown site_selector '{site_selector}'. "
             "Direct: 'line:N' (1-based), '*' (first tagged atom), or a named atom tag "
             "in the XYZ 5th column. "
-            "Semantic: 'oxygen_terminal', 'oxygen_hydroxyl', 'nitrogen'."
+            "Semantic: 'oxygen_terminal', 'oxygen_hydroxyl', 'nitrogen', 'alpha_carbon'."
         )
 
     # --- Kind 3: semantic ---
@@ -304,6 +305,24 @@ def pick_protonation_site_by_selector(
         for i, sym in enumerate(atoms):
             if sym == "N":
                 candidates.append(i)
+
+    elif sel in ("alpha_carbon", "alpha_to_carbonyl", "alpha_h", "alpha_ch",
+                 "carbonyl_alpha", "alpha_c"):
+        # Carbonyl-C: carbon bonded to at least one terminal O (no H on that O)
+        carbonyl_c_set = set()
+        for i, sym in enumerate(atoms):
+            if sym == "C":
+                for j in adj[i]:
+                    if atoms[j] == "O" and not any(atoms[k] == "H" for k in adj[j]):
+                        carbonyl_c_set.add(i)
+                        break
+        # Alpha-H: H bonded to a C that is adjacent to at least one carbonyl-C
+        for i, sym in enumerate(atoms):
+            if sym == "H":
+                for j in adj[i]:
+                    if atoms[j] == "C" and any(k in carbonyl_c_set for k in adj[j]):
+                        candidates.append(i)
+                        break
 
     if not candidates:
         raise ValueError(

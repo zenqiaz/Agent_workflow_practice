@@ -38,6 +38,7 @@ class State(TypedDict, total=False):
     current_geom: Optional[str]
     final_report: Dict[str, Any]
     result: Any
+    token_usage: Dict[str, int]
 
 
 
@@ -99,6 +100,7 @@ def build_state(
     st.setdefault("last_status", "init")
     st.setdefault("last_tool_result", {})
     st.setdefault("final_report", {})
+    st.setdefault("token_usage", {"planner": 0, "calculator": 0, "reporter": 0, "total": 0})
 
     # Collect artifact keys from multiple plan sections
     artifact_keys: set[str] = set()
@@ -173,7 +175,7 @@ def compile_expr(expr: str) -> Callable[[Dict[str, float]], float]:
 # Tool parameter names safe to patch (all ORCA tools expose these)
 _PATCHABLE_TOOL_ARGS: set = {
     "method", "basis", "use_ri", "scf_max_iter", "opt_max_iter",
-    "ncores", "wall_timeout_seconds", "n_states", "calc_hess",
+    "ncores", "wall_timeout_seconds", "nroots", "calc_hess", "xtb_preopt",
 }
 
 
@@ -597,6 +599,13 @@ def build_graph_from_plan(
                                     model=os.getenv("LLM_MODEL", "gpt-4.1-mini"),
                                     messages=messages,
                                 )
+                                # Accumulate calculator token usage into state
+                                _usage = getattr(resp, "usage", None)
+                                if _usage:
+                                    _tu = state.get("token_usage") or {}
+                                    _tu["calculator"] = _tu.get("calculator", 0) + (_usage.total_tokens or 0)
+                                    _tu["total"]      = _tu.get("total", 0)      + (_usage.total_tokens or 0)
+                                    state = {**state, "token_usage": _tu}
                                 raw = (resp.choices[0].message.content or "").strip()
                                 out = json.loads(raw)
                                 if not isinstance(out, dict):

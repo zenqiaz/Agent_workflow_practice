@@ -17,6 +17,7 @@ from types import SimpleNamespace
 # ---- OPI imports ----
 from opi.core import Calculator
 from opi.input.structures.structure import Structure
+
 from opi.input.blocks.block_scf import BlockScf
 from opi.input.blocks.block_geom import BlockGeom
 
@@ -55,6 +56,8 @@ def extract_total_energy(output_text: str) -> Optional[float]:
             except Exception:
                 return None
     return None
+
+
 
 
 def extract_nbo_section(output_text: str) -> str:
@@ -373,6 +376,20 @@ def extract_casscf_root_energies(output_text: str) -> List[float]:
                 root_energies[int(m.group(1))] = float(m.group(2))
                 break
     return [root_energies[i] for i in sorted(root_energies)]
+
+
+def extract_dipole_moment(output_text: str) -> Optional[float]:
+    """Parse dipole moment magnitude in Debye from ORCA output.
+
+    Finds the last occurrence of:
+        Magnitude (Debye)      :      2.089206051
+    Returns the magnitude as a float, or None if not found.
+    """
+    pat = re.compile(r'Magnitude\s*\(Debye\)\s*:\s*([\d.]+)', re.IGNORECASE)
+    result = None
+    for m in pat.finditer(output_text):
+        result = float(m.group(1))  # keep last occurrence
+    return result
 
 
 def extract_homo_lumo_gap(output_text: str) -> Optional[float]:
@@ -777,6 +794,61 @@ async def run_solvator_cluster_thermo(
     )
 
 # -----------------------------
+# Constraint helpers
+# -----------------------------
+
+def _constraint_auto_value(ctype: str, atoms: list, geometry_xyz: str) -> Optional[float]:
+    """Compute the current value of a constraint from the geometry (bond length in Å)."""
+    import math
+    if ctype != "B" or len(atoms) < 2:
+        return None
+    coords = []
+    for line in (geometry_xyz or "").strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            try:
+                coords.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            except ValueError:
+                pass
+    i, j = atoms[0], atoms[1]
+    if i >= len(coords) or j >= len(coords):
+        return None
+    dx = coords[i][0] - coords[j][0]
+    dy = coords[i][1] - coords[j][1]
+    dz = coords[i][2] - coords[j][2]
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
+
+
+def _build_constraint_line(c: dict, geometry_xyz: str = None) -> str:
+    """Format one ORCA constraint entry: {B i j value C}.
+
+    ORCA 6 %geom Constraints block requires explicit value + C modifier.
+    If value is omitted, auto-computes from geometry_xyz (bond length only).
+    """
+    ctype = (c.get("type") or "B").upper()
+    atoms = c.get("atoms") or []
+    atom_str = " ".join(str(a) for a in atoms)
+    value = c.get("value")
+    if value is None:
+        value = _constraint_auto_value(ctype, atoms, geometry_xyz)
+    if value is None:
+        raise ValueError(
+            f"Constraint {ctype} {atoms}: no value provided and auto-computation failed. "
+            "Supply an explicit 'value' in the constraint dict."
+        )
+    return f"    {{{ctype} {atom_str} {float(value):.4f} C}}"
+
+
+def _build_constrained_geom_block(opt_max_iter: int, constraints: list,
+                                   geometry_xyz: str = None) -> str:
+    """Build a %geom block with maxiter and Constraints section."""
+    lines = ["%geom", f"  maxiter {opt_max_iter}", "  Constraints"]
+    lines.extend(_build_constraint_line(c, geometry_xyz) for c in constraints)
+    lines += ["  end", "end"]
+    return "\n".join(lines)
+
+
+# -----------------------------
 # Tools
 # -----------------------------
 
@@ -790,9 +862,12 @@ async def run_opt_job(
     use_ri: bool = True,
     scf_max_iter: int = 150,
     opt_max_iter: int = 100,
+    constraints: Optional[list] = None,
     wall_timeout_seconds: int = 1800,
     job_label: Optional[str] = None,
     ncores: int = 1,
+    xtb_preopt: bool = False,
+    xtb_preopt_timeout: int = 300,
     clean_workdir: bool = True,
     debug: bool = False,
     debug_tail_lines: int = 160,
@@ -812,15 +887,51 @@ async def run_opt_job(
     jobs_dir = Path(os.environ.get("ORCA_JOBS_DIR", "jobs"))
     workdir = jobs_dir / job_label
 
+    # --- optional xTB pre-optimisation ---
+    # Run a cheap GFN2-xTB geometry optimisation first so B3LYP starts near the minimum.
+    # Only activated when xtb_preopt=True (e.g. via on_error patch_and_retry).
+    active_geometry = geometry_xyz
+    if xtb_preopt:
+        xtb_label = job_label + "_xtbpre"
+        xtb_workdir = jobs_dir / xtb_label
+        xtb_calc = _build_calc(
+            label=xtb_label,
+            workdir=xtb_workdir,
+            geometry_xyz=geometry_xyz,
+            charge=charge,
+            multiplicity=multiplicity,
+            method="XTB2",
+            basis="",
+            job_type="opt",
+            use_ri=False,
+            scf_max_iter=150,
+            opt_max_iter=500,
+            nbo=False,
+            ncores=ncores,
+            clean_workdir=True,
+        )
+        try:
+            xtb_output = await _run_calc_with_timeout(xtb_calc, xtb_preopt_timeout)
+            xtb_out_text = _read_out_text(xtb_workdir, xtb_label)
+            xtb_geom = extract_final_geometry_from_out(xtb_out_text)
+            if xtb_geom and xtb_geom.strip():
+                active_geometry = xtb_geom
+        except Exception:
+            pass  # xTB failed — fall through to DFT with original geometry
+
+    # When constraints are provided, use job_type="scan" so _build_calc adds the
+    # OPT keyword but skips BlockGeom — we then add a single combined %geom block
+    # containing both maxiter and the Constraints section.
+    _job_type = "scan" if constraints else "opt"
     calc = _build_calc(
         label=job_label,
         workdir=workdir,
-        geometry_xyz=geometry_xyz,
+        geometry_xyz=active_geometry,
         charge=charge,
         multiplicity=multiplicity,
         method=method,
         basis=basis,
-        job_type="opt",
+        job_type=_job_type,
         use_ri=use_ri,
         scf_max_iter=scf_max_iter,
         opt_max_iter=opt_max_iter,
@@ -828,6 +939,10 @@ async def run_opt_job(
         ncores=ncores,
         clean_workdir=clean_workdir,
     )
+    if constraints:
+        calc.input.add_arbitrary_string(
+            _build_constrained_geom_block(opt_max_iter, constraints, geometry_xyz)
+        )
 
     try:
         output = await _run_calc_with_timeout(calc, wall_timeout_seconds)
@@ -1010,9 +1125,25 @@ async def run_sp_energy(
     wall_timeout_seconds: int = 600,
     job_label: Optional[str] = None,
     ncores: int = 1,
+    properties: Optional[List[str]] = None,
+    n_tddft_states: int = 5,
 ) -> str:
+    """Single-point DFT job.
+
+    properties: optional list of extra quantities to compute in the same ORCA run.
+      "dipole"       — dipole moment magnitude (Debye); always returned, no extra cost
+      "homo_lumo_gap"— KS orbital gap (eV); always returned, no extra cost
+      "nbo"          — NBO/NPA analysis; adds NBO keyword to ORCA input
+      "tddft"        — TD-DFT excited states; adds %tddft block (n_tddft_states roots)
+
+    All of energy_eh, dipole_moment_debye, homo_lumo_gap_ev are always returned
+    regardless of the properties list. nbo_section and excited_states are only
+    returned when explicitly requested.
+    """
     if not geometry_xyz.strip():
         raise ValueError("geometry_xyz is empty")
+
+    props = set(properties or [])
 
     if job_label is None:
         job_label = f"sp_{os.getpid()}_{int(asyncio.get_event_loop().time())}"
@@ -1032,9 +1163,13 @@ async def run_sp_energy(
         use_ri=use_ri,
         scf_max_iter=scf_max_iter,
         opt_max_iter=50,
-        nbo=False,
+        nbo="nbo" in props,
         ncores=ncores,
     )
+
+    if "tddft" in props:
+        n_states = max(1, int(n_tddft_states))
+        calc.input.add_arbitrary_string(f"%tddft\n  nroots {n_states}\nend")
 
     try:
         output = await _run_calc_with_timeout(calc, wall_timeout_seconds)
@@ -1055,10 +1190,21 @@ async def run_sp_energy(
                            "code": _classify_orca_error_code(out_text),
                            "tail": "\n".join(out_text.splitlines()[-120:])})
 
-    energy = extract_total_energy(out_text)
-    gap_ev = extract_homo_lumo_gap(out_text)
-    return json.dumps({"status": "ok", "label": job_label, "energy_eh": energy,
-                       "homo_lumo_gap_ev": gap_ev, "product": "energy_eh"})
+    result: Dict[str, Any] = {
+        "status":             "ok",
+        "label":              job_label,
+        "energy_eh":          extract_total_energy(out_text),
+        "dipole_moment_debye": extract_dipole_moment(out_text),
+        "homo_lumo_gap_ev":   extract_homo_lumo_gap(out_text),
+        "product":            "energy_eh",
+    }
+    if "nbo" in props:
+        result["nbo_section"] = extract_nbo_section(out_text)
+    if "tddft" in props:
+        result["excited_states"] = extract_excited_states(out_text)
+
+    return json.dumps(result)
+
 
 
 @mcp.tool()
@@ -1245,7 +1391,7 @@ async def run_tddft_job(
     multiplicity: int = 1,
     method: str = "B3LYP",
     basis: str = "def2-SVP",
-    n_states: int = 5,
+    nroots: int = 5,
     use_ri: bool = True,
     scf_max_iter: int = 150,
     wall_timeout_seconds: int = 3600,
@@ -1254,7 +1400,7 @@ async def run_tddft_job(
 ) -> str:
     """Run an ORCA TD-DFT excited-state calculation on a pre-optimised geometry.
 
-    Computes ground-state DFT energy and the lowest n_states singlet excited states.
+    Computes ground-state DFT energy and the lowest nroots singlet excited states.
     The input geometry must already be optimised (run run_opt_job first).
 
     Returns a dict with:
@@ -1289,8 +1435,8 @@ async def run_tddft_job(
         nbo=False,
         ncores=ncores,
     )
-    n_states = max(1, int(n_states))
-    calc.input.add_arbitrary_string(f"%tddft\n  nroots {n_states}\nend")
+    nroots = max(1, int(nroots))
+    calc.input.add_arbitrary_string(f"%tddft\n  nroots {nroots}\nend")
 
     try:
         output = await _run_calc_with_timeout(calc, wall_timeout_seconds)
@@ -1798,6 +1944,243 @@ async def run_casscf_job(
     if root_energies:
         ret["energies_eh"] = root_energies
     return json.dumps(ret)
+
+
+# Ligand field strength for spin-state heuristic.
+# Strong-field ligands stabilise low spin; weak-field ligands favour high spin.
+_STRONG_FIELD_LIGS = {
+    "cn", "cyanide", "co", "carbonyl", "no",
+    "bipy", "phen", "terpy",
+    "en", "edta", "cyclam", "cyclen",
+    "acac", "acetylacetone",
+    "nh3", "ammonia",
+    "dppe", "dmpe", "dmf", "dmi",
+}
+_WEAK_FIELD_LIGS = {
+    "cl", "chloride", "br", "bromide", "f", "fluoride", "i", "iodide",
+    "water", "h2o", "oh", "hydroxide",
+    "ncs", "thiocyanate", "acetate", "formate", "ox", "oxalate",
+    "no2", "nitrite", "azide",
+}
+
+
+def _ligand_field(ligands: list) -> str:
+    """Return 'strong' or 'weak' based on majority of recognisable ligands."""
+    n_strong = sum(1 for l in ligands if l.lower() in _STRONG_FIELD_LIGS)
+    n_weak   = sum(1 for l in ligands if l.lower() in _WEAK_FIELD_LIGS)
+    return "strong" if n_strong >= n_weak else "weak"
+
+
+def _auto_spin(metal: str, oxidation_state: str, geometry: str,
+               ligands: Optional[list] = None) -> Optional[int]:
+    """Return automatic spin multiplicity, or None if the case is ambiguous.
+
+    Deterministic rules (geometry + d-count):
+      d10 (Cu+, Zn2+, Ag+, Au+, Cd2+, Hg2+)  → 1
+      d9  (Cu2+)                               → 2
+      d8  sqp (Ni2+, Pd2+, Pt2+)              → 1  (always diamagnetic)
+      d8  thd (Ni2+, Pd2+, Pt2+)              → 3  (triplet, rare)
+      d3  oct (Cr3+, Mo3+)                    → 4  (always HS, only t2g3)
+
+    Ligand-field heuristic for octahedral Fe/Co/Mn/Ni (strong vs weak field):
+      Fe(III) d5:  strong→2  (t2g5, S=1/2),  weak→6  (t2g3eg2, S=5/2)
+      Fe(II)  d6:  strong→1  (t2g6, S=0),    weak→5  (t2g4eg2, S=2)
+      Co(III) d6:  strong→1  (t2g6, S=0),    weak→5  (t2g4eg2, S=2)
+      Co(II)  d7:  strong→2  (t2g6eg1, S=1/2), weak→4 (t2g5eg2, S=3/2)
+      Mn(II)  d5:  strong→2  (S=1/2),        weak→6  (S=5/2)
+      Mn(III) d4:  strong→3  (t2g4, S=1),    weak→5  (t2g3eg1, S=2)
+      Ni(II)  d8 oct: strong→1 (S=0, rare),  weak→3  (t2g6eg2, S=1)
+    """
+    m = metal.lower()
+    ox_str = str(oxidation_state).strip().upper()
+    _roman = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6}
+    ox = _roman.get(ox_str)
+    if ox is None:
+        try:
+            ox = int(ox_str)
+        except ValueError:
+            return None
+
+    _group_e = {
+        "cr": 6, "mn": 7, "fe": 8, "co": 9, "ni": 10, "cu": 11, "zn": 12,
+        "mo": 6, "tc": 7, "ru": 8, "rh": 9, "pd": 10, "ag": 11, "cd": 12,
+        "w":  6, "re": 7, "os": 8, "ir": 9, "pt": 10, "au": 11, "hg": 12,
+    }
+    if m not in _group_e:
+        return None
+    d = _group_e[m] - ox
+    g = geometry.lower()
+    ligs = ligands or []
+
+    # ── Deterministic rules ──────────────────────────────────────────────────
+    if d == 10:  return 1                   # d10: always S=0
+    if d == 9:   return 2                   # d9:  always S=1/2
+    if d == 8:
+        if g == "sqp":  return 1            # d8 square planar: always S=0
+        if g == "thd":  return 3            # d8 tetrahedral:   S=1 (triplet)
+    if d == 3 and g == "oct":  return 4     # d3 oct: always t2g3, S=3/2
+
+    # ── Ligand-field heuristic for oct Fe/Co/Mn/Ni ──────────────────────────
+    if g == "oct":
+        field = _ligand_field(ligs)
+        strong = (field == "strong")
+        if d == 5:   return 2 if strong else 6   # Fe(III), Mn(II)
+        if d == 6:   return 1 if strong else 5   # Fe(II), Co(III)
+        if d == 7:   return 2 if strong else 4   # Co(II)
+        if d == 4:   return 3 if strong else 5   # Mn(III), Cr(II)
+        if d == 8:   return 1 if strong else 3   # Ni(II) oct
+
+    return None  # unknown or ambiguous — caller must require explicit spin
+
+
+@mcp.tool()
+async def build_coordination_complex(
+    metal: str,
+    ligands: list,
+    geometry: str = "oct",
+    oxidation_state: str = "II",
+    spin: Optional[int] = None,
+    multiplicity: Optional[int] = None,
+    charge: int = 0,
+    force_field: str = "uff",
+    job_label: Optional[str] = None,
+) -> str:
+    """Build a 3D coordination complex geometry using molSimplify.
+
+    Args:
+        metal:           Element symbol lowercase: "fe", "co", "ni", "cu", "pt", etc.
+        ligands:         List of molSimplify ligand names, one entry per coordination site.
+                         Common: "cl", "water", "nh3", "co", "cn", "en", "bipy",
+                         "acac", "acetate", "ox", "ncs".
+                         Bidentate ligands (en, bipy, acac…) count as 2 sites each.
+                         Coordination number is derived automatically.
+        geometry:        "oct" (octahedral) | "sqp" (square planar) |
+                         "tbp" (trigonal bipyramidal) | "thd" (tetrahedral)
+        oxidation_state: Roman numeral string: "II", "III", "IV", etc.
+        spin:            Spin multiplicity 2S+1. Auto-determined if omitted:
+                           Cu(I)/Zn(II)/d10  → 1
+                           Cu(II)/d9         → 2
+                           Ni/Pd/Pt d8 sqp   → 1  (diamagnetic square planar)
+                           Ni/Pd/Pt d8 thd   → 3  (triplet tetrahedral)
+                           Fe/Co/Cr/Mn       → ANN prediction
+                           Others            → error (must be specified)
+        charge:          Total complex charge (integer).
+        force_field:     "uff" (default) | "mmff94" | "n" (skip FF).
+        job_label:       Optional label for this structure.
+
+    Returns:
+        JSON with status, geometry_xyz (no-header XYZ), n_atoms, charge, multiplicity.
+    """
+    try:
+        from molSimplify.Scripts.generator import startgen_pythonic
+    except ImportError as e:
+        return json.dumps({"status": "error", "error": f"molSimplify not available: {e}"})
+
+    if not metal:
+        return json.dumps({"status": "error", "error": "metal must be specified"})
+    if not ligands:
+        return json.dumps({"status": "error", "error": "ligands list must not be empty"})
+
+    # Resolve spin: explicit > ligand-field heuristic > error
+    explicit_spin = multiplicity if multiplicity is not None else spin
+    if explicit_spin is not None:
+        effective_spin = int(explicit_spin)
+        spin_source = "explicit"
+    else:
+        auto = _auto_spin(metal, oxidation_state, geometry, ligands)
+        if auto is not None:
+            effective_spin = auto
+            spin_source = "auto"
+        else:
+            return json.dumps({
+                "status": "error",
+                "error": (f"spin not specified and no auto-rule for "
+                          f"{metal}/{oxidation_state}/{geometry}. "
+                          f"Please provide spin explicitly.")
+            })
+
+    lig_str = ",".join(str(l) for l in ligands)
+    ligocc_str = ",".join("1" for _ in ligands)
+
+    # Derive effective_coord by summing denticities from ligands.dict.
+    # Format: "name:struct_file,abbrev,conn_atoms,groups,ff,charge"
+    # Split on first ":" only, then split the value by "," — conn_atoms is index 2.
+    def _get_denticity(lig_name: str) -> int:
+        try:
+            import os as _os
+            import molSimplify as _ms
+            db = _os.path.join(_os.path.dirname(_ms.__file__), "Ligands", "ligands.dict")
+            with open(db) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(":", 1)
+                    if len(parts) < 2:
+                        continue
+                    if parts[0].strip().lower() == lig_name.lower():
+                        subfields = parts[1].split(",")
+                        if len(subfields) < 3:
+                            continue
+                        conn = subfields[2].strip()   # e.g. "0 1" for bidentate
+                        return sum(1 for t in conn.split() if t.isdigit())
+        except Exception:
+            pass
+        return 1  # default monodentate
+
+    effective_coord = sum(_get_denticity(l) for l in ligands)
+
+    input_dict = {
+        "-core":     metal.lower(),
+        "-lig":      lig_str,
+        "-ligocc":   ligocc_str,
+        "-coord":    str(effective_coord),
+        "-geometry": geometry.lower(),
+        "-oxstate":  str(oxidation_state),
+        "-spin":     str(effective_spin),
+        "-charge":   str(charge),
+        "-ff":       force_field,
+        "-ffoption": "ba" if force_field != "n" else "n",
+        "-skipANN":  "True",
+    }
+    if job_label:
+        input_dict["-name"] = sanitize_label(job_label)
+
+    try:
+        import io, contextlib
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            strfiles, emsg, diag = startgen_pythonic(input_dict=input_dict, write=False)
+    except Exception as e:
+        return json.dumps({"status": "error", "error": f"molSimplify exception: {e}"})
+
+    if emsg:
+        return json.dumps({"status": "error", "error": f"molSimplify error: {emsg}"})
+
+    mol = diag.mol
+    if mol is None or mol.natoms == 0:
+        return json.dumps({"status": "error", "error": "molSimplify returned empty geometry"})
+
+    # coords() returns "N\n\nxyz_block" — strip the natoms/comment header
+    full_xyz = mol.coords()
+    lines = full_xyz.strip().splitlines()
+    body_lines = [l for l in lines if l.strip() and not l.strip().lstrip('-').isdigit()]
+    geometry_xyz = "\n".join(body_lines)
+
+    return json.dumps({
+        "status":       "ok",
+        "geometry_xyz": geometry_xyz,
+        "n_atoms":      mol.natoms,
+        "charge":       charge,
+        "multiplicity": effective_spin,
+        "metal":        metal,
+        "geometry":     geometry,
+        "spin_source":  spin_source,
+        "text": (f"Status: OK\n"
+                 f"Complex: {metal.capitalize()} {geometry} CN={effective_coord}\n"
+                 f"Ligands: {lig_str}\n"
+                 f"Atoms: {mol.natoms}  Charge: {charge}  Mult: {effective_spin} ({spin_source})"),
+    })
 
 
 @mcp.tool()

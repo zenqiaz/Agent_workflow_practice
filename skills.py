@@ -66,7 +66,9 @@ Recommended levels of theory by task:
   Microsolvation cluster: r2scan-3c (good accuracy/cost ratio for freq on clusters)
   NBO analysis          : B3LYP/def2-SVP with NBO keyword
   HOMO-LUMO gap (KS)    : run_sp_energy at PBE0/def2-TZVP; returns homo_lumo_gap_ev
-  HOMO-LUMO + UV-Vis    : run_tddft_job; returns homo_lumo_gap_ev + excited_states
+  Dipole moment         : run_sp_energy (always returned, no extra cost)
+  NBO charges           : run_sp_energy(properties=["nbo"]) — adds NBO keyword in same job
+  HOMO-LUMO + UV-Vis    : run_sp_energy(properties=["tddft"]) or run_tddft_job standalone
 
 Basis set guidance:
   def2-SVP   → cheap, opt/freq, qualitative
@@ -75,16 +77,25 @@ Basis set guidance:
 
 Performance flags:
   use_ri=True  reduces cost of hybrid DFT significantly (RIJCOSX in ORCA)
-  ncores: default 1; increase for large molecules if VM allows
+  ncores: ALWAYS 1 — MPI is not available in this execution environment
 
 Wall-time limits (always set wall_timeout_seconds for every calc node):
   run_sp_energy         :  600 s
-  run_opt_job           : 1200 s
+  run_opt_job           : 1800 s  (3600 s for coordination complexes / large molecules)
   run_freq_job          : 1800 s
   run_scan_job          : 3600 s
   run_ts_opt_job        : 1800 s
   run_casscf_job        : 3600 s
   run_solvator_cluster_thermo: 3600 s
+
+Geometry provenance — when to add run_opt_job:
+  name_to_geometry_xyz        → PubChem/OPSIN 3D structure (reasonable quality).
+                                 SKIP run_opt_job if task is SP-only or quick NBO/TDDFT scan.
+                                 ADD  run_opt_job before freq / pKa / thermochemistry.
+  build_coordination_complex  → force-field geometry. ALWAYS add run_opt_job before any QC job.
+  structure_add_remove_proton → approximate geometry. ALWAYS add run_opt_job before SP/freq.
+  geometry already in state (unknown source, loaded from file, user-provided XYZ)
+                              → provenance unknown. ALWAYS add run_opt_job before any QC job.
 """.strip()
 
 
@@ -137,11 +148,36 @@ Calibration benchmarks (gas-phase B3LYP/def2-SVP, for sanity check):
   NH₄⁺             9.2              ~11–12
   HCl             −7               ~−4 to −5
 
+Deprotonation step — structure_add_remove_proton:
+  Use  mode="remove"  with the correct  site_selector  (STRING, not a dict).
+  DO NOT pass  geometry_xyz  in args — the executor injects it automatically via input_id.
+  DO NOT use argument names 'site', 'site_hint', 'proton_site', or any other variant.
+  The ONLY valid argument name is  site_selector.
+
+  site_selector values for common pKa sites:
+    "oxygen_hydroxyl"   → O-H bond (carboxylic acid, phenol, alcohol)
+    "nitrogen"          → N-H bond (amine, amide)
+    "alpha_carbon"      → alpha C-H bond (H on C adjacent to C=O; beta-ketoesters,
+                          malonates, ketones, esters — any carbonyl alpha position)
+    "line:N"            → Nth atom line in the XYZ (1-based; most explicit fallback)
+
+  For carbonyl alpha-H acidity (pKa of C-H between two C=O groups):
+    ALWAYS use  site_selector="alpha_carbon"
+    NOT "alpha_to_carbonyl_C-H", NOT "alpha_H", NOT any other invented string.
+
 Plan validation rules:
   ✓ artifacts_to_save MUST include G_HA_eh and G_A_minus_eh
   ✓ Both freq nodes must set  product: {"G_XX_eh": "gibbs_free_energy_eh"}
   ✓ LLM calc node must list  needs_artifacts: ["G_HA_eh", "G_A_minus_eh"]
+  ✓ structure_add_remove_proton node: use input_id (not geometry_xyz in args), site_selector only
   ✗ Do NOT use SP energy as proxy for G in a pKa plan
+
+on_error patches for run_opt_job / run_freq_job:
+  RESOURCE_LIMIT (geometry slow to converge, wall time exceeded):
+    patch: {xtb_preopt: true, wall_timeout_seconds: 3600}   ← xTB pre-opt gets geometry near minimum
+    NOT: {ncores: 1}  — ncores is already 1, this does nothing
+  SCF_NOT_CONVERGED:
+    patch: {scf_max_iter: 500}
 """.strip()
 
 
@@ -518,6 +554,181 @@ CRITICAL — no kind:"llm" node:
 """.strip()
 
 
+class InteractionScanSkill(PlannerSkill):
+    """Intermolecular interaction-energy scan: monomer SP energies + dimer PES."""
+
+    name = "interaction_scan"
+    priority = 19   # just before ScanSkill (21)
+
+    _KEYWORDS = (
+        "interaction scan", "interaction energy", "binding energy scan",
+        "approach curve", "dissociation curve", "intermolecular scan",
+        "pi stacking", "π stacking", "cation pi", "cation-pi", "cation π",
+        "electrophilic aromatic", "wheland", "adduct scan",
+        "dimer scan", "complex scan", "host guest scan",
+    )
+
+    def matches(self, user_text: str, state: Dict[str, Any]) -> bool:
+        low = user_text.lower()
+        return any(kw in low for kw in self._KEYWORDS)
+
+    def render(self, user_text: str, state: Dict[str, Any]) -> str:
+        geom_info = ""
+        geoms = state.get("geometries", {})
+        if geoms:
+            sizes = {k: len([l for l in v.splitlines() if l.strip()]) for k, v in geoms.items()}
+            geom_info = "\nLoaded geometries: " + ", ".join(
+                f"{k}({n}atoms)" for k, n in sizes.items()
+            )
+        return ("""SKILL: Intermolecular Interaction-Energy Scan
+────────────────────────────────────────────────────────────
+
+Goal: compute ΔE_int(d) = E(dimer, d) − E(A) − E(B) as a function of
+intermolecular distance d. This gives a proper dissociation curve with
+the zero at infinite separation (two isolated monomers).
+
+═══ Choose one of two workflows ═══
+
+──── Workflow A: Rigid-body approach scan (PREFERRED for most cases) ────
+
+  Translates mol_b as a rigid fragment toward mol_a along the centroid-
+  to-centroid vector. No ORCA constraints, no atom index arithmetic.
+  Works for any fragment size and orientation.
+
+  Plan structure (4 + N nodes):
+
+  [parallel] sp_a  — run_sp_energy(input_id: mol_a) → E_A_eh
+  [parallel] sp_b  — run_sp_energy(input_id: mol_b) → E_B_eh
+
+  build_scan  — build_approach_scan_geometries(
+      mol_a_id: "mol_a",
+      mol_b_id: "mol_b",          ← starting position already set in state
+      n_steps: <N>,               ← e.g. 11
+      step_ang: <Δ>,              ← e.g. 0.1 Å
+      output_prefix: "approach"   ← geom_ids will be approach_00..approach_10
+  )
+
+  [parallel, N nodes]
+  sp_approach_00  — run_sp_energy(input_id: "approach_00") → E_approach_00_eh
+  sp_approach_01  — run_sp_energy(input_id: "approach_01") → E_approach_01_eh
+  ...
+  sp_approach_NN  — run_sp_energy(input_id: "approach_NN") → E_approach_NN_eh
+
+  CRITICAL: geom_ids are deterministic — {output_prefix}_{00..n_steps-1}.
+  Write them explicitly in the plan at plan time.
+
+  CRITICAL: use EXACTLY ONE llm node for the entire curve — do NOT add one llm
+  node per step. One node receives all monomer + approach energies and returns
+  the full interaction_curve list.
+
+  compute_delta_e  — kind:"llm"  (ONE node for ALL steps)
+      needs_artifacts: ["E_A_eh", "E_B_eh",
+                        "E_approach_00_eh", "E_approach_01_eh", ..., "E_approach_NN_eh",
+                        "start_distance_ang", "step_ang"]
+      prompt: "Given E_A_eh, E_B_eh, start_distance_ang, step_ang, and
+               E_approach_00_eh through E_approach_NN_eh, compute for each step i:
+               distance_ang = start_distance_ang - step_ang * i,
+               delta_e_int_kcal = (E_approach_i_eh - E_A_eh - E_B_eh) * 627.509.
+               Return JSON: {status,
+               interaction_curve: [{step, distance_ang, delta_e_int_kcal}],
+               d_eq_ang: distance at minimum delta_e_int_kcal,
+               binding_energy_kcal: minimum delta_e_int_kcal}"
+      product: {"interaction_curve": "interaction_curve",
+                "d_eq_ang": "d_eq_ang",
+                "binding_energy_kcal": "binding_energy_kcal"}
+
+──── Workflow B: ORCA relaxed scan (use only for small rigid systems ≤ 20 atoms) ────
+
+  Constrains ONE internal coordinate (the approach bond) and fully
+  relaxes everything else at each step. Gives correct TS geometries
+  but requires atom index arithmetic and ncores=1.
+
+  build_dimer  — build_dimer_xyz(
+      geom_a_id: "mol_a", geom_b_id: "mol_b",
+      distance_ang: $(settings.d_start),
+      ref_atom_b: $(settings.ref_atom_b),
+      axis: "z", output_id: "dimer"
+  )
+
+  CRITICAL — scan_atom_b must be a LITERAL INTEGER:
+    scan_atom_b = n_atoms_a + ref_atom_b
+    Read n_atoms_a from STATE (the "n_atoms=N" field). Write the literal integer.
+
+  scan_approach  — run_scan_job(
+      input_id: "dimer",
+      scan_coords: '[{"type":"B","atoms":[0,<scan_atom_b>],"start":<d_start>,"end":<d_end>,"n_points":<N>}]'
+  ) → scan_results_dimer
+
+  compute_delta_e  — kind:"llm"
+      needs_artifacts: ["scan_results_dimer", "E_A_eh", "E_B_eh"]
+      prompt: "For each point in scan_results_dimer compute
+               delta_e_int_kcal = (energy_eh - E_A_eh - E_B_eh) * 627.509.
+               Return JSON: {status, interaction_curve, d_eq_ang, binding_energy_kcal}"
+      product: {"interaction_curve": "interaction_curve", ...}
+
+═──── Workflow C: Parallel constrained-opt scan (bond-forming with relaxation) ────
+
+  Use when: 1.4–2.0 Å bond-forming region AND geometry relaxation matters
+  (e.g. EAS ipso puckering, SN2 backside attack, O-N-O angle narrowing).
+  Faster than Workflow B (parallel instead of sequential ORCA).
+
+  Step 1 — generate dimer geometries at each approach distance (same as Workflow A):
+    build_scan — build_approach_scan_geometries(
+        mol_a_id, mol_b_id, n_steps, step_ang, ref_atom_a, output_prefix="approach"
+    )
+    → geom_ids: approach_00 .. approach_{n_steps-1}
+    → mol_a atoms are indices 0 .. N_a-1 in each dimer
+    → mol_b atoms are indices N_a .. N_a+N_b-1 in each dimer
+
+  Step 2 — parallel constrained opts (ONE node per scan point):
+    opt_approach_00 — run_opt_job(
+        input_geom_id: "approach_00",
+        constraints: [{"type": "B", "atoms": [<ref_atom_a>, <ref_atom_b_in_dimer>]}]
+        # omit "value" → ORCA fixes bond at current distance in that geometry
+    ) → E_opt_approach_00_eh
+
+  CRITICAL: ref_atom_b_in_dimer = N_a + ref_atom_b_in_mol_b
+    Read N_a from STATE (the "n_atoms=N" field for mol_a). Write the literal integer.
+    Example: mol_a=benzene (N_a=12), mol_b=NO2+ (N=atom 2) → ref_atom_b_in_dimer=14
+
+  Step 3 — monomer SPs (parallel, unconstrained):
+    sp_a — run_sp_energy(input_geom_id: mol_a) → E_A_eh
+    sp_b — run_sp_energy(input_geom_id: mol_b) → E_B_eh
+
+  Step 4 — ONE llm node for full curve (same as Workflow A).
+
+═══ Scan range guidance ═══
+
+  Interaction type               | d_start (Å) | d_end (Å) | n_steps | step_ang
+  ────────────────────────────── | ----------- | --------- | ------- | --------
+  H-bond (O-H···O/N)             |   3.5       |   1.5     |   11    |  0.2
+  Ion–π approach (coarse)        |   5.0       |   2.4     |   11    |  0.26
+  π–π stacking                   |   6.0       |   3.0     |   11    |  0.3
+  van der Waals (noble gas)      |   6.0       |   3.0     |    9    |  0.375
+  Bond-forming region (C-C/C-N/C-O, fine scan) | 2.0 | 1.4 | 13 | 0.05
+
+  Bond-forming rule: C-C, C-N, C-O single bonds form at 1.47–1.54 Å.
+  For EAS (Wheland intermediate), SN2 at carbonyl, Michael addition:
+    • Coarse pass: d_start=2.5 → d_end=1.4, n_steps=12, step_ang=0.1
+      (maps full approach curve, finds the repulsive wall onset)
+    • Fine pass: d_start=2.0 → d_end=1.4, n_steps=13, step_ang=0.05
+      (resolves the TS region where bond actually forms)
+  Use the fine scan range when the question is specifically about the
+  transition state geometry or activation barrier.
+
+═══ Method / basis ═══
+
+  B3LYP/def2-SVP: qualitative curves.
+  PBE0/def2-TZVP: quantitative binding energies.
+
+CRITICAL:
+  - The kind:"llm" compute_delta_e node is the ONLY LLM node allowed.
+  - Do NOT add a kind:"llm" node for report generation.
+  - scan_results_dimer / individual E_approach energies are raw E(dimer) —
+    ΔE_int requires monomer subtraction, so the LLM node IS necessary.
+""" + geom_info).strip()
+
+
 class SpectrumSkill(PlannerSkill):
     """IR/Raman vibrational spectrum protocol."""
 
@@ -596,9 +807,12 @@ class TDDFTSkill(PlannerSkill):
 
     _KEYWORDS = ("tddft", "td-dft", "excited state", "excitation energy",
                  "uv-vis", "uv/vis", "absorption spectrum", "electronic transition",
-                 "oscillator strength", "charge transfer state", "singlet excited",
-                 "s1 state", "vertical excitation", "optical gap",
-                 "homo-lumo", "homo lumo", "frontier orbital", "band gap")
+                 "oscillator strength", "charge transfer state",
+                 "singlet excited", "triplet excited",
+                 "s1 state", "t1 state", "s1 energy", "t1 energy",
+                 "s0->s1", "s0-s1", "vertical excitation", "optical gap",
+                 "uv absorption", "photon absorption", "photophysic",
+                 "fluorescen", "phosphorescen")
 
     def matches(self, user_text: str, state: Dict[str, Any]) -> bool:
         low = user_text.lower()
@@ -608,24 +822,28 @@ class TDDFTSkill(PlannerSkill):
         return """SKILL: TD-DFT Excited State / UV-Vis Absorption Calculation
 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-Tool: run_tddft_job
-  Single-point TD-DFT on an already-optimised geometry.
-  Computes ground-state energy + vertical excitation energies for singlet excited states.
+run_sp_energy with properties (preferred — single ORCA job):
+  run_sp_energy always returns: energy_eh, dipole_moment_debye, homo_lumo_gap_ev
+  Add properties=["tddft"] to also get excited_states in the same job.
+  Add properties=["nbo"]   to also get nbo_section in the same job.
+  Combine freely: properties=["tddft","nbo"] for all in one run.
+
+Tool: run_tddft_job (standalone alternative)
+  Use when you only need excited states and no other SP properties,
+  or for a clean 3-node plan after run_opt_job.
 
 Parameters:
-  n_states: number of excited states to compute (default 5; increase for wider coverage)
+  n_tddft_states (run_sp_energy) / n_states (run_tddft_job): number of roots (default 5)
 
 Output fields:
-  energy_ground_state_eh: ground-state DFT energy (Eh)
-  homo_lumo_gap_ev: KS orbital gap in eV (LUMO_ev - HOMO_ev from SCF; null if not parsed)
+  energy_eh / energy_ground_state_eh: ground-state DFT energy (Eh)
+  dipole_moment_debye: dipole moment magnitude in Debye (always from run_sp_energy)
+  homo_lumo_gap_ev: KS orbital gap in eV (LUMO_ev - HOMO_ev from SCF)
   excited_states: list of {state, energy_ev, wavelength_nm, oscillator_strength}
-                  sorted by state index (ascending energy)
 
 HOMO-LUMO gap:
-  homo_lumo_gap_ev is the KS (Kohn-Sham) orbital energy gap — available from run_tddft_job
-  AND from run_sp_energy (both parse ORBITAL ENERGIES block automatically).
-  For the KS gap only (no excited states needed): use run_sp_energy, product homo_lumo_gap_ev.
-  For the optical gap (S1 excitation energy): use excited_states[0].energy_ev from run_tddft_job.
+  KS gap only (2-node plan, fast): run_sp_energy → homo_lumo_gap_ev
+  Optical gap (S1): excited_states[0].energy_ev (from tddft)
   The KS gap underestimates the true gap; PBE0/def2-TZVP is more reliable than B3LYP.
 
 UV/Vis conventions:
@@ -635,33 +853,42 @@ UV/Vis conventions:
 
 Geometry requirement:
   Always run on an optimised geometry (use run_opt_job first).
-  Standard workflow:
-    run_opt_job (output_id: mol_opt) -> run_tddft_job (input_id: mol_opt)
 
 Recommended levels of theory:
   General UV/Vis:   B3LYP/def2-SVP    (fast, qualitatively correct for most organics)
   Better accuracy:  PBE0/def2-TZVP    (~2x cost, more quantitative excitation energies)
   Charge-transfer:  CAM-B3LYP/def2-TZVP (range-separated; needed for CT excited states)
 
-Plan pattern (3 nodes -- NO LLM node):
-  load -> run_opt_job (output_id: mol_opt) -> run_tddft_job (input_id: mol_opt, n_states=5)
-  product: {"excited_states_<species>": "excited_states",
-            "energy_<species>_ground_eh": "energy_ground_state_eh",
-            "homo_lumo_gap_<species>_ev": "homo_lumo_gap_ev"}
+Plan patterns (NO LLM node):
 
-CRITICAL -- no kind:"llm" report node:
-  excited_states is already fully structured JSON. QC-CALCULATOR cannot write UV/Vis tables.
-  Keep the plan to exactly 3 nodes: load, opt, tddft.
-  Use final_report.fields: ["excited_states_<species>", "homo_lumo_gap_<species>_ev"]
+  UV-Vis + dipole + HOMO-LUMO in one job (preferred):
+    load -> run_opt_job (output_id: mol_opt)
+         -> run_sp_energy(input_id: mol_opt, properties=["tddft"], n_tddft_states=5)
+    product: {"excited_states_<mol>": "excited_states",
+              "homo_lumo_gap_<mol>_ev": "homo_lumo_gap_ev",
+              "dipole_<mol>_debye": "dipole_moment_debye"}
+
+  Standalone run_tddft_job:
+    load -> run_opt_job (output_id: mol_opt) -> run_tddft_job(input_id: mol_opt, n_states=5)
+    product: {"excited_states_<mol>": "excited_states",
+              "homo_lumo_gap_<mol>_ev": "homo_lumo_gap_ev"}
+
+Multi-compound comparison (e.g. "which compound absorbs best at 500 nm"):
+  Collect excited_states for each compound — NEVER add a kind:"llm" comparison node.
+  The reporter already has all excited_states artifacts and answers the comparison directly.
+  Plan: for each compound: load -> run_opt_job -> run_tddft_job (or run_sp_energy with properties=["tddft"])
+  artifacts_to_save: ["excited_states_mol1", "excited_states_mol2", ...]
+  final_report.fields: ["excited_states_mol1", "excited_states_mol2", ...]
+
+CRITICAL -- NEVER add any kind:"llm" node for TDDFT tasks:
+  excited_states is already fully structured JSON. QC-CALCULATOR cannot write tables or comparisons.
+  DO NOT add a "compare_absorption" or any ranking/comparison kind:"llm" node — the reporter does this.
+  The ONLY valid kind:"llm" node is for computing scalar numbers (pKa, ΔG) not present in tool output.
 
 Artifact naming convention:
-  excited_states_<species>         -- the list of excited states
-  energy_<species>_ground_eh       -- ground state DFT energy (Eh)
-  homo_lumo_gap_<species>_ev       -- KS HOMO-LUMO gap in eV
-
-For HOMO-LUMO gap only (no UV-Vis needed):
-  Use run_sp_energy with product: {"homo_lumo_gap_<species>_ev": "homo_lumo_gap_ev"}
-  Plan: load -> run_sp_energy  (2 nodes, fast)
+  excited_states_<mol>      -- list of excited states
+  homo_lumo_gap_<mol>_ev    -- KS HOMO-LUMO gap in eV
+  dipole_<mol>_debye        -- dipole moment in Debye
 """.strip()
 
 
@@ -682,12 +909,22 @@ class NBOSkill(PlannerSkill):
         return """SKILL: NBO Analysis Protocol
 ────────────────────────────────────────────────────────────
 
-Tool: run_nbo_job
-  Runs ORCA with NBO keyword; returns raw NBO section from output.
+Two ways to run NBO:
+
+Option A — run_sp_energy with properties=["nbo"] (preferred, fewer nodes):
+  load → run_opt_job (output_id: mol_opt)
+       → run_sp_energy(input_id: mol_opt, properties=["nbo"])
+  Returns: energy_eh, dipole_moment_debye, homo_lumo_gap_ev, nbo_section
+  product: {"nbo_output": "nbo_section", "homo_lumo_gap_mol_ev": "homo_lumo_gap_ev"}
+
+Option B — run_nbo_job (standalone):
+  load → run_opt_job (output_id: mol_opt) → run_nbo_job(input_id: mol_opt)
+  Returns: nbo_section only.
+  product: {"nbo_output": "nbo_section"}
 
 Recommended settings:
   method: B3LYP, basis: def2-SVP  (NBO is relatively basis-insensitive)
-  Geometry should be pre-optimised before NBO (use run_opt_job first if needed).
+  Geometry should be pre-optimised before NBO (use run_opt_job first).
 
 What the output contains:
   - Natural Population Analysis (NPA): atomic charges and electron counts
@@ -696,16 +933,9 @@ What the output contains:
   - Wiberg Bond Indices: bond orders
   - NBO charges are more chemically meaningful than Mulliken charges
 
-Plan pattern (opt → NBO):
-  load → opt_job (output_id: mol_opt) → nbo_job (input_id: mol_opt)
-
-Artifacts from run_nbo_job:
-  The tool returns a text block (nbo_section). Store it as an artifact key
-  (e.g. "nbo_output") for the final report. No numeric artifact is extracted
-  automatically — the LLM report node summarises the text.
-
-product field for NBO node:
-  {"nbo_output": "nbo_section"}   ← maps artifact key to result field
+Artifacts:
+  nbo_section is a raw text block. Store as artifact key (e.g. "nbo_output").
+  No numeric artifact is extracted automatically — the LLM report node summarises the text.
 """.strip()
 
 
@@ -720,7 +950,7 @@ class CoordinationChemistrySkill(PlannerSkill):
 
     _KEYWORDS = {
         "complex", "coordination", "ligand", "metal", "octahedral", "tetrahedral",
-        "square planar", "square_planar", "bipyridine", "bipy", "en ", "ethylenediamine",
+        "square planar", "square_planar", "bipyridine", "bipy", "ethylenediamine",
         "ammonia complex", "transition metal", "cobalt", "iron", "ruthenium", "platinum",
         "copper", "nickel", "zinc", "chromium", "manganese", "palladium", "rhodium",
         "iridium", "molybdenum", "tungsten", "fe(", "co(", "ru(", "pt(", "cu(", "ni(",
@@ -734,42 +964,309 @@ class CoordinationChemistrySkill(PlannerSkill):
         return """
 Coordination complex workflow
 ─────────────────────────────
-Use build_coordination_complex (client-side) to generate the starting geometry, then
-pipe it into run_opt_job via output_id/input_id.
+Use build_coordination_complex (server-side MCP tool, uses molSimplify) to generate the
+starting geometry, then pipe into run_opt_job via output_id/input_id.
 
 build_coordination_complex parameters:
-  metal        – element symbol: "Fe", "Ru", "Co", "Pt", "Cu", …
-  ligands      – list of ligand names or SMILES (one entry per binding unit)
-  geometry     – "linear" | "trigonal_planar" | "tetrahedral" | "square_planar"
-               | "trigonal_bipyramidal" | "octahedral"
-  charge       – total complex charge (integer)
-  multiplicity – spin multiplicity 2S+1 (integer; use high spin for first-row TMs unless told otherwise)
-  bond_length  – M–donor bond length in Å (optional, default 2.0)
+  metal           – element symbol lowercase: "fe", "co", "ru", "cu", "pt", …
+  ligands         – list of molSimplify ligand names (one entry per coordination site).
+                    Common names: "cl" (chloride), "water", "nh3", "co" (carbonyl),
+                    "cn" (cyanide), "en" (ethylenediamine), "bipy" (bipyridine),
+                    "acac", "acetate", "ox" (oxalate), "ncs" (thiocyanate).
+                    Repeat the same name for multiple identical ligands.
+                    len(ligands) sets the coordination number automatically.
+  geometry        – "oct" (octahedral, 6) | "thd" (tetrahedral, 4) |
+                    "sqp" (square planar, 4) | "tbp" (trigonal bipyramidal, 5)
+  oxidation_state – Roman numeral string: "II", "III", "IV", etc.
+  spin            – spin multiplicity 2S+1 (integer)
+  charge          – total complex charge (integer)
+  force_field     – "uff" (default) | "mmff94" | "n" (skip FF)
 
-Denticity rules:
-  Monodentate ligands (NH3, H2O, Cl, CO, CN, SCN) → one entry per site.
-  Bidentate ligands (en, bipyridine, acac, ox) → one entry per ligand; the tool
-  auto-detects two donor atoms and fills two adjacent sites.
-  Total denticity must equal coordination number:
-    linear=2, trigonal_planar=3, tetrahedral/square_planar=4,
-    trigonal_bipyramidal=5, octahedral=6.
+CRITICAL: do NOT pass bond_length or coordination_number — not valid parameters.
+  Coordination number is derived automatically from ligand denticities.
 
-Common bond lengths (Å):
-  M–N  2.0 (first-row TM, e.g. Fe–NH3, Co–en)
-  M–O  2.1 (e.g. Fe–H2O)
-  M–Cl 2.3, M–P 2.3, M–C 1.9 (for CO/CN)
-  Second-row TMs (Ru, Pd, Rh): add ~0.1 Å.
+CRITICAL: ALWAYS set both spin and charge explicitly in every build_coordination_complex call.
+  Never omit them — missing args cause wrong defaults and silent errors.
 
-Multiplicity guidance:
-  Fe(II) octahedral: 5 (high spin, d6 t2g4 eg2) or 1 (low spin, d6 t2g6) — depends on ligand field.
-  Strong-field ligands (CO, CN, bipy) → low spin; weak-field (H2O, Cl, NH3) → high spin for Fe/Co.
+Spin (spin multiplicity 2S+1) — ALWAYS provide explicitly:
+  d10 metals  Cu(I), Zn(II), Ag(I), Au(I)            → spin=1
+  d9  metals  Cu(II)                                  → spin=2
+  d8  sqp     Ni(II), Pd(II), Pt(II) square planar    → spin=1
+  d8  thd     Ni(II), Pd(II), Pt(II) tetrahedral      → spin=3  (rare)
+  d6  LS      Ru(II), Ir(III), Rh(III), Fe(II)+CN/CO  → spin=1
+  d5  LS      Fe(III) + strong field (CN,CO,en,bipy)   → spin=2
+  d5  HS      Fe(III) + weak field   (Cl,H2O,F,NCS)   → spin=6
+  d6  HS      Fe(II)  + weak field                    → spin=5
+  d4  LS      Co(III) + strong field                  → spin=1
+  d4  HS      Co(III) + weak field                    → spin=5
+  d3          Cr(III) oct                             → spin=4  (always HS)
+
+  Strong-field ligands (low spin): CN⁻, CO, bipy, en, NH₃, NO₂⁻
+  Weak-field  ligands (high spin): Cl⁻, F⁻, H₂O, NCS⁻, OAc⁻
+
+charge — ALWAYS provide explicitly:
+  Total complex charge = metal oxidation state + sum of ligand charges.
+  Example: Fe(III) + 6 CN⁻ → charge = +3 + 6×(−1) = −3
 
 Typical plan pattern:
   build_coordination_complex (output_id: complex_start)
     → run_opt_job            (input_id: complex_start, output_id: complex_opt)
-    → run_sp_energy or run_freq_job
+    → run_freq_job or run_sp_energy
 
-Geometry note: the template geometry is approximate. Always follow with run_opt_job.
+Geometry note: molSimplify uses UFF force-field pre-optimization. The result is a
+reasonable starting geometry; always follow with run_opt_job for accurate structure.
+
+CRITICAL run_opt_job settings for coordination complexes:
+  use_ri=True               – REQUIRED for metal complexes; speeds SCF by 3-5x
+  ncores=1                  – MPI is unavailable in this environment; always ncores=1
+  wall_timeout_seconds=3600 – coordination complexes often need > 30 min to optimize
+""".strip()
+
+
+class GeometrySkill(PlannerSkill):
+    """Teaches the planner how to construct and inject custom molecular geometries."""
+
+    name = "geometry"
+    priority = 18   # just before InteractionScanSkill (19)
+
+    _KEYWORDS = (
+        "above", "tilt", "tilted", "angle", "degree", "orient", "orientation",
+        "approach", "axial", "equatorial", "perpendicular", "parallel",
+        "set_geometry", "custom geometry", "write xyz", "starting geometry",
+        "sigma complex", "sigma-complex", "wheland", "eas", "electrophilic aromatic",
+        "above the ring", "above the plane", "off centre", "off-centre", "off center",
+        "directly above", "carbon atom", "target atom",
+        "dimer geometry", "interaction scan", "cation pi", "cation-pi",
+    )
+
+    def matches(self, user_text: str, state: Dict[str, Any]) -> bool:
+        low = user_text.lower()
+        return any(kw in low for kw in self._KEYWORDS)
+
+    def render(self, user_text: str, state: Dict[str, Any]) -> str:
+        return """SKILL: Molecular Geometry Construction
+────────────────────────────────────────────────────────────
+
+═══ Reading atom indices from the STATE block ═══
+
+The STATE block shows each loaded geometry with element ranges, e.g.:
+  - benzene: q=0, mult=1  n_atoms=12  atoms: C[0-5] H[6-11]
+  - no2plus: q=1, mult=1  n_atoms=3   atoms: O[0-1] N[2]
+
+Use these indices directly for scan_coords, target_atom_a, ref_atom_b, etc.
+Do NOT guess — always read from the STATE block.
+
+═══ Coordinate conventions ═══
+
+- Geometries stored WITHOUT natoms/comment header
+- One line per atom: El  x  y  z
+- PubChem orientations (after centering at origin):
+    Benzene C6H6:    ring in XY plane, centroid at (0,0,0)
+                     C[0-5] roughly at radius 1.40 Å in XY, H[6-11] at 2.48 Å
+    NO2+ (linear):   O-N-O along X axis, N at origin
+                     O[0] at (-1.336, 0, 0), O[1] at (1.336, 0, 0), N[2] at (0,0,0)
+    Water H2O:       O at origin, H-O-H in XY plane
+    CO2 (linear):    O-C-O along X axis
+
+═══ Tool choice ═══
+
+  build_dimer_xyz  — use when:
+    • Approach is straight along Z (or X/Y) above A's centroid
+    • No tilt, no specific target atom on A needed
+    • Perpendicular π-approach, symmetric van der Waals scan
+
+  set_geometry_xyz  — use when:
+    • Approach is tilted (θ > 0° from ring normal)
+    • Target is a specific atom of A (not the centroid)
+    • EAS / σ-complex starting geometry (N directly above a C)
+    • Any custom dimer geometry the planner computes explicitly
+
+═══ Computing a tilted or off-centre approach geometry ═══
+
+Step 1 — Center A at origin (subtract centroid from all coordinates).
+Step 2 — Identify target atom position t = (tx, ty, tz) in A.
+Step 3 — Choose approach vector v at angle θ from Z, tilted toward t:
+           v_horiz = normalize(tx, ty, 0)   # horizontal component toward t
+           v = sin(θ)·v_horiz + cos(θ)·ẑ   # unit approach vector
+Step 4 — Place ref_atom_b of B at:  p = t + d·v
+Step 5 — Shift all atoms of B so ref_atom_b lands at p.
+Step 6 — Write combined A+B coordinates into set_geometry_xyz.
+
+Example — NO2+ N directly above C0 of benzene at d=2.4 Å (θ=0°, EAS):
+  C0 of benzene (after centering) ≈ (0.000, 1.396, 0.000)
+  v = ẑ = (0, 0, 1)
+  N position = (0.000, 1.396, 2.400)
+  O atoms: N ± (1.336, 0, 0) → (-1.336, 1.396, 2.400) and (1.336, 1.396, 2.400)
+  → scan_coords atoms: [0, scan_atom_b]  where 0 = C0 index, scan_atom_b = 12+2 = 14
+
+Example — NO2+ at 45° above C0 (tilted EAS approach):
+  v_horiz = normalize(0, 1.396, 0) = (0, 1, 0)
+  v = sin(45°)·(0,1,0) + cos(45°)·(0,0,1) = (0, 0.707, 0.707)
+  N position = (0, 1.396, 0) + d·(0, 0.707, 0.707)
+  At d=3.0 Å: N = (0, 1.396+2.121, 2.121) = (0, 3.517, 2.121)
+
+═══ scan_atom_a for off-centre scans ═══
+
+When the reference atom on A is NOT atom 0, set:
+  scan_atom_a = index of target atom in A  (read from STATE atoms: block)
+  scan_atom_b = n_atoms_a + ref_atom_b_local_index
+
+scan_coords: '[{"type":"B","atoms":[$(settings.scan_atom_a),$(settings.scan_atom_b)],...}]'
+Put both as LITERAL INTEGERS in settings.
+"""
+
+
+# ---------------------------------------------------------------------------
+# EAS reactivity skill (priority 33 — between Solvation=30 and NBO=40)
+# ---------------------------------------------------------------------------
+
+class EASSkill(PlannerSkill):
+    """EAS site reactivity via NPA charges and Fukui f⁻ indices."""
+
+    name     = "eas_reactivity"
+    priority = 33
+
+    _KEYWORDS = (
+        "eas", "electrophilic aromatic", "aromatic substitution",
+        "site selectivity", "site reactivity", "activated site", "deactivated site",
+        "ortho para", "o/p director", "meta director",
+        "fukui", "fukui function",
+        "charge analysis", "npa charge", "natural charge",
+        "electron density", "charge distribution", "aromatic reactivity",
+        "most reactive site", "least reactive site", "preferred site",
+    )
+
+    def matches(self, user_text: str, state: Dict[str, Any]) -> bool:
+        low = user_text.lower()
+        return any(kw in low for kw in self._KEYWORDS)
+
+    def render(self, user_text: str, state: Dict[str, Any]) -> str:
+        return """SKILL: EAS Reactivity Analysis Protocol
+────────────────────────────────────────────────────────────
+
+Goal: rank aromatic carbon sites by susceptibility to electrophilic attack.
+Two methods — choose based on accuracy need:
+
+══ Method A: NPA charges (fast, 1 SP per molecule) ════════════════════════
+
+  Step 1  opt → run_opt_job  (output_id: mol_opt)
+  Step 2  run_sp_energy(input_id: mol_opt, properties=["nbo"])
+          product: {"npa_charges_mol": "nbo_section"}
+  Step 3  llm node: extract NPA natural charges for each aromatic C from nbo_section;
+          sort ascending (most negative = highest electron density = most EAS-activated);
+          return JSON:
+            {"site_ranking": [{"atom_idx": N, "element": "C", "npa_charge": X, "rank": 1}, ...]}
+
+  Chemistry: EAS preferentially attacks the most negative-charge carbon.
+  Use for: single-ring aromatics, simple substituent effects (OH, NH2, Cl, NO2, CN).
+
+══ Method B: Fukui f⁻ index (rigorous, 2 parallel SP per molecule) ════════
+
+  Step 1  opt → run_opt_job  (output_id: mol_opt)
+  Step 2a run_sp_energy(input_id: mol_opt, charge=<neutral>, multiplicity=<neutral_mult>,
+                         properties=["nbo"])
+          product: {"npa_neutral_mol": "nbo_section"}
+  Step 2b run_sp_energy(input_id: mol_opt, charge=<neutral+1>, multiplicity=2,
+                         properties=["nbo"])          ← radical cation, remove 1 electron
+          product: {"npa_cation_mol": "nbo_section"}
+  Steps 2a/2b are parallel (both need: ["opt_node"]).
+  Step 3  llm node:
+            f_minus_k = q_neutral_k - q_cation_k   (NPA charges, per aromatic C)
+          Higher f⁻ = more electron density donated on ionisation = most EAS-activated.
+          return JSON:
+            {"fukui_ranking": [{"atom_idx": N, "f_minus": X, "rank": 1}, ...]}
+
+  Use for: polycyclics, heteroaromatics, cross-molecule comparisons.
+
+══ Multi-molecule comparison ═══════════════════════════════════════════════
+
+  Run Method A or B for each molecule in parallel (separate opt → SP chains).
+  Final llm node (needs_artifacts: all npa_* or fukui_* keys):
+    compare most activated site per molecule, report cross-molecule ranking.
+    product: {"eas_comparison": "comparison_table"}
+
+══ Recommended settings ════════════════════════════════════════════════════
+
+  method: B3LYP, basis: def2-SVP, use_ri: True
+  ncores: 1  (MPI unavailable); wall_timeout_seconds: 600 (SP+NBO is fast)
+  Always optimize geometry before charge analysis.
+
+══ Parsing nbo_section in the llm node ════════════════════════════════════
+
+  Look for header:  "Summary of Natural Population Analysis:"
+  Line format:       Atom  No    Charge     Core   Valence   Rydberg    Total
+  Example:           C      1   -0.20123   1.99938  3.94879  0.25306   6.20123
+  NBO atom No is 1-based and matches the atom order in the XYZ geometry file.
+  Extract the Charge column for every C atom; ignore H, N, O etc. for ranking
+  (but note heteroatom charges for context).
+
+══ Ring numbering: map NBO atom index → IUPAC ring position ═══════════════
+
+  The NBO atom indices (1-based, XYZ order) are NOT necessarily the IUPAC numbers.
+  The llm node MUST convert them using the following rules:
+
+  Step A — identify the scaffold from the molecule name in context.
+  Step B — locate each aromatic C in the NBO atom list (by type and charge pattern).
+  Step C — assign IUPAC position number using the rule below.
+  Step D — group symmetry-equivalent positions (same IUPAC environment).
+
+  IUPAC numbering rules for common ring systems:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Monosubstituted benzene (toluene, aniline, nitrobenzene, etc.)  │
+  │   C1 = ipso (bears the substituent)                            │
+  │   C2, C6 = ortho  (equivalent by mirror symmetry)             │
+  │   C3, C5 = meta   (equivalent by mirror symmetry)             │
+  │   C4     = para                                                │
+  │   Unique sites: ipso(C1), ortho(C2), meta(C3), para(C4)       │
+  ├─────────────────────────────────────────────────────────────────┤
+  │ Naphthalene (and its mono-substituted derivatives)             │
+  │   Ring junction carbons: C4a, C8a (not reactive sites)        │
+  │   α positions: C1, C4, C5, C8 (adjacent to ring junction)     │
+  │   β positions: C2, C3, C6, C7 (not adjacent to junction)      │
+  │   Unsubstituted naphthalene: α ≡ β, two unique classes only   │
+  │   1-substituted: C1(ipso), C2(α), C3(β), C4(α),              │
+  │                  C5(β'), C6(α'), C7(β'), C8(α') — 7 sites     │
+  ├─────────────────────────────────────────────────────────────────┤
+  │ 1,2-disubstituted benzene (ortho): each C is unique (6 sites) │
+  │ 1,3-disubstituted (meta): C1=C3(ipso), C2(between), C4=C6,   │
+  │                            C5 — 4 unique sites                │
+  │ 1,4-disubstituted (para): C1=C4(ipso), C2=C3=C5=C6(non-ipso)│
+  └─────────────────────────────────────────────────────────────────┘
+
+══ Required output format for the llm ranking node ════════════════════════
+
+  Return JSON with per-site entries using IUPAC labels AND explicit ring numbers:
+  {
+    "molecule": "toluene",
+    "method": "NPA" or "Fukui_f-",
+    "site_ranking": [
+      {
+        "iupac_position": "C4",
+        "label": "para",
+        "equivalent_atoms": [4],        ← 1-based NBO atom indices in this group
+        "npa_charge": -0.195,           ← representative value (average if equivalent)
+        "f_minus": null,                ← fill if Fukui was computed
+        "rank": 1                       ← 1 = most EAS-activated
+      },
+      {
+        "iupac_position": "C2/C6",
+        "label": "ortho",
+        "equivalent_atoms": [2, 6],
+        "npa_charge": -0.181,
+        "f_minus": null,
+        "rank": 2
+      },
+      ...
+    ]
+  }
+
+  Key rules for the llm node:
+  • Merge symmetry-equivalent atoms into one entry; average their charges.
+  • Sort by npa_charge ascending (most negative first) or f_minus descending.
+  • Include ipso carbon even though it is not an EAS site (rank it last).
+  • Include ring-junction carbons (C4a, C8a in naphthalene) as "junction — not reactive".
+  • Use the molecule name from the user request to identify the scaffold;
+    if ambiguous, state the assumed numbering convention explicitly.
 """.strip()
 
 
@@ -782,6 +1279,8 @@ SKILL_REGISTRY: List[PlannerSkill] = [
     CoordinationChemistrySkill(),
     ProtonationSiteSkill(),
     PKaSkill(),
+    GeometrySkill(),
+    InteractionScanSkill(),
     ScanSkill(),
     SpectrumSkill(),
     TDDFTSkill(),
@@ -789,6 +1288,7 @@ SKILL_REGISTRY: List[PlannerSkill] = [
     ThermochemistrySkill(),
     TSSearchSkill(),
     SolvationSkill(),
+    EASSkill(),
     NBOSkill(),
 ]
 

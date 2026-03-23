@@ -53,31 +53,90 @@
 		}
 	},
 
-	"build_coordination_complex": {
+	"build_dimer_xyz": {
 		"type": "function",
 		"function": {
-		"name": "build_coordination_complex",
-		"description": "Build a starting 3D geometry for a coordination complex from a metal center and a list of ligands. Monodentate ligands (NH3, H2O, Cl, CO) each occupy one site. Bidentate ligands (en, bipyridine, acac) are auto-detected and consume two adjacent sites. Total denticity must match the coordination number of the chosen geometry. Use output_id to route the geometry to the next node (run_opt_job).",
+		"name": "build_dimer_xyz",
+		"description": "Assemble two molecules into a dimer starting geometry for an interaction-energy scan. Centers molecule A at its centroid, then places molecule B along the chosen axis so that B's reference atom (ref_atom_b) is at distance_ang from A's centroid. Returns geometry_xyz, n_atoms_a, n_atoms_b, offset_b (=n_atoms_a), and scan_atom_b (0-based index of ref_atom_b in the combined geometry). Use output_id to route the assembled geometry to run_scan_job.",
 		"parameters": {
 			"type": "object",
 			"properties": {
-			"metal":        { "type": "string", "description": "Element symbol of the metal center, e.g. 'Fe', 'Ru', 'Co', 'Pt'." },
-			"ligands":      { "type": "array",  "items": { "type": "string" }, "description": "List of ligand names or SMILES. Monodentate ligands each occupy one site; bidentate ones (two donors within 1.8-5 A) occupy two adjacent sites. The total denticity must equal the coordination number." },
-			"geometry":     { "type": "string", "enum": ["linear","trigonal_planar","tetrahedral","square_planar","trigonal_bipyramidal","octahedral"], "description": "Coordination geometry. Determines the coordination number: linear=2, trigonal_planar=3, tetrahedral/square_planar=4, trigonal_bipyramidal=5, octahedral=6." },
-			"charge":       { "type": "integer", "description": "Total charge of the complex." },
-			"multiplicity": { "type": "integer", "description": "Spin multiplicity (2S+1). Use 1 for closed-shell, higher for open-shell metals." },
-			"bond_length":  { "type": "number",  "description": "Metal-donor bond length in Angstrom (default 2.0, suitable for first-row transition metals with N/O donors)." }
+			"geom_a_id":     { "type": "string",  "description": "Geometry key for molecule A (host / larger molecule, e.g. benzene)." },
+			"geom_b_id":     { "type": "string",  "description": "Geometry key for molecule B (guest / approaching molecule, e.g. NO2+)." },
+			"distance_ang":  { "type": "number",  "description": "Initial distance in Angstrom between centroid of A and ref_atom_b of B (default 3.5)." },
+			"ref_atom_b":    { "type": "integer", "description": "0-based atom index in B to use as the approach reference — typically the atom closest to A (e.g. N of NO2+, O of H2O). Default 0." },
+			"axis":          { "type": "string",  "enum": ["x", "y", "z"], "description": "Approach axis (default 'z')." },
+			"output_id":     { "type": "string",  "description": "Geometry key under which the assembled dimer is stored in state." }
 			},
-			"required": ["metal", "ligands", "geometry", "charge", "multiplicity"]
+			"required": ["geom_a_id", "geom_b_id", "output_id"]
 		}
 		}
 	},
+
+	"build_approach_scan_geometries": {
+		"type": "function",
+		"function": {
+		"name": "build_approach_scan_geometries",
+		"description": "Generate N dimer geometries by rigidly translating mol_b toward mol_a along the centroid-to-centroid vector. Step 0 is mol_b at its current position; step i shifts mol_b by step_ang*i Å closer. Stores each dimer as {output_prefix}_{i:02d} in state. Follow immediately with parallel run_sp_energy nodes on each geom_id. Use this for rigid-body approach scans — no ORCA constraints needed, works for any fragment size and orientation. The planner knows the geom_ids at plan time since they are {output_prefix}_{00..n_steps-1}.",
+		"parameters": {
+			"type": "object",
+			"properties": {
+			"mol_a_id":       { "type": "string",  "description": "Geometry key for the fixed molecule (host, e.g. 'benzene'). Also accepted as host_geom_id or geom_a_id." },
+			"mol_b_id":       { "type": "string",  "description": "Geometry key for the moving molecule (guest, e.g. 'no2plus'). Its current position in state sets the starting geometry — use set_geometry_xyz or build_dimer_xyz first to place it correctly. Also accepted as guest_geom_id or geom_b_id." },
+			"n_steps":        { "type": "integer", "description": "Number of dimer geometries to generate. Step 0 = starting position." },
+			"step_ang":       { "type": "number",  "description": "Step size in Angstrom per step. mol_b moves this far toward mol_a at each step." },
+			"output_prefix":  { "type": "string",  "description": "Prefix for generated geometry IDs. Geom IDs will be {output_prefix}_00, _01, ... Default: '{mol_a_id}_{mol_b_id}_approach'." },
+			"ref_atom_a":     { "type": "integer", "description": "0-based atom index in mol_a to aim toward (default: centroid of mol_a). Use this to target a specific atom, e.g. ref_atom_a=0 to aim mol_b directly toward atom 0 of mol_a, giving a straight-line approach to that atom." }
+			},
+			"required": ["mol_a_id", "mol_b_id", "n_steps", "step_ang"]
+		}
+		}
+	},
+
+	"set_geometry_xyz": {
+		"type": "function",
+		"function": {
+		"name": "set_geometry_xyz",
+		"description": "Store a literal XYZ coordinate block directly into the geometry registry. Use this when the planner computes a custom dimer geometry (tilted approach, off-centre target atom, EAS starting geometry, etc.) and needs to inject it into state. The planner writes the coordinates explicitly in its chain-of-thought, then passes them here. No natoms/comment header — raw 'El x y z' lines only.",
+		"parameters": {
+			"type": "object",
+			"properties": {
+			"geom_id":      { "type": "string", "description": "Key under which to store the geometry in state (e.g. 'dimer', 'eas_start')." },
+			"geometry_xyz": { "type": "string", "description": "Raw coordinate block, no header. One 'El  x  y  z' line per atom, newline-separated." },
+			"charge":       { "type": "integer", "description": "Total charge of the molecule (default 0)." },
+			"multiplicity": { "type": "integer", "description": "Spin multiplicity (default 1)." }
+			},
+			"required": ["geom_id", "geometry_xyz"]
+		}
+		}
+	},
+
+    "build_coordination_complex": {
+        "type": "function",
+        "function": {
+            "name": "build_coordination_complex",
+            "description": "Build a 3D coordination complex geometry using molSimplify (server-side). Returns geometry_xyz for use with output_id → run_opt_job. Coordination number is derived automatically from ligand denticities (e.g. 3×en = CN 6). Spin is auto-determined for common cases: d10→1, Cu(II)→2, d8 sqp→1, d8 thd→3, Fe/Co/Cr/Mn→ANN. Omit spin unless overriding.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "metal":           { "type": "string", "description": "Element symbol lowercase: 'fe', 'co', 'ni', 'cu', 'pt', 'cr', 'mn', 'ru', etc." },
+                    "ligands":         { "type": "array", "items": { "type": "string" }, "description": "molSimplify ligand names, one entry per ligand (bidentate like en/bipy count as 2 sites automatically). Common: 'cl','water','nh3','co','cn','en','bipy','acac','acetate','ox','ncs'. Repeat for multiple identical ligands." },
+                    "geometry":        { "type": "string", "enum": ["oct","sqp","tbp","thd"], "default": "oct", "description": "oct=octahedral(6), sqp=square planar(4), tbp=trigonal bipyramidal(5), thd=tetrahedral(4)." },
+                    "oxidation_state": { "type": "string", "default": "II", "description": "Roman numeral: 'I','II','III','IV', etc." },
+                    "spin":            { "type": "integer", "description": "Spin multiplicity 2S+1. Omit for auto-determination: d10→1, d9→2, d8 sqp→1, d8 thd→3, d3 oct→4. For Fe/Co/Cr/Mn oct: strong-field ligands (CN,CO,en,bipy,NH3)→low spin, weak-field (Cl,H2O,NCS,OAc)→high spin. Provide explicitly for Ru, Ir, Rh, or to override." },
+                    "charge":          { "type": "integer", "default": 0, "description": "Total complex charge (metal ox + sum of ligand charges)." },
+                    "force_field":     { "type": "string", "enum": ["uff","mmff94","n"], "default": "uff", "description": "'n' skips FF pre-optimization." }
+                },
+                "required": ["metal", "ligands", "geometry", "oxidation_state", "charge"]
+            }
+        }
+    },
 	
     "run_opt_job": {
         "type": "function",
         "function": {
             "name": "run_opt_job",
-            "description": "Optimize geometry with ORCA.",
+            "description": "Optimize geometry with ORCA. Supports optional geometry constraints (fix bonds, angles, dihedrals) for constrained optimization.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -87,7 +146,21 @@
                     "use_ri": {"type": "boolean", "default": true},
                     "scf_max_iter": {"type": "integer", "default": 150},
                     "opt_max_iter": {"type": "integer", "default": 100},
-                    "wall_timeout_seconds": {"type": "integer", "default": 1800}
+                    "constraints": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["B", "A", "D"], "description": "B=bond (2 atoms), A=angle (3 atoms), D=dihedral (4 atoms)"},
+                                "atoms": {"type": "array", "items": {"type": "integer"}, "description": "0-based atom indices in the dimer geometry"},
+                                "value": {"type": "number", "description": "Target distance (Å for B) or angle (° for A/D). Omit to fix at the current geometry value."}
+                            },
+                            "required": ["type", "atoms"]
+                        },
+                        "description": "Optional constraints. Example: [{\"type\":\"B\",\"atoms\":[0,14]}] freezes the bond between atoms 0 and 14 at its current distance. Atom indices in merged dimer: mol_a atoms first (0..N_a-1), then mol_b atoms (N_a..N_a+N_b-1)."
+                    },
+                    "wall_timeout_seconds": {"type": "integer", "default": 1800},
+                    "xtb_preopt": {"type": "boolean", "default": false, "description": "Run a cheap GFN2-xTB pre-optimisation before the DFT opt. Use in on_error patch when RESOURCE_LIMIT is triggered — starts B3LYP from a better geometry so it converges in fewer cycles."}
                 },
                 "required": ["input_geom_id"]}
         }
@@ -111,11 +184,12 @@
                     "wall_timeout_seconds": {"type": "integer", "default": 600}},
                 "required": ["input_geom_id"]}}},
 
+
     "run_sp_energy": {
         "type": "function",
         "function": {
             "name": "run_sp_energy",
-            "description": "Run a single-point energy calculation. Returns energy_eh and homo_lumo_gap_ev (KS orbital gap in eV; null if not parsed).",
+            "description": "Run a single-point DFT job. Always returns energy_eh, dipole_moment_debye, homo_lumo_gap_ev. Add extra properties via the 'properties' list: 'nbo' (NBO/NPA analysis → nbo_section), 'tddft' (TD-DFT excited states → excited_states). These map directly to ORCA input blocks in a single job.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -124,7 +198,14 @@
                     "basis": {"type": "string", "default": "def2-SVP"},
                     "use_ri": {"type": "boolean", "default": true},
                     "scf_max_iter": {"type": "integer", "default": 150},
-                    "wall_timeout_seconds": {"type": "integer", "default": 600}},
+                    "wall_timeout_seconds": {"type": "integer", "default": 600},
+                    "properties": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["dipole", "homo_lumo_gap", "nbo", "tddft"]},
+                        "description": "Extra properties to compute in the same ORCA run. 'nbo' adds NBO keyword; 'tddft' adds %tddft block. 'dipole' and 'homo_lumo_gap' are always returned and need not be listed."
+                    },
+                    "n_tddft_states": {"type": "integer", "default": 5, "description": "Number of TD-DFT roots (only used when 'tddft' is in properties)."}
+                },
                 "required": ["input_geom_id"]}}},
 
     "run_freq_job": {
@@ -174,7 +255,7 @@
                 "type": "object",
                 "properties": {
                     "input_geom_id": {"type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from."},
-                    "n_states": {"type": "integer", "default": 5, "description": "Number of excited singlet states to compute (default 5; increase for broader spectral coverage)."},
+                    "nroots": {"type": "integer", "default": 5, "description": "Number of excited singlet states to compute (default 5; increase for broader spectral coverage)."},
                     "method": {"type": "string", "default": "B3LYP"},
                     "basis": {"type": "string", "default": "def2-SVP"},
                     "use_ri": {"type": "boolean", "default": true},
