@@ -25,10 +25,11 @@ class State(TypedDict, total=False):
     run_finished_utc: str
     last_status: str
     last_tool_result: Dict[str, Any]
-    run_log: List[dict]
 
-    artifacts: Dict[str, Any]
-    node_results: Dict[str, Any]
+    # Annotated with merge reducer so parallel nodes don't overwrite each other's entries.
+    run_log:      Annotated[List[dict],      lambda a, b: (a or []) + (b or [])]
+    artifacts:    Annotated[Dict[str, Any],  lambda a, b: {**(a or {}), **(b or {})}]
+    node_results: Annotated[Dict[str, Any],  lambda a, b: {**(a or {}), **(b or {})}]
 
     # GeometryRegistry-backed storage (dict-state)
     # Annotated with merge reducer so parallel nodes don't overwrite each other's geometry entries.
@@ -555,7 +556,7 @@ def build_graph_from_plan(
                     updates.update({
                         "last_status":      status,
                         "last_tool_result": tool_payload,
-                        "run_log":          (state.get("run_log") or []) + [log_entry],
+                        "run_log":          [log_entry],
                     })
                     if isinstance(result, dict):
                         updates.update(_stash_artifacts(node_id, spec, result, state))
@@ -630,7 +631,7 @@ def build_graph_from_plan(
 
                     updates["last_status"] = status
                     updates["last_tool_result"] = out_with_meta
-                    updates["run_log"] = state.get("run_log", []) + [{
+                    updates["run_log"] = [{
                         "node": node_id,
                         "kind": kind,
                         "llm_task": task,
@@ -647,10 +648,18 @@ def build_graph_from_plan(
                         cur_artifacts = dict(state.get("artifacts") or {})
                         cur_artifacts.update(updates.get("artifacts") or {})
                         values_dict = out.get("values") if isinstance(out.get("values"), dict) else {}
+                        # Build a flat lookup merging top-level + values_dict
+                        # Also try common key aliases (site_ranking_json → site_ranking, etc.)
+                        _ALIAS_MAP = {
+                            "site_ranking_json": "site_ranking",
+                            "ranking_json":      "site_ranking",
+                            "comparison_table_json": "comparison_table",
+                        }
+                        flat_out = {**values_dict, **{k: v for k, v in out.items() if k != "values"}}
                         for art_key, src_key in product_spec.items():
-                            val = out.get(src_key)
+                            val = flat_out.get(src_key)
                             if val is None:
-                                val = values_dict.get(src_key)
+                                val = flat_out.get(_ALIAS_MAP.get(src_key, src_key))
                             if val is not None:
                                 cur_artifacts[art_key] = val
                         updates["artifacts"] = cur_artifacts
@@ -699,7 +708,7 @@ def build_graph_from_plan(
                     updates.update({
                         "last_status": status,
                         "last_tool_result": result,
-                        "run_log": state.get("run_log", []) + [{
+                        "run_log": [{
                             "node": node_id,
                             "kind": kind,
                             "status": status,
@@ -718,7 +727,7 @@ def build_graph_from_plan(
                     duration_ms = int((time.perf_counter() - t0) * 1000)
 
                     updates["last_status"] = status
-                    updates["run_log"] = state.get("run_log", []) + [{
+                    updates["run_log"] = [{
                         "node": node_id,
                         "kind": kind,
                         "status": status,
@@ -745,7 +754,7 @@ def build_graph_from_plan(
                 if isinstance(goto, str) and goto not in nodes_by_id and goto != FINAL_NODE_ID:
                     print(f"  [unknown_goto] node={node_id!r} goto={goto!r} known={list(nodes_by_id.keys())}")
                     updates["last_status"] = "error"
-                    updates["run_log"] = state.get("run_log", []) + [{"node": node_id, "status": "error", "error": f"unknown next node: {goto!r}"}]
+                    updates["run_log"] = [{"node": node_id, "status": "error", "error": f"unknown next node: {goto!r}"}]
                     goto = FINAL_NODE_ID
 
                 return Command(update=updates, goto=goto)
@@ -798,7 +807,7 @@ def build_graph_from_plan(
 
                 ended_utc = datetime.now(timezone.utc).isoformat()
                 duration_ms = int((time.perf_counter() - t0) * 1000)
-                updates["run_log"] = state.get("run_log", []) + [{
+                updates["run_log"] = [{
                     "node": node_id,
                     "kind": spec.get("kind", "tool"),
                     "status": "error",
@@ -862,7 +871,7 @@ def build_graph_from_plan(
             artifacts["runtime_report_md_path"] = rt_md_path
 
         updates["artifacts"] = artifacts
-        updates["run_log"] = (state.get("run_log", []) or []) + [{
+        updates["run_log"] = [{
             "node": FINAL_NODE_ID,
             "kind": "final",
             "status": "ok",

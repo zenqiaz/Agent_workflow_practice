@@ -135,18 +135,26 @@ Recommended level of theory:
   Higher acc.  : opt B3LYP/def2-SVP → SP B3LYP/def2-TZVP
   Aqueous pKa  : use run_solvator_cluster_thermo (nsolv ≥ 3) for HA and A⁻
 
-Known systematic errors — gas-phase B3LYP/def2-SVP:
-  Computed pKa values are typically 2–4 units too HIGH vs. aqueous experiment.
-  Do NOT apply ad-hoc corrections in the plan; report raw computed value and
-  note the systematic offset in the final_report fields.
+Isodesmic calibration for alpha-CH pKa (REQUIRED for carbonyl alpha-H requests):
+  Gas-phase B3LYP/def2-SVP has a large systematic error vs. aqueous experiment
+  (~200–250 pKa units too high) due to missing solvation. Cancel this error
+  using ethanal (acetaldehyde, CH₃CHO) as a calibration reference:
 
-Calibration benchmarks (gas-phase B3LYP/def2-SVP, for sanity check):
-  Molecule      Exp. pKa(aq)   Typical computed gas-phase
-  HF               3.2              ~5–6
-  CH₃COOH          4.8              ~7–8
-  H₂O             15.7              ~18–20
-  NH₄⁺             9.2              ~11–12
-  HCl             −7               ~−4 to −5
+    Experimental alpha-CH pKa(ethanal, aq) = 17.0
+
+  Plan must include opt+freq nodes for ethanal HA and A⁻ (same level as targets).
+  Artifact names: G_ethanal_HA_eh, G_ethanal_A_minus_eh
+
+  In each per-compound pKa LLM node, include G_ethanal_HA_eh and
+  G_ethanal_A_minus_eh in needs_artifacts and apply:
+
+    ΔG_ref_eh  = G_ethanal_A_minus_eh + G_H_plus_ref_eh − G_ethanal_HA_eh
+    pKa_ref_calc = ΔG_ref_eh × 2625499.638 / (8.314462618 × 298.15 × 2.302585093)
+    epsilon    = pKa_ref_calc − 17.0          (systematic error to subtract)
+
+    ΔG_X_eh    = G_X_A_minus_eh + G_H_plus_ref_eh − G_X_HA_eh
+    pKa_X_raw  = ΔG_X_eh × 2625499.638 / (8.314462618 × 298.15 × 2.302585093)
+    pKa_X      = pKa_X_raw − epsilon          (calibrated pKa)
 
 Deprotonation step — structure_add_remove_proton:
   Use  mode="remove"  with the correct  site_selector  (STRING, not a dict).
@@ -1145,128 +1153,71 @@ class EASSkill(PlannerSkill):
 ────────────────────────────────────────────────────────────
 
 Goal: rank aromatic carbon sites by susceptibility to electrophilic attack.
-Two methods — choose based on accuracy need:
 
-══ Method A: NPA charges (fast, 1 SP per molecule) ════════════════════════
+IMPORTANT: NBO/NPA analysis is NOT available on this server (NBOEXE not set).
+Use Mulliken charges from run_sp_energy (always available, no extra keyword needed).
 
-  Step 1  opt → run_opt_job  (output_id: mol_opt)
-  Step 2  run_sp_energy(input_id: mol_opt, properties=["nbo"])
-          product: {"npa_charges_mol": "nbo_section"}
-  Step 3  llm node: extract NPA natural charges for each aromatic C from nbo_section;
-          sort ascending (most negative = highest electron density = most EAS-activated);
-          return JSON:
-            {"site_ranking": [{"atom_idx": N, "element": "C", "npa_charge": X, "rank": 1}, ...]}
-
-  Chemistry: EAS preferentially attacks the most negative-charge carbon.
-  Use for: single-ring aromatics, simple substituent effects (OH, NH2, Cl, NO2, CN).
-
-══ Method B: Fukui f⁻ index (rigorous, 2 parallel SP per molecule) ════════
+══ Method: Mulliken charges (1 SP per molecule, NO properties=["nbo"]) ═══
 
   Step 1  opt → run_opt_job  (output_id: mol_opt)
-  Step 2a run_sp_energy(input_id: mol_opt, charge=<neutral>, multiplicity=<neutral_mult>,
-                         properties=["nbo"])
-          product: {"npa_neutral_mol": "nbo_section"}
-  Step 2b run_sp_energy(input_id: mol_opt, charge=<neutral+1>, multiplicity=2,
-                         properties=["nbo"])          ← radical cation, remove 1 electron
-          product: {"npa_cation_mol": "nbo_section"}
-  Steps 2a/2b are parallel (both need: ["opt_node"]).
-  Step 3  llm node:
-            f_minus_k = q_neutral_k - q_cation_k   (NPA charges, per aromatic C)
-          Higher f⁻ = more electron density donated on ionisation = most EAS-activated.
+  Step 2  run_sp_energy(input_id: mol_opt)  ← NO properties needed
+          product: {"mulliken_mol": "mulliken_charges"}
+  Step 3  llm node: read mulliken_mol (list of {atom_index, symbol, charge});
+          filter to aromatic C (and heteroatoms) only;
+          sort by charge ascending (most negative = most EAS-activated);
           return JSON:
-            {"fukui_ranking": [{"atom_idx": N, "f_minus": X, "rank": 1}, ...]}
+            {"site_ranking": [{"atom_idx": N, "element": "C", "mulliken_charge": X, "rank": 1}, ...]}
 
-  Use for: polycyclics, heteroaromatics, cross-molecule comparisons.
+  Chemistry: EAS preferentially attacks the most electron-rich (most negative) carbon.
+  Mulliken charges are less absolute than NPA but correctly rank relative site reactivity
+  within a molecule and qualitatively across similar molecules.
 
 ══ Multi-molecule comparison ═══════════════════════════════════════════════
 
-  Run Method A or B for each molecule in parallel (separate opt → SP chains).
-  Final llm node (needs_artifacts: all npa_* or fukui_* keys):
+  Run Method above for each molecule (separate opt → SP chains).
+  Final llm node (needs_artifacts: all mulliken_* keys):
     compare most activated site per molecule, report cross-molecule ranking.
     product: {"eas_comparison": "comparison_table"}
 
 ══ Recommended settings ════════════════════════════════════════════════════
 
   method: B3LYP, basis: def2-SVP, use_ri: True
-  ncores: 1  (MPI unavailable); wall_timeout_seconds: 600 (SP+NBO is fast)
+  ncores: 1  (MPI unavailable); wall_timeout_seconds: 600
   Always optimize geometry before charge analysis.
 
-══ Parsing nbo_section in the llm node ════════════════════════════════════
+══ Parsing mulliken_charges in the llm node ═══════════════════════════════
 
-  Look for header:  "Summary of Natural Population Analysis:"
-  Line format:       Atom  No    Charge     Core   Valence   Rydberg    Total
-  Example:           C      1   -0.20123   1.99938  3.94879  0.25306   6.20123
-  NBO atom No is 1-based and matches the atom order in the XYZ geometry file.
-  Extract the Charge column for every C atom; ignore H, N, O etc. for ranking
-  (but note heteroatom charges for context).
+  The artifact is a JSON list of dicts:
+    [{"atom_index": 0, "symbol": "C", "charge": -0.037},
+     {"atom_index": 1, "symbol": "C", "charge":  0.019}, ...]
+  atom_index is 0-based (matches XYZ file order).
+  Filter by symbol to get only C (and N, S for heteroaromatics).
+  Sort by charge ascending for EAS ranking.
 
-══ Ring numbering: map NBO atom index → IUPAC ring position ═══════════════
+══ Required output format for the rank llm node ════════════════════════════
 
-  The NBO atom indices (1-based, XYZ order) are NOT necessarily the IUPAC numbers.
-  The llm node MUST convert them using the following rules:
+  Keep it simple — DO NOT attempt IUPAC mapping (no geometry available).
+  Just filter carbons, sort by charge, and return atom_index + charge.
 
-  Step A — identify the scaffold from the molecule name in context.
-  Step B — locate each aromatic C in the NBO atom list (by type and charge pattern).
-  Step C — assign IUPAC position number using the rule below.
-  Step D — group symmetry-equivalent positions (same IUPAC environment).
+  CRITICAL: the top-level JSON key MUST be exactly "site_ranking" (not "site_ranking_json"
+  or any other name). The product spec MUST use {"eas_sites_<mol>": "site_ranking"}.
 
-  IUPAC numbering rules for common ring systems:
-  ┌─────────────────────────────────────────────────────────────────┐
-  │ Monosubstituted benzene (toluene, aniline, nitrobenzene, etc.)  │
-  │   C1 = ipso (bears the substituent)                            │
-  │   C2, C6 = ortho  (equivalent by mirror symmetry)             │
-  │   C3, C5 = meta   (equivalent by mirror symmetry)             │
-  │   C4     = para                                                │
-  │   Unique sites: ipso(C1), ortho(C2), meta(C3), para(C4)       │
-  ├─────────────────────────────────────────────────────────────────┤
-  │ Naphthalene (and its mono-substituted derivatives)             │
-  │   Ring junction carbons: C4a, C8a (not reactive sites)        │
-  │   α positions: C1, C4, C5, C8 (adjacent to ring junction)     │
-  │   β positions: C2, C3, C6, C7 (not adjacent to junction)      │
-  │   Unsubstituted naphthalene: α ≡ β, two unique classes only   │
-  │   1-substituted: C1(ipso), C2(α), C3(β), C4(α),              │
-  │                  C5(β'), C6(α'), C7(β'), C8(α') — 7 sites     │
-  ├─────────────────────────────────────────────────────────────────┤
-  │ 1,2-disubstituted benzene (ortho): each C is unique (6 sites) │
-  │ 1,3-disubstituted (meta): C1=C3(ipso), C2(between), C4=C6,   │
-  │                            C5 — 4 unique sites                │
-  │ 1,4-disubstituted (para): C1=C4(ipso), C2=C3=C5=C6(non-ipso)│
-  └─────────────────────────────────────────────────────────────────┘
-
-══ Required output format for the llm ranking node ════════════════════════
-
-  Return JSON with per-site entries using IUPAC labels AND explicit ring numbers:
+  Return JSON:
   {
-    "molecule": "toluene",
-    "method": "NPA" or "Fukui_f-",
     "site_ranking": [
-      {
-        "iupac_position": "C4",
-        "label": "para",
-        "equivalent_atoms": [4],        ← 1-based NBO atom indices in this group
-        "npa_charge": -0.195,           ← representative value (average if equivalent)
-        "f_minus": null,                ← fill if Fukui was computed
-        "rank": 1                       ← 1 = most EAS-activated
-      },
-      {
-        "iupac_position": "C2/C6",
-        "label": "ortho",
-        "equivalent_atoms": [2, 6],
-        "npa_charge": -0.181,
-        "f_minus": null,
-        "rank": 2
-      },
+      {"atom_index": 2, "symbol": "C", "mulliken_charge": -0.180, "rank": 1},
+      {"atom_index": 3, "symbol": "C", "mulliken_charge": -0.172, "rank": 2},
       ...
     ]
   }
 
-  Key rules for the llm node:
-  • Merge symmetry-equivalent atoms into one entry; average their charges.
-  • Sort by npa_charge ascending (most negative first) or f_minus descending.
-  • Include ipso carbon even though it is not an EAS site (rank it last).
-  • Include ring-junction carbons (C4a, C8a in naphthalene) as "junction — not reactive".
-  • Use the molecule name from the user request to identify the scaffold;
-    if ambiguous, state the assumed numbering convention explicitly.
+  Key rules:
+  • "site_ranking" is the ONLY required top-level key — do NOT wrap in "values" or "molecule".
+  • Include ALL carbon atoms (and heteroatoms if relevant).
+  • Sort by mulliken_charge ascending (most negative = rank 1 = most EAS-activated).
+  • DO NOT invent IUPAC positions — only use atom_index from the input list.
+  • The final compare node will handle cross-molecule interpretation.
+  • Product spec for each rank node: {"eas_sites_<mol>": "site_ranking"}
 """.strip()
 
 

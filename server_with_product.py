@@ -61,8 +61,29 @@ def extract_total_energy(output_text: str) -> Optional[float]:
 
 
 def extract_nbo_section(output_text: str) -> str:
-    # Very conservative: return a chunk containing "NBO" and "NPA"/"NATURAL POPULATIONS"
+    """Return the NPA/NBO section from ORCA output.
+
+    Priority 1: "Summary of Natural Population Analysis:" block (has per-atom NPA charges).
+    Priority 2: First "NBO ANALYSIS" / "NATURAL POPULATIONS" marker + 600 lines.
+    Fallback:   Last 200 lines.
+    """
     lines = output_text.splitlines()
+
+    # Priority 1: find the NPA charges summary table
+    npa_start = None
+    for i, line in enumerate(lines):
+        u = line.upper()
+        if "SUMMARY OF NATURAL POPULATION ANALYSIS" in u or (
+            "NATURAL POPULATION ANALYSIS" in u and "SUMMARY" in u
+        ):
+            npa_start = i
+            break
+
+    if npa_start is not None:
+        # Include up to 150 lines — enough for the atom charges table
+        return "\n".join(lines[npa_start : min(len(lines), npa_start + 150)])
+
+    # Priority 2: first NBO/NPA section header
     start = None
     for i, line in enumerate(lines):
         u = line.upper()
@@ -70,11 +91,10 @@ def extract_nbo_section(output_text: str) -> str:
             start = i
             break
     if start is None:
-        # fallback: last 200 lines (better than empty)
         return "\n".join(lines[-200:])
 
-    # take a window after start
-    return "\n".join(lines[start : min(len(lines), start + 400)])
+    # Wider window to capture the NPA table that comes after the header
+    return "\n".join(lines[start : min(len(lines), start + 800)])
 
 
 def extract_final_geometry_from_out(output_text: str) -> str:
@@ -390,6 +410,34 @@ def extract_dipole_moment(output_text: str) -> Optional[float]:
     for m in pat.finditer(output_text):
         result = float(m.group(1))  # keep last occurrence
     return result
+
+
+def extract_mulliken_charges(output_text: str) -> List[Dict]:
+    """Parse MULLIKEN ATOMIC CHARGES block from ORCA output.
+
+    Returns list of {atom_index, symbol, charge} dicts, one per heavy atom.
+    Lines look like:    0 C  :    -0.037265
+    """
+    lines = output_text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if "MULLIKEN ATOMIC CHARGES" in line.upper():
+            start = i
+    if start is None:
+        return []
+    charges = []
+    pat = re.compile(r'^\s*(\d+)\s+([A-Za-z]+)\s*:\s*([-\d.]+)')
+    for line in lines[start + 2 :]:
+        m = pat.match(line)
+        if m:
+            charges.append({
+                "atom_index": int(m.group(1)),
+                "symbol":     m.group(2),
+                "charge":     float(m.group(3)),
+            })
+        elif line.strip() == "" or "SUM" in line.upper():
+            break
+    return charges
 
 
 def extract_homo_lumo_gap(output_text: str) -> Optional[float]:
@@ -1196,6 +1244,7 @@ async def run_sp_energy(
         "energy_eh":          extract_total_energy(out_text),
         "dipole_moment_debye": extract_dipole_moment(out_text),
         "homo_lumo_gap_ev":   extract_homo_lumo_gap(out_text),
+        "mulliken_charges":   extract_mulliken_charges(out_text),
         "product":            "energy_eh",
     }
     if "nbo" in props:
