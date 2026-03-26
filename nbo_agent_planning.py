@@ -297,6 +297,40 @@ async def identify_and_confirm_compounds(
     return confirmed
 
 
+def _build_mcp_server_params():
+    """Build StdioServerParameters for the MCP server.
+
+    MCP_MODE=local  — spawn server_with_product.py as a local subprocess (no SSH).
+                      Set MCP_SERVER_CMD to override the default 'python server_with_product.py'.
+    MCP_MODE=ssh    — (default) connect via SSH, controlled by MCP_SSH_BIN/KEY/HOST/SERVER_CMD.
+    """
+    from mcp import StdioServerParameters
+    _mode = os.getenv("MCP_MODE", "ssh").strip().lower()
+    if _mode == "local":
+        _cmd = os.getenv("MCP_SERVER_CMD", "python server_with_product.py")
+        parts = _cmd.split()
+        return StdioServerParameters(
+            command=parts[0],
+            args=parts[1:],
+            env=dict(os.environ),
+        )
+    # ssh mode (default)
+    _ssh_bin  = os.getenv("MCP_SSH_BIN",  "ssh")
+    _ssh_key  = os.getenv("MCP_SSH_KEY",  "C:/Users/zrqrc/.ssh/droplet1")
+    _ssh_host = os.getenv("MCP_SSH_HOST", "root@188.166.232.163")
+    _ssh_cmd  = os.getenv(
+        "MCP_SERVER_CMD",
+        "source ~/venvs/QCagent/bin/activate && cd /root/nbo_agent && "
+        "PATH=/root/ORCA/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg:$PATH python server_with_product.py",
+    )
+    return StdioServerParameters(
+        command=_ssh_bin,
+        args=["-i", _ssh_key, "-o", "StrictHostKeyChecking=no",
+              "-o", "BatchMode=yes", _ssh_host, _ssh_cmd],
+        env=dict(os.environ),  # MCP's default env filter strips vars SSH needs
+    )
+
+
 async def main():
     parser = argparse.ArgumentParser(description="QC Agent REPL")
     parser.add_argument(
@@ -314,20 +348,7 @@ async def main():
     args = parser.parse_args()
     compound_mode: str = args.compound_mode
 
-    _mcp_ssh_bin  = os.getenv("MCP_SSH_BIN",  "ssh")
-    _mcp_ssh_key  = os.getenv("MCP_SSH_KEY",  "C:/Users/zrqrc/.ssh/droplet1")
-    _mcp_ssh_host = os.getenv("MCP_SSH_HOST", "root@188.166.232.163")
-    _mcp_server_cmd = os.getenv(
-        "MCP_SERVER_CMD",
-        "source ~/venvs/QCagent/bin/activate && cd /root/nbo_agent && "
-        "PATH=/root/ORCA/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg:$PATH python server_with_product.py",
-    )
-    server_params = StdioServerParameters(
-        command=_mcp_ssh_bin,
-        args=["-i", _mcp_ssh_key, "-o", "StrictHostKeyChecking=no",
-              "-o", "BatchMode=yes", _mcp_ssh_host, _mcp_server_cmd],
-        env=dict(os.environ),  # MCP's default env filter strips vars SSH needs
-    )
+    server_params = _build_mcp_server_params()
 
     _client_kwargs = {"base_url": _LLM_BASE_URL} if _LLM_BASE_URL else {}
     client = OpenAI(**_client_kwargs)

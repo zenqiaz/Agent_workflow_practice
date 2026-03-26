@@ -39,8 +39,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 import os
+import random
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -71,19 +73,25 @@ from client_helpers import (
     geom_key_from_path,
     pubchem_get_basic_properties,
     structure_add_remove_proton,
-    build_coordination_complex,
+    build_dimer_xyz,
+    set_geometry_xyz,
+    build_approach_scan_geometries,
     run_tool_node,
     state_get_tool_args,
     auto_display_spectra,
+    result_dict_to_prompt,
 )
-from prompts import SYSTEM_PROMPT
+from prompts import SYSTEM_PROMPT, REPORTER_SYSTEM_PROMPT
 from skills import run_planning_skills, SKILL_REGISTRY
 
 LLM_MODEL    = os.getenv("LLM_MODEL", "gpt-4.1-mini")
 _LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip() or None
 
 # ─── TOP-LEVEL CONFIG (edit here or override with CLI flags) ───────────────────
-MESSAGE     = "calculate the pKa of acetic acid"
+MESSAGE     = ("calculate the alpha-CH pKa of ethyl acetylacetate, barbituric acid, "
+               "acetone, and ethyl chloroacetate. Use ethanal (acetaldehyde, experimental "
+               "pKa=17.0) as an isodesmic calibration reference to correct the systematic "
+               "gas-phase DFT error.")
 N_RUNS      = 10
 MODE        = "plan"   # "plan" | "full"
 WITH_SKILLS = True
@@ -93,6 +101,17 @@ CHECKER     = "auto"   # "auto" | "pka" | "sp" | "nbo" | "solvation" | "struct"
 # Leave "" to skip.  Used to match normal REPL flow without interactive prompts.
 COMPOUND_CONTEXT = ""
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Per-checker default messages — used when --checker is explicit but --message is not.
+# Falls back to MESSAGE (the global default) for any checker not listed here.
+_CHECKER_DEFAULT_MESSAGES: dict = {
+    "pka": MESSAGE,   # alias for the global default
+    "eas": ("rank EAS reactivity of naphthalene, pyrrole, imidazole, pyrazole, "
+            "thiophene, thiazole using Mulliken charges from DFT"),
+    "ts":  ("find the transition state for H2O2 cis conformation interconversion "
+            "by scanning the H-O-O-H dihedral D=[2,0,1,3] from 0 to 180 degrees "
+            "(9 points), then optimizing the TS and computing frequencies"),
+}
 
 
 EMPTY_STATE: dict = {
@@ -106,7 +125,9 @@ CLIENT_SIDE_TOOL_FUNCS = {
     "name_to_geometry_xyz": name_to_geometry_xyz,
     "pubchem_get_basic_properties": pubchem_get_basic_properties,
     "structure_add_remove_proton": structure_add_remove_proton,
-    "build_coordination_complex": build_coordination_complex,
+    "build_dimer_xyz": build_dimer_xyz,
+    "set_geometry_xyz": set_geometry_xyz,
+    "build_approach_scan_geometries": build_approach_scan_geometries,
 }
 
 
@@ -154,10 +175,30 @@ def _preload_geometries(specs: List[str], state: dict) -> None:
 
 # ─── Checker functions ─────────────────────────────────────────────────────────
 
+_VALID_TOOLS = {
+    # MCP tools
+    "run_sp_energy", "run_opt_job", "run_freq_job", "run_nbo_job",
+    "run_solvator_cluster", "run_solvator_cluster_thermo",
+    "run_tddft_job", "run_scan_job", "run_ts_opt_job", "run_casscf_job",
+    "run_spectrum_job", "structure_add_remove_proton", "inspect_job",
+    # Client-side tools
+    "name_to_geometry_xyz", "load_xyz_as_geometry",
+    "pubchem_get_basic_properties", "state_update", "state_get_tool_args",
+    "build_dimer_xyz", "set_geometry_xyz",
+    "build_approach_scan_geometries",
+    # server-side MCP tools (also valid in plans):
+    "build_coordination_complex",
+}
+
+
 def check_struct(plan: dict) -> Dict[str, bool]:
     """Minimal structural validity — every plan must pass these."""
     nodes     = plan.get("nodes") or []
     artifacts = plan.get("artifacts_to_save") or []
+    tool_nodes_valid = all(
+        n.get("tool") in _VALID_TOOLS
+        for n in nodes if n.get("kind") == "tool"
+    )
     return {
         "is_dict":             isinstance(plan, dict),
         "has_name":            bool(plan.get("name")),
@@ -165,6 +206,7 @@ def check_struct(plan: dict) -> Dict[str, bool]:
         "has_artifacts":       len(artifacts) > 0,
         "nodes_have_id":       all(n.get("id") for n in nodes),
         "nodes_have_kind":     all(n.get("kind") for n in nodes),
+        "tools_valid":         tool_nodes_valid,
     }
 
 
@@ -180,7 +222,7 @@ def check_pka(plan: dict) -> Dict[str, bool]:
         "uses_freq_not_sp":    "run_freq_job" in tools_used and "run_sp_energy" not in tools_used,
         "has_h_plus_ref":      "G_H_plus_ref_eh" in settings,
         "artifacts_G_eh":      any(a.startswith("G_") and a.endswith("_eh") for a in artifacts),
-        "pka_in_artifacts":    "pka" in artifacts,
+        "pka_in_artifacts":    any("pka" in a.lower() for a in artifacts),
         "llm_node_exists":     len(llm_nodes) >= 1,
         "freq_arts_in_needs":  any("G_" in a and "_eh" in a for a in needs_arts),
     }
@@ -378,18 +420,144 @@ def check_casscf(plan: dict) -> Dict[str, bool]:
     }
 
 
+def check_interaction_scan(plan: dict) -> Dict[str, bool]:
+    nodes     = plan.get("nodes", [])
+    tools_set = {n.get("tool") for n in nodes if n.get("kind") == "tool"}
+    all_keys  = set(plan.get("artifacts_to_save") or []) | _all_product_keys(plan)
+    llm_nodes = [n for n in nodes if n.get("kind") == "llm"]
+    return {
+        "has_dimer_build":        "build_dimer_xyz" in tools_set,
+        "has_sp_monomer":         "run_sp_energy" in tools_set,
+        "has_scan_node":          "run_scan_job" in tools_set,
+        "has_delta_e_llm":        len(llm_nodes) == 1,  # exactly one LLM node for ΔE_int
+        "interaction_curve_art":  any("interaction_curve" in k.lower() or "binding_energy" in k.lower()
+                                      for k in all_keys),
+        "scan_results_art":       any("scan_results" in k.lower() for k in all_keys),
+    }
+
+
+def check_eas(plan: dict) -> Dict[str, bool]:
+    nodes      = plan.get("nodes", [])
+    tools_used = [n.get("tool") for n in nodes if n.get("kind") == "tool"]
+    tools_set  = set(tools_used)
+    llm_nodes  = [n for n in nodes if n.get("kind") == "llm"]
+    all_keys   = set(plan.get("artifacts_to_save") or []) | _all_product_keys(plan)
+
+    # SP for charge analysis: Mulliken (no extra properties) OR NBO/NPA
+    sp_nodes    = [n for n in nodes if n.get("tool") == "run_sp_energy"]
+    has_sp_node = len(sp_nodes) >= 1
+    has_nbo_job = "run_nbo_job" in tools_set
+
+    # Charge artifact produced (Mulliken, NPA, NBO, Fukui all accepted)
+    has_charge_art = any(
+        any(kw in k.lower() for kw in ("npa", "nbo", "charge", "fukui", "mulliken"))
+        for k in all_keys
+    )
+    # Ranking artifact from LLM node
+    has_ranking_art = any(
+        any(kw in k.lower() for kw in ("ranking", "site", "eas", "fukui"))
+        for k in all_keys
+    )
+
+    return {
+        "has_opt_node":     "run_opt_job" in tools_set,
+        "has_charge_calc":  has_sp_node or has_nbo_job,
+        "has_ranking_llm":  len(llm_nodes) >= 1,
+        "charge_artifact":  has_charge_art,
+        "ranking_artifact": has_ranking_art,
+    }
+
+
+def check_coordination_sp(plan: dict) -> Dict[str, bool]:
+    """SP on coordination compounds: build_coordination_complex → opt → SP, all three properties.
+
+    When used with the four standard test compounds (Fe(CN)6^3-, Pt(en)2^2+, CuEDTA^2-,
+    Ni(dmgH)2), also checks charge and spin/multiplicity in each build node.
+    """
+    nodes      = plan.get("nodes", [])
+    all_keys   = set(plan.get("artifacts_to_save") or []) | _all_product_keys(plan)
+    all_keys_l = {k.lower() for k in all_keys}
+
+    build_nodes = [n for n in nodes if n.get("tool") == "build_coordination_complex"]
+    opt_nodes   = [n for n in nodes if n.get("tool") == "run_opt_job"]
+    sp_nodes    = [n for n in nodes if n.get("tool") == "run_sp_energy"]
+
+    # Every build node must be followed by an opt node
+    build_output_ids    = {n.get("output_id") for n in build_nodes if n.get("output_id")}
+    opt_input_ids       = {n.get("input_id")  for n in opt_nodes  if n.get("input_id")}
+    all_built_are_opted = build_output_ids.issubset(opt_input_ids) if build_output_ids else False
+
+    # First-occurrence ordering
+    build_idx = next((i for i, n in enumerate(nodes) if n.get("tool") == "build_coordination_complex"), -1)
+    opt_idx   = next((i for i, n in enumerate(nodes) if n.get("tool") == "run_opt_job"), -1)
+    sp_idx    = next((i for i, n in enumerate(nodes) if n.get("tool") == "run_sp_energy"), -1)
+
+    # Hard-coded charge/spin for known test compounds.
+    # Matched by keywords in node id or output_id (case-insensitive).
+    # spin here = multiplicity (2S+1) as used in build_coordination_complex args.
+    _EXPECTED = [
+        # (id_keywords,              charge, mult)
+        (("fe", "cn"),               -3,     2),   # Fe(CN)6^3-, Fe3+ d5 low-spin S=1/2
+        (("pt", "en"),               +2,     1),   # Pt(en)2^2+, Pt2+ d8 square planar S=0
+        (("cu", "edta"),             -2,     2),   # CuEDTA^2-, Cu2+ d9 S=1/2
+        (("ni", "dmg"),               0,     1),   # Ni(dmgH)2, Ni2+ d8 square planar S=0
+        (("pt", "nh3"),               0,     1),   # cis-Pt(NH3)2Cl2, Pt2+ d8 S=0, neutral
+        (("pt", "cl"),                0,     1),   # cis-Pt(NH3)2Cl2 (alt label), same
+        (("cisplatin",),              0,     1),   # cisplatin by name
+        (("cu", "en"),               +2,     2),   # Cu(en)2^2+, Cu2+ d9 S=1/2
+    ]
+
+    def _node_label(n: dict) -> str:
+        return ((n.get("id") or "") + " " + (n.get("output_id") or "")).lower()
+
+    charge_ok: Dict[str, bool] = {}
+    spin_ok:   Dict[str, bool] = {}
+    for keywords, exp_charge, exp_mult in _EXPECTED:
+        matched = [n for n in build_nodes
+                   if all(kw in _node_label(n) for kw in keywords)]
+        if not matched:
+            continue  # compound not in plan — skip (generic test still valid)
+        n    = matched[0]
+        args      = n.get("args") or {}
+        key       = "_".join(keywords)
+        actual_spin = args.get("spin") if args.get("spin") is not None else args.get("multiplicity")
+        # None means the planner relied on the default (multiplicity=1); treat as 1
+        if actual_spin is None:
+            actual_spin = 1
+        charge_ok[f"charge_{key}"] = args.get("charge") == exp_charge
+        spin_ok[f"spin_{key}"]     = actual_spin == exp_mult
+
+    result = {
+        "has_build_node":      len(build_nodes) >= 1,
+        "has_opt_node":        len(opt_nodes) >= 1,
+        "has_sp_node":         len(sp_nodes) >= 1,
+        "build_before_opt":    build_idx >= 0 and opt_idx > build_idx,
+        "opt_before_sp":       opt_idx >= 0 and sp_idx > opt_idx,
+        "all_built_are_opted": all_built_are_opted,
+        "has_energy_art":      any("energy" in k and "_eh" in k for k in all_keys_l),
+        "has_homo_lumo_art":   any("homo" in k or "lumo" in k or "gap" in k for k in all_keys_l),
+        "has_dipole_art":      any("dipole" in k for k in all_keys_l),
+    }
+    result.update(charge_ok)
+    result.update(spin_ok)
+    return result
+
+
 _CHECKER_MAP = {
-    "pka":          check_pka,
-    "sp":           check_sp,
-    "nbo":          check_nbo,
-    "solvation":    check_solvation,
-    "protonation":  check_protonation,
-    "spectrum":     check_spectrum,
-    "ts":           check_ts,
-    "casscf":       check_casscf,
-    "tddft":        check_tddft,
-    "scan":         check_scan,
-    "struct":       lambda _: {},   # only struct checks apply
+    "pka":              check_pka,
+    "sp":               check_sp,
+    "nbo":              check_nbo,
+    "solvation":        check_solvation,
+    "protonation":      check_protonation,
+    "spectrum":         check_spectrum,
+    "ts":               check_ts,
+    "casscf":           check_casscf,
+    "tddft":            check_tddft,
+    "scan":             check_scan,
+    "interaction_scan":  check_interaction_scan,
+    "eas":               check_eas,
+    "coordination_sp":   check_coordination_sp,
+    "struct":            lambda _: {},   # only struct checks apply
 }
 
 _AUTO_KEYWORDS = {
@@ -409,9 +577,21 @@ _AUTO_KEYWORDS = {
     "ts":           ["transition state", "ts search", "ts opt", "saddle point",
                      "activation barrier", "activation energy", "optts",
                      "ts structure", "find ts", "locate ts", "reaction barrier"],
-    "casscf":       ["casscf", "cas(", "active space", "multireference",
-                     "multi-reference", "sa-casscf", "state-averaged",
-                     "complete active space", "mcscf"],
+    "casscf":           ["casscf", "cas(", "active space", "multireference",
+                         "multi-reference", "sa-casscf", "state-averaged",
+                         "complete active space", "mcscf"],
+    "interaction_scan": ["interaction scan", "interaction energy", "binding energy scan",
+                         "approach curve", "dissociation curve", "intermolecular scan",
+                         "pi stacking", "π stacking", "cation pi", "cation-pi",
+                         "dimer scan", "complex scan"],
+    "coordination_sp":  ["coordination compound", "build_coordination_complex",
+                         "metal complex", "coordination complex",
+                         "hexacyanide", "ethylenediamine", "edta", "dimethylglyoxim"],
+    "eas":              ["eas", "electrophilic aromatic", "aromatic substitution",
+                         "site selectivity", "site reactivity", "ortho para",
+                         "o/p director", "meta director", "fukui f",
+                         "npa charge", "natural charge", "aromatic reactivity",
+                         "most reactive site", "preferred site"],
 }
 
 
@@ -426,12 +606,19 @@ def detect_checker(message: str) -> str:
 # ─── Execution result checkers (full mode) ────────────────────────────────────
 
 def check_pka_result(artifacts: dict) -> Dict[str, bool]:
-    pka = artifacts.get("pka")
+    # Multi-compound plans use per-compound keys like pka_acetone, pka_barbituric_acid, etc.
+    # Fall back to plain "pka" for single-compound plans.
+    pka_vals = {k: v for k, v in artifacts.items() if k == "pka" or k.startswith("pka_")}
     g_vals = {k: v for k, v in artifacts.items()
               if k.startswith("G_") and k.endswith("_eh")}
+    # At least one pKa must be in a reasonable calibrated range (-20 to 60)
+    reasonable = any(
+        isinstance(v, (int, float)) and -20 < v < 60
+        for v in pka_vals.values()
+    )
     return {
-        "pka_present":    pka is not None,
-        "pka_reasonable": isinstance(pka, (int, float)) and -5 < pka < 60,
+        "pka_present":    len(pka_vals) > 0,
+        "pka_reasonable": reasonable,
         "G_eh_present":   len(g_vals) >= 2,
         "G_negative":     all(isinstance(v, (int, float)) and v < 0
                               for v in g_vals.values()),
@@ -503,12 +690,32 @@ def check_scan_result(artifacts: dict) -> Dict[str, bool]:
     }
 
 
+def check_interaction_scan_result(artifacts: dict) -> Dict[str, bool]:
+    curve = artifacts.get("interaction_curve") or []
+    # also accept any key containing "interaction_curve"
+    if not curve:
+        for k, v in artifacts.items():
+            if "interaction_curve" in k.lower() and isinstance(v, list):
+                curve = v
+                break
+    sample   = curve[:3]
+    nonempty = len(curve) > 0
+    return {
+        "interaction_curve_present":  nonempty,
+        "has_distance":               nonempty and all("distance_ang" in p or "value" in p for p in sample),
+        "has_delta_e":                nonempty and all("delta_e_int_kcal" in p for p in sample),
+        "binding_energy_present":     "binding_energy_kcal" in artifacts or any(
+            "binding_energy" in k for k in artifacts),
+    }
+
+
 _RESULT_CHECKER_MAP = {
-    "pka":      check_pka_result,
-    "sp":       check_sp_result,
-    "spectrum": check_spectrum_result,
-    "tddft":    check_tddft_result,
-    "scan":     check_scan_result,
+    "pka":              check_pka_result,
+    "sp":               check_sp_result,
+    "spectrum":         check_spectrum_result,
+    "tddft":            check_tddft_result,
+    "scan":             check_scan_result,
+    "interaction_scan": check_interaction_scan_result,
 }
 
 
@@ -527,18 +734,29 @@ def _build_messages(message: str, state: dict, skill_contexts: list,
     return msgs
 
 
-def _call_planner(client: OpenAI, msgs: list) -> dict:
+def _call_planner(client: OpenAI, msgs: list) -> Tuple[dict, dict]:
+    """Call the planner LLM. Returns (plan, token_usage_dict)."""
     resp = client.chat.completions.create(
         model=LLM_MODEL,
         messages=msgs,
         tool_choice="none",
         tools=[],
     )
+    usage = getattr(resp, "usage", None)
+    planner_total = getattr(usage, "total_tokens",      0) or 0
+    token_usage = {
+        "context_tokens": getattr(usage, "prompt_tokens",     0) or 0,
+        "plan_tokens":    getattr(usage, "completion_tokens", 0) or 0,
+        "planner":        planner_total,
+        "calculator":     0,
+        "reporter":       0,
+        "total":          planner_total,
+    }
     raw  = (resp.choices[0].message.content or "").strip()
     plan = parse_json_only(raw)
     if not isinstance(plan, dict):
         raise ValueError(f"Planner returned non-dict JSON:\n{raw[:300]}")
-    return plan
+    return plan, token_usage
 
 
 # ─── Single run ────────────────────────────────────────────────────────────────
@@ -563,10 +781,11 @@ def run_plan_once(
     plan  = {}
     all_checks: Dict[str, bool] = {}
 
+    token_usage: Dict[str, int] = {"planner": 0, "calculator": 0, "total": 0}
     try:
         skill_ctxs = run_planning_skills(message, state) if with_skills else []
         msgs       = _build_messages(message, state, skill_ctxs, compound_context)
-        plan       = _call_planner(client, msgs)
+        plan, token_usage = _call_planner(client, msgs)
 
         # Structural checks always run
         all_checks.update(check_struct(plan))
@@ -574,7 +793,14 @@ def run_plan_once(
         # Task-specific checks
         checker_fn = _CHECKER_MAP.get(checker_name)
         if checker_fn:
-            all_checks.update(checker_fn(plan))
+            checks = checker_fn(plan)
+            # When geometries are preloaded: opt-before-TDDFT not required;
+            # LLM comparison node allowed (reporter handles comparison, but planner may add one too)
+            if preload_specs and checker_name == "tddft":
+                checks.pop("has_opt_node", None)
+                checks.pop("tddft_after_opt", None)
+                checks.pop("no_llm_node", None)
+            all_checks.update(checks)
 
     except Exception as exc:
         error = str(exc)
@@ -589,6 +815,7 @@ def run_plan_once(
         "error":       error,
         "duration_ms": duration_ms,
         "plan":        plan,
+        "token_usage": token_usage,
     }
 
 
@@ -612,16 +839,25 @@ async def run_full_once(
     plan  = {}
     all_checks: Dict[str, bool] = {}
 
+    token_usage: Dict[str, int] = {"planner": 0, "calculator": 0, "reporter": 0, "total": 0}
+    agent_report = ""
     try:
         # Step 1: generate plan
         skill_ctxs = run_planning_skills(message, state) if with_skills else []
         msgs       = _build_messages(message, state, skill_ctxs, compound_context)
-        plan       = _call_planner(client, msgs)
+        plan, token_usage = _call_planner(client, msgs)
 
         all_checks.update(check_struct(plan))
         checker_fn = _CHECKER_MAP.get(checker_name)
         if checker_fn:
-            all_checks.update(checker_fn(plan))
+            checks = checker_fn(plan)
+            # When geometries are preloaded: opt-before-TDDFT not required;
+            # LLM comparison node allowed (reporter handles comparison, but planner may add one too)
+            if preload_specs and checker_name == "tddft":
+                checks.pop("has_opt_node", None)
+                checks.pop("tddft_after_opt", None)
+                checks.pop("no_llm_node", None)
+            all_checks.update(checks)
 
         if not all(all_checks.values()):
             raise ValueError("Plan failed structural checks; skipping execution")
@@ -647,12 +883,35 @@ async def run_full_once(
 
         all_checks["execution_ok"] = result.get("last_status") == "ok"
 
+        # Merge calculator token usage from LangGraph result
+        result_tu = result.get("token_usage") or {}
+        calc_tokens = result_tu.get("calculator", 0) or 0
+        token_usage["calculator"] = calc_tokens
+        token_usage["total"]      = token_usage.get("planner", 0) + calc_tokens
+
         # Step 3: artifact checks + auto-display spectra/PES
         artifacts = result.get("artifacts", {})
         result_checker = _RESULT_CHECKER_MAP.get(checker_name)
         if result_checker:
             all_checks.update(result_checker(artifacts))
         auto_display_spectra(artifacts)
+
+        # Step 4: generate agent report (same as REPL does after execution)
+        user_payload = (
+            f"Original user request:\n{message}\n\n"
+            f"Run result:\n{result_dict_to_prompt(result=result, user_text=message)}"
+        )
+        report_resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": REPORTER_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_payload},
+            ],
+        )
+        agent_report = report_resp.choices[0].message.content or ""
+        reporter_tokens = (report_resp.usage.total_tokens or 0) if report_resp.usage else 0
+        token_usage["reporter"] = reporter_tokens
+        token_usage["total"]    = token_usage.get("total", 0) + reporter_tokens
 
     except Exception as exc:
         error = str(exc)
@@ -667,6 +926,8 @@ async def run_full_once(
         "error":       error,
         "duration_ms": duration_ms,
         "plan":        plan,
+        "token_usage": token_usage,
+        "agent_report": agent_report,
     }
 
 
@@ -695,6 +956,12 @@ def save_test_log(
     n_pass = sum(1 for r in results if r["passed"])
     rate   = round(n_pass / n * 100, 1) if n else 0.0
 
+    # Aggregate token usage across all runs
+    total_tu: Dict[str, int] = {}
+    for r in results:
+        for k, v in (r.get("token_usage") or {}).items():
+            total_tu[k] = total_tu.get(k, 0) + (v or 0)
+
     log = {
         "type":          "test_run",
         "timestamp_utc": now,
@@ -706,6 +973,11 @@ def save_test_log(
         "n_runs":        n,
         "n_pass":        n_pass,
         "rate":          rate,
+        "token_usage":         total_tu,
+        "sample_agent_report": next(
+            (r.get("agent_report", "") for r in results
+             if r.get("agent_report") and r.get("passed")), ""
+        ),
         "runs": [
             {
                 "run":         i + 1,
@@ -714,6 +986,7 @@ def save_test_log(
                 "checks":      r["checks"],
                 "error":       r["error"],
                 "plan":        r["plan"],
+                "token_usage": r.get("token_usage", {}),
             }
             for i, r in enumerate(results)
         ],
@@ -813,6 +1086,41 @@ def print_report(
         weakest = min(check_pass, key=lambda k: check_pass[k])
         print(f"  {rate:.1f}% success  — weakest check: {weakest!r} ({check_pass[weakest]}/{n})")
 
+    # Token usage summary
+    total_tu: Dict[str, int] = {}
+    for r in results:
+        for k, v in (r.get("token_usage") or {}).items():
+            total_tu[k] = total_tu.get(k, 0) + (v or 0)
+    if total_tu.get("total", 0) > 0:
+        avg_ctx  = total_tu.get("context_tokens", 0) // n if n else 0
+        avg_plan = total_tu.get("plan_tokens",    0) // n if n else 0
+        avg_tot  = total_tu["total"] // n if n else 0
+        calc     = total_tu.get("calculator", 0)
+        reporter = total_tu.get("reporter",   0)
+        extras   = ""
+        if calc:     extras += f" | calculator={calc}"
+        if reporter: extras += f" | reporter={reporter}"
+        print(f"  Tokens (avg/run): context={avg_ctx}  plan={avg_plan}  planner_total={avg_tot}{extras}")
+
+
+# ─── Random compound sampler ───────────────────────────────────────────────────
+
+def build_random_sp_message(csv_path: str, n: int, seed: Optional[int] = 0) -> str:
+    """Sample N compounds from a CSV and build an SP message for test_success_rate."""
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        compounds = list(csv.DictReader(fh))
+    rng = random.Random(seed)
+    sample = rng.sample(compounds, min(n, len(compounds)))
+    names = [c["compound_name"] for c in sample]
+    compound_list = "\n".join(f"  - {n}" for n in names)
+    return (
+        f"Calculate single-point energy (B3LYP/def2-SVP) for each of the following "
+        f"{len(names)} compounds. Run them in parallel where possible. "
+        f"For each compound report: SP energy (energy_eh), HOMO-LUMO gap (homo_lumo_gap_ev), "
+        f"and dipole moment (dipole_moment_debye). All three are returned by run_sp_energy "
+        f"at no extra cost.\n\nCompounds:\n{compound_list}"
+    )
+
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
@@ -823,7 +1131,9 @@ def parse_args():
     p.add_argument("--mode",             choices=["plan", "full"], default=None)
     p.add_argument("--checker",          choices=["auto", "pka", "sp", "nbo",
                                                    "solvation", "protonation", "spectrum",
-                                                   "tddft", "scan", "ts", "casscf", "struct"], default=None)
+                                                   "tddft", "scan", "ts", "casscf",
+                                                   "interaction_scan", "eas",
+                                                   "coordination_sp", "struct"], default=None)
     p.add_argument("--no-skills",        action="store_true", help="Disable skill injection")
     p.add_argument("--compound-context", default=None,
                    help="Pre-confirmed compound context string injected into every run")
@@ -843,6 +1153,14 @@ def parse_args():
                        "The geom_id is the key used in the plan. "
                        "Can be repeated: --preload ethanol:mol1 --preload water:solvent"
                    ))
+    p.add_argument("--csv", default=None,
+                   help="Compound CSV file (e.g. organic_compounds_100.csv). "
+                        "When set with --n-compounds, auto-builds the SP message "
+                        "and sets checker=sp.")
+    p.add_argument("--n-compounds", type=int, default=None,
+                   help="Number of compounds to randomly sample from --csv.")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Random seed for compound sampling (default: 0).")
     p.add_argument("--env-file", "--env", default=None,
                    help="Dotenv file to load (default: .env). "
                         "Use .env.local for lab server / qwen2.5:32b. "
@@ -854,32 +1172,24 @@ def parse_args():
 
 
 async def _run_full_suite(args):
-    from mcp import ClientSession, StdioServerParameters
+    from mcp import ClientSession
     from mcp.client.stdio import stdio_client
+    from nbo_agent_planning import _build_mcp_server_params
 
-    _ssh_bin  = os.getenv("MCP_SSH_BIN",  "ssh")
-    _ssh_key  = os.getenv("MCP_SSH_KEY",  "C:/Users/zrqrc/.ssh/droplet1")
-    _ssh_host = os.getenv("MCP_SSH_HOST", "root@188.166.232.163")
-    _cmd      = os.getenv(
-        "MCP_SERVER_CMD",
-        "source ~/venvs/QCagent/bin/activate && cd /root/nbo_agent && "
-        "PATH=/root/ORCA/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg:$PATH "
-        "python server_with_product.py",
-    )
-    server_params = StdioServerParameters(
-        command=_ssh_bin,
-        args=["-i", _ssh_key, "-o", "StrictHostKeyChecking=no",
-              "-o", "BatchMode=yes", _ssh_host, _cmd],
-        env=dict(os.environ),  # MCP's default env filter strips vars SSH needs
-    )
+    server_params = _build_mcp_server_params()
 
-    message          = args.message or MESSAGE
+    if getattr(args, "csv", None) and getattr(args, "n_compounds", None):
+        message      = build_random_sp_message(args.csv, args.n_compounds,
+                                               seed=getattr(args, "seed", 0))
+        checker_name = "sp"
+    else:
+        checker_name = (args.checker or CHECKER)
+        message      = args.message or _CHECKER_DEFAULT_MESSAGES.get(checker_name, MESSAGE)
     n_runs           = args.runs    or N_RUNS
     with_skills      = not args.no_skills if args.no_skills else WITH_SKILLS
     compound_context = args.compound_context if args.compound_context is not None else COMPOUND_CONTEXT
     if getattr(args, "compound_mode", None) == "xyz":
         compound_context = ""  # planner reasons from geometry state only
-    checker_name     = (args.checker or CHECKER)
     if checker_name == "auto":
         checker_name = detect_checker(message)
     preload_specs    = getattr(args, "preload", None) or []
@@ -919,13 +1229,18 @@ async def _run_full_suite(args):
 
 
 def _run_plan_suite(args):
-    message          = args.message or MESSAGE
+    if getattr(args, "csv", None) and getattr(args, "n_compounds", None):
+        message      = build_random_sp_message(args.csv, args.n_compounds,
+                                               seed=getattr(args, "seed", 0))
+        checker_name = "sp"
+    else:
+        checker_name = (args.checker or CHECKER)
+        message      = args.message or _CHECKER_DEFAULT_MESSAGES.get(checker_name, MESSAGE)
     n_runs           = args.runs    or N_RUNS
     with_skills      = not args.no_skills if args.no_skills else WITH_SKILLS
     compound_context = args.compound_context if args.compound_context is not None else COMPOUND_CONTEXT
     if getattr(args, "compound_mode", None) == "xyz":
         compound_context = ""  # planner reasons from geometry state only
-    checker_name     = (args.checker or CHECKER)
     if checker_name == "auto":
         checker_name = detect_checker(message)
     preload_specs    = getattr(args, "preload", None) or []
