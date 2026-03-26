@@ -25,7 +25,9 @@ from client_helpers import (
     summarize_geometries_prompt,
     geom_key_from_path,
     name_to_geometry_xyz,
-    build_coordination_complex,
+    build_dimer_xyz,
+    set_geometry_xyz,
+    build_approach_scan_geometries,
     structure_add_remove_proton,
     print_tool_output,
     get_trivial_properties,
@@ -70,7 +72,9 @@ _LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip() or None
 OPENAI_TOOLS = json.loads(Path("openai_tools_geom.json").read_text(encoding="utf-8"))
 CLIENT_SIDE_TOOL_FUNCS = {
     "name_to_geometry_xyz": name_to_geometry_xyz,
-    "build_coordination_complex": build_coordination_complex,
+    "build_dimer_xyz": build_dimer_xyz,
+    "set_geometry_xyz": set_geometry_xyz,
+    "build_approach_scan_geometries": build_approach_scan_geometries,
     "pubchem_get_basic_properties": pubchem_get_basic_properties,
     "structure_add_remove_proton": structure_add_remove_proton,
     
@@ -126,6 +130,24 @@ def tools_for_server(tool_names: list[str]) -> list[dict]:
 
 
 
+def _record_usage(state: dict, role: str, resp) -> None:
+    """Accumulate token usage from an OpenAI response into state['token_usage']."""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return
+    tu = state.setdefault("token_usage", {"planner": 0, "calculator": 0, "reporter": 0, "total": 0})
+    tu[role]  = tu.get(role, 0)  + (usage.total_tokens or 0)
+    tu["total"] = tu.get("total", 0) + (usage.total_tokens or 0)
+
+
+def _print_token_usage(state: dict) -> None:
+    tu = state.get("token_usage") or {}
+    if not tu or tu.get("total", 0) == 0:
+        return
+    parts = [f"{k}={v}" for k, v in tu.items() if k != "total" and v]
+    print(f"  [tokens] {' | '.join(parts)} | total={tu.get('total', 0)}")
+
+
 async def handle_user_turn(session, client, state, user_text: str, tools_for_this_call: list,
                            compound_context: str = "", skill_contexts: list = []):
     # Build message list: general prompt → skills → state → compound identity → user
@@ -153,6 +175,7 @@ async def handle_user_turn(session, client, state, user_text: str, tools_for_thi
             tools=tools_for_this_call,
             tool_choice="none",
         )
+        _record_usage(state, "planner", resp)
         msg = resp.choices[0].message
         messages.append(msg)
         raw = (msg.content or "").strip()
@@ -325,6 +348,7 @@ async def main():
     "node_results": {},
     "default_charge": 0,
     "default_multiplicity": 1,
+    "token_usage": {"planner": 0, "calculator": 0, "reporter": 0, "total": 0},
             }
 
             tools = await session.list_tools()
@@ -462,6 +486,12 @@ async def main():
                     print("Done:", result.get("status", "unknown"))
                     pprint(result.get("artifacts"))
                     state["last_artifacts"] = result.get("artifacts") or {}
+                    # Merge calculator token usage from LangGraph result back into REPL state
+                    _result_tu = result.get("token_usage") or {}
+                    if _result_tu:
+                        _tu = state.setdefault("token_usage", {"planner": 0, "calculator": 0, "reporter": 0, "total": 0})
+                        for _k, _v in _result_tu.items():
+                            _tu[_k] = _tu.get(_k, 0) + _v
                     auto_display_spectra(state["last_artifacts"])
                     user_payload = (
                         f"Original user request:\n{state.get('last_user_text','(not provided)')}\n\n"
@@ -476,8 +506,10 @@ async def main():
                         model=LLM_MODEL,
                         messages=report_messages,
                     )
+                    _record_usage(state, "reporter", resp)
                     msg = resp.choices[0].message
                     print(msg.content)
+                    _print_token_usage(state)
                     #print(json.dumps(result, ensure_ascii=False, indent=2))
                     continue
                 
