@@ -1,0 +1,11 @@
+# QC Agent — local client dependencies
+# Python 3.11+ required
+
+openai>=2.5
+langgraph>=0.2
+mcp>=1.18
+python-dotenv>=1.0
+requests>=2.31
+matplotlib>=3.8
+rdkit>=2024.3
+openbabel-wheel>=3.1
