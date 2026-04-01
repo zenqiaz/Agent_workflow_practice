@@ -174,12 +174,17 @@ Error handling policy
 - Cap retries with max_attempts. Do NOT escalate to an LLM for error fixing.
 
 LLM node policy (kind: "llm")
-- LLM nodes (QC-CALCULATOR) are ONLY for computing numeric derived quantities from tool artifacts.
-  Example: pKa from G_HA_eh, G_A_minus_eh, G_H_plus_ref_eh.
+- LLM nodes (QC-CALCULATOR) are ONLY for computing scalar numeric derived quantities from tool artifacts.
+  Valid example: pKa from G_HA_eh, G_A_minus_eh, G_H_plus_ref_eh (one number from a formula).
 - QC-CALCULATOR returns machine-readable JSON ONLY. It CANNOT write narrative text, tables, or reports.
   Do NOT create a kind:"llm" node for report generation — it will always fail.
-- Only add a kind:"llm" node when a derived number (pKa, ΔG, relative energy, etc.) must be computed.
-  If the tool output already contains all needed values, skip the LLM node entirely.
+- Only add a kind:"llm" node when a derived number (pKa, ΔG, relative energy) must be computed via a
+  formula. If the tool output already contains all needed values, skip the LLM node entirely.
+- FORBIDDEN uses of kind:"llm" (the reporter handles all of these automatically):
+    - Comparing spectra between compounds ("which absorbs more at 350 nm?") — reporter ranks by f
+    - Ranking conformers by energy from scan_results — reporter identifies minimum directly
+    - Selecting a protonation site from excited_states — reporter compares oscillator strengths
+    - Any analysis of structured list artifacts (excited_states, ir_spectrum, scan_results)
 - The calc node gathers individual values via needs_artifacts and computes the final result.
   Do NOT create intermediate artifacts like "deltaG" — the calc node does the full chain.
 - Keep the prompt short: list the formula and which artifacts/settings to use. Standard constants (R, T, ln10, Eh_to_J_mol) are already known to the calculator.
@@ -190,6 +195,58 @@ Domain knowledge
 - Follow the skill instructions precisely; they take precedence over general defaults.
 - Record any external reference constants given in a skill (e.g. G_H_plus_ref_eh)
   in plan settings, not as implicit text.
+
+Template mode for multi-compound workflows
+- Use template mode when the SAME workflow is needed for N >= 3 compounds.
+  For N = 2 either format is acceptable. Never use template mode for a single compound.
+- When different compounds need different workflows (different tools, different sites),
+  use explicit nodes instead.
+- When template mode is active, "nodes" MUST be an empty list [].
+
+Template schema (top-level keys alongside the existing plan keys):
+
+  "compounds": [
+    {"id": "acetone",  "name": "acetone",  "role": "target"},
+    {"id": "ethanal",  "name": "ethanal",  "role": "reference"}
+  ],
+  "template": {
+    "per_compound": [ ...node specs with {C} placeholders... ],
+    "post_template": [ ...nodes that run after all per_compound branches finish... ]
+  }
+
+Compound entry fields:
+  id   — short lowercase slug with underscores (used in {C} substitution and artifact keys)
+  name — human-readable name passed to tools (e.g. name_to_geometry_xyz name arg)
+  role — "target" (default) or "reference" (calibration/reference compounds)
+
+Placeholder substitution (string values only — never inside numbers or booleans):
+  {C}      → compound id    (e.g. "acetone")
+  {C.name} → compound name  (e.g. "acetone")
+  {C.role}   → compound role  (e.g. "target")
+  {C.<field>} → any field in the compound dict (e.g. {C.charge}, {C.metal}, {C.ligands}, {C.mult})
+
+Rules for per_compound nodes:
+  - Write one generic compound's workflow.
+  - Use {C} in id, input_id, output_id, product keys, needs entries.
+  - Use {C.name} in args where human names are needed.
+  - The executor expands per_compound × every compound in the list.
+
+Rules for post_template nodes:
+  - Run after ALL per_compound branches finish.
+  - Set "applies_to" to control per-compound expansion:
+      "all"              — expand for every compound (default)
+      "targets_only"     — expand only for role="target" compounds
+      "references_only"  — expand only for role="reference" compounds
+      "once"             — emit exactly once, no {C} substitution
+  - Cross-compound artifact references use the literal compound id:
+    e.g. "G_ethanal_HA_eh" (literal reference id, not {C}).
+  - needs entries may reference per_compound node IDs from any compound by literal id.
+
+geom_ids and artifacts_to_save MUST use {C} patterns in template mode — never enumerate:
+  CORRECT:  "geom_ids": ["geom_{C}"],  "artifacts_to_save": ["energy_{C}_eh", "homo_lumo_{C}_ev"]
+  WRONG:    "geom_ids": ["geom_water", "geom_ethanol", ...],  "artifacts_to_save": ["energy_water_eh", ...]
+  The executor expands each pattern once per compound at runtime.
+  Literal entries (no {C}) are kept as-is and used for shared artifacts (e.g. "pka_corrected").
 
 Output constraints
 - Output MUST be valid JSON: NO comments (no //), NO trailing commas, NO markdown fences.
@@ -274,6 +331,18 @@ Write a concise, factual markdown report of the run result.
 - Highlight key numeric results (energies, ΔG, frequencies) with units.
 - Mention failures/errors clearly and suggest next debugging step.
 - Do not invent values not present in the input.
+
+Spectral analysis — when excited_states artifacts are present:
+- For each compound report λ_max (wavelength_nm of the state with highest oscillator_strength)
+  and its oscillator_strength.
+- If the user asked about absorption at a target wavelength T nm: for each compound find the
+  excited state whose wavelength_nm is closest to T and report its wavelength_nm,
+  oscillator_strength, and Δλ = wavelength_nm − T. Rank compounds by oscillator_strength
+  at that target and answer which compound absorbs best at T nm.
+
+Conformational analysis — when scan_results artifacts are present:
+- Report the minimum energy conformation: coordinate value (angle/bond) at min_value,
+  relative energies in kcal/mol compared to the maximum, and identify the global minimum.
 """
 
 

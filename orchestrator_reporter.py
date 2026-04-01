@@ -191,7 +191,7 @@ def write_bug_report(
     md_path = str(Path(out_dir) / f"{stem}.md")
 
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+        json.dump(report, f, indent=2, ensure_ascii=True)
 
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(_bug_report_to_markdown(report))
@@ -351,7 +351,7 @@ def write_runtime_report(
     md_path = str(Path(out_dir) / f"{stem}.md")
 
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+        json.dump(report, f, indent=2, ensure_ascii=True)
 
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(_runtime_report_to_markdown(report))

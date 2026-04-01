@@ -240,16 +240,28 @@ def opsin_resolve(name: str, timeout=15):
         }
     return None
 
-def pubchem_name_to_cid(name: str, timeout=15):
-    # canonical PUG-REST prolog described in cookbook 
+def pubchem_name_to_cid(name: str, timeout=15, retries=3):
+    # canonical PUG-REST prolog described in cookbook
+    import time as _time
     prolog = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
     url = f"{prolog}/compound/name/{urllib.parse.quote(name)}/cids/JSON"
-    r = requests.get(url, timeout=timeout)
-    if r.status_code != 200:
-        return None
-    data = r.json()
-    cids = data.get("IdentifierList", {}).get("CID", [])
-    return int(cids[0]) if cids else None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=timeout)
+            if r.status_code != 200:
+                if attempt < retries - 1:
+                    _time.sleep(2 ** attempt)
+                    continue
+                return None
+            data = r.json()
+            cids = data.get("IdentifierList", {}).get("CID", [])
+            return int(cids[0]) if cids else None
+        except requests.RequestException:
+            if attempt < retries - 1:
+                _time.sleep(2 ** attempt)
+            else:
+                return None
+    return None
 
 def pubchem_cid_to_props(cid: int, timeout=15):
     prolog = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
@@ -425,6 +437,42 @@ def _bare_ion_from_elem_charge(elem: str, charge: int) -> Optional[dict]:
             "provenance": {"geometry": "single_atom"}}
 
 
+def _smiles_to_xyz(smiles: str) -> str | None:
+    """Convert a SMILES string to XYZ geometry (no header) via RDKit ETKDG + MMFF."""
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        mol = Chem.AddHs(mol)
+        res = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+        if res == -1:
+            # Fallback to random coords
+            res = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+        if res == -1:
+            return None
+        AllChem.MMFFOptimizeMolecule(mol)
+        conf = mol.GetConformer()
+        lines = []
+        for i in range(mol.GetNumAtoms()):
+            sym = mol.GetAtomWithIdx(i).GetSymbol()
+            pos = conf.GetAtomPosition(i)
+            lines.append(f"{sym}  {pos.x:.6f}  {pos.y:.6f}  {pos.z:.6f}")
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
+def _looks_like_smiles(s: str) -> bool:
+    """Heuristic: SMILES strings contain = or # or [ but not spaces (except salts)."""
+    import re as _re
+    if " " in s:
+        return False  # compound names have spaces; SMILES generally don't
+    # Must contain at least one SMILES-specific character
+    return bool(_re.search(r'[=#\[\]/\\@]', s))
+
+
 def name_to_geometry_xyz(name: str) -> dict:
     name = (name or "").strip()
     if not name:
@@ -438,6 +486,34 @@ def name_to_geometry_xyz(name: str) -> dict:
         sign = 1 if _ion_suffix.group(1) == '+' else -1
         mag  = int(_ion_suffix.group(2)) if _ion_suffix.group(2) else 1
         default_charge = sign * mag
+    # 0a-pre) SMILES input: detect by SMILES-specific characters, no spaces
+    if _looks_like_smiles(name):
+        xyz = _smiles_to_xyz(name)
+        if xyz:
+            # Count formal charges from SMILES brackets to set default_charge
+            import re as _re2
+            charges = _re2.findall(r'\[([^\]]+)\]', name)
+            inferred_charge = default_charge  # already parsed from suffix
+            if inferred_charge == 0:
+                # sum [O-], [N+], [Fe3+] etc. from SMILES
+                for part in charges:
+                    m = _re2.search(r'([+-])(\d*)$', part)
+                    if m:
+                        s = 1 if m.group(1) == '+' else -1
+                        mag = int(m.group(2)) if m.group(2) else 1
+                        inferred_charge += s * mag
+            mult = 1
+            if inferred_charge != 0:
+                # simple guess: closed-shell default
+                mult = 1
+            return {
+                "status": "ok",
+                "name": name,
+                "geometry_xyz": xyz,
+                "charge": inferred_charge,
+                "multiplicity": mult,
+                "provenance": {"geometry": "rdkit_smiles_embed"},
+            }
     # 0a) bare element symbol / simple ion notation: Fe, Fe3+, Cl-, Na+, etc.
     bare = _try_bare_ion_geometry(name)
     if bare is not None:
@@ -2856,6 +2932,14 @@ async def execute_tool_from_node_spec(*, state: Dict[str, Any], node_spec: Dict[
     except Exception:
         payload = {"status": "ok", "tool": tool_name, "text": text}
 
+    # FastMCP wraps tool exceptions as plain text with "Error executing tool ..."
+    # Promote these to status=error so downstream geometry/artifact logic is skipped.
+    if payload.get("status") == "ok" and payload.get("text"):
+        _t = str(payload["text"])
+        if _t.startswith("Error executing tool") or _t.startswith("Error:"):
+            payload["status"] = "error"
+            payload["error"] = _t
+            del payload["text"]
 
     # Update GeometryRegistry from payload using node-injected ids (input_id/output_id)
     try:

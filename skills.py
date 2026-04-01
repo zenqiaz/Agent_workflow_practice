@@ -156,6 +156,12 @@ Isodesmic calibration for alpha-CH pKa (REQUIRED for carbonyl alpha-H requests):
     pKa_X_raw  = ΔG_X_eh × 2625499.638 / (8.314462618 × 298.15 × 2.302585093)
     pKa_X      = pKa_X_raw − epsilon          (calibrated pKa)
 
+  LLM node product mapping:
+    ALWAYS use  "product": {"pka_{C}": "pka"}  and instruct the LLM to return
+    JSON with the key "pka" (lowercase, exactly).  The prompt should end with:
+    "Return JSON: {status, pka}" — NOT "pKa_X", NOT "pKa", NOT any other variant.
+    The executor reads result["pka"]; wrong capitalisation → artifact stays null.
+
 Deprotonation step — structure_add_remove_proton:
   Use  mode="remove"  with the correct  site_selector  (STRING, not a dict).
   DO NOT pass  geometry_xyz  in args — the executor injects it automatically via input_id.
@@ -173,12 +179,35 @@ Deprotonation step — structure_add_remove_proton:
     ALWAYS use  site_selector="alpha_carbon"
     NOT "alpha_to_carbonyl_C-H", NOT "alpha_H", NOT any other invented string.
 
+xTB pre-optimization for anion geometry (REQUIRED for alpha-carbon deprotonation):
+  After removing an alpha-C–H proton, the crude geometry retains a tetrahedral sp3
+  carbon with a missing H — but the enolate is sp2 (planar). This large structural
+  change means DFT optimization from the raw geometry is slow, often hits RESOURCE_LIMIT,
+  and may fail to find the correct minimum.
+
+  ALWAYS set  xtb_preopt: true  on the run_opt_job node for A⁻ whenever the deprotonation
+  site is "alpha_carbon" (or any carbon site). This runs a cheap GFN2-xTB optimization
+  first, relaxes the sp3→sp2 geometry, then passes the improved structure to ORCA.
+
+  This is NOT required for O-H or N-H deprotonation (geometry change is minor).
+
+  Example opt_A_minus node args:
+    {"xtb_preopt": true, "wall_timeout_seconds": 1800}
+
 Plan validation rules:
   ✓ artifacts_to_save MUST include G_HA_eh and G_A_minus_eh
   ✓ Both freq nodes must set  product: {"G_XX_eh": "gibbs_free_energy_eh"}
   ✓ LLM calc node must list  needs_artifacts: ["G_HA_eh", "G_A_minus_eh"]
   ✓ structure_add_remove_proton node: use input_id (not geometry_xyz in args), site_selector only
   ✗ Do NOT use SP energy as proxy for G in a pKa plan
+
+Multi-compound pKa with calibration — use template mode (N >= 3 targets):
+  Put all target compounds and ethanal in "compounds" list.
+  Mark ethanal with role="reference".
+  per_compound: load → deprot (alpha_carbon, xtb_preopt: true on A⁻ opt) → freq_HA → freq_A⁻
+  post_template: one compute_pka_{C} LLM node per target (applies_to="targets_only")
+    that reads G_{C}_HA_eh, G_{C}_A_minus_eh, G_ethanal_HA_eh, G_ethanal_A_minus_eh
+    (last two are literal — not {C} — because ethanal is the fixed reference).
 
 on_error patches for run_opt_job / run_freq_job:
   RESOURCE_LIMIT (geometry slow to converge, wall time exceeded):
@@ -977,12 +1006,20 @@ starting geometry, then pipe into run_opt_job via output_id/input_id.
 
 build_coordination_complex parameters:
   metal           – element symbol lowercase: "fe", "co", "ru", "cu", "pt", …
-  ligands         – list of molSimplify ligand names (one entry per coordination site).
+  ligands         – list of molSimplify ligand names.
                     Common names: "cl" (chloride), "water", "nh3", "co" (carbonyl),
                     "cn" (cyanide), "en" (ethylenediamine), "bipy" (bipyridine),
-                    "acac", "acetate", "ox" (oxalate), "ncs" (thiocyanate).
-                    Repeat the same name for multiple identical ligands.
-                    len(ligands) sets the coordination number automatically.
+                    "acac" (acetylacetonate), "acetate", "ox" (oxalate), "ncs" (thiocyanate).
+                    Use ONE ENTRY PER LIGAND MOLECULE (not per donor atom).
+                    Coordination number is derived automatically from denticity:
+                      Monodentate (cl, water, nh3, cn, co, ncs, acetate): 1 site each
+                      Bidentate   (en, acac, bipy, phen, ox):             2 sites each
+                    Examples:
+                      [Fe(CN)₆]³⁻  → ligands=["cn","cn","cn","cn","cn","cn"], geometry="oct"
+                      [Cu(en)₂]²⁺  → ligands=["en","en"],  geometry="sqp"   (2 × bidentate = coord 4)
+                      Ni(acac)₂    → ligands=["acac","acac"], geometry="sqp" (2 × bidentate = coord 4)
+                      cis-Pt(NH₃)₂Cl₂ → ligands=["nh3","nh3","cl","cl"], geometry="sqp"
+                    WARNING: "dmg" (dimethylglyoximate) is NOT in molSimplify. Use acac as a substitute.
   geometry        – "oct" (octahedral, 6) | "thd" (tetrahedral, 4) |
                     "sqp" (square planar, 4) | "tbp" (trigonal bipyramidal, 5)
   oxidation_state – Roman numeral string: "II", "III", "IV", etc.

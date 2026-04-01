@@ -72,6 +72,150 @@ ALLOWED_NODES = (
 )
 
 
+# ─── Template expansion ────────────────────────────────────────────────────────
+
+def _deep_substitute(obj: Any, compound: Dict[str, Any]) -> Any:
+    """Recursively replace {C} and {C.<field>} placeholders in strings.
+
+    Supported placeholders:
+      {C}         → compound["id"]
+      {C.name}    → compound.get("name", id)
+      {C.role}    → compound.get("role", "target")
+      {C.<field>} → compound.get("<field>", "") for any other field in the compound dict
+    """
+    if isinstance(obj, str):
+        import re as _re
+        # Whole-value shortcut: if the entire string is exactly one placeholder,
+        # return the raw Python value so lists/ints pass through without str().
+        if obj == "{C}":
+            return compound["id"]
+        _whole_match = _re.fullmatch(r"\{C\.([^}]+)\}", obj)
+        if _whole_match:
+            return compound.get(_whole_match.group(1), "")
+
+        def _replace(m: "re.Match") -> str:
+            field = m.group(1)  # everything after "C."
+            if field == "":
+                return compound["id"]
+            return str(compound.get(field, ""))
+        # Replace {C} first, then {C.<field>}
+        result = obj.replace("{C}", compound["id"])
+        result = _re.sub(r"\{C\.([^}]+)\}", _replace, result)
+        return result
+    if isinstance(obj, dict):
+        return {_deep_substitute(k, compound): _deep_substitute(v, compound)
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_substitute(item, compound) for item in obj]
+    return obj  # int, float, bool, None — pass through unchanged
+
+
+def expand_template(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Expand template + compounds into a flat nodes list.
+
+    If plan has no 'template' key, returns plan unchanged (backward compatible).
+    Raises ValueError on invalid template structure or unresolved placeholders.
+    """
+    template = plan.get("template")
+    if not template or not isinstance(template, dict):
+        return plan
+
+    compounds = plan.get("compounds")
+    if not compounds or not isinstance(compounds, list):
+        raise ValueError("plan has 'template' but no 'compounds' list")
+
+    per_compound = template.get("per_compound") or []
+    post_template = template.get("post_template") or []
+
+    expanded_nodes: List[Dict[str, Any]] = []
+
+    # Phase 1: expand per_compound nodes for every compound.
+    # Nodes whose id contains no {C} placeholder are treated as "once" nodes —
+    # they belong at the end (after all per-compound nodes) and appear exactly once.
+    once_nodes: List[Dict[str, Any]] = []
+    _seen_once_ids: set = set()
+    for compound in compounds:
+        for node_tmpl in per_compound:
+            node_id_tmpl = (node_tmpl.get("id") or "") if isinstance(node_tmpl, dict) else ""
+            if "{C" not in node_id_tmpl:
+                # Shared node: collect once, add after per-compound loop
+                resolved = _deep_substitute(node_tmpl, compound)
+                nid = resolved.get("id") if isinstance(resolved, dict) else None
+                if nid and nid not in _seen_once_ids:
+                    _seen_once_ids.add(nid)
+                    once_nodes.append(resolved)
+            else:
+                expanded_nodes.append(_deep_substitute(node_tmpl, compound))
+    expanded_nodes.extend(once_nodes)
+
+    # Phase 2: expand post_template nodes with applies_to filtering
+    for node_tmpl in post_template:
+        applies_to = node_tmpl.get("applies_to", "all")
+        if applies_to == "once":
+            node = dict(node_tmpl)
+            node.pop("applies_to", None)
+            expanded_nodes.append(node)
+        else:
+            if applies_to == "targets_only":
+                subset = [c for c in compounds if c.get("role", "target") != "reference"]
+            elif applies_to == "references_only":
+                subset = [c for c in compounds if c.get("role", "target") == "reference"]
+            else:  # "all"
+                subset = compounds
+            for compound in subset:
+                node = _deep_substitute(node_tmpl, compound)
+                if isinstance(node, dict):
+                    node.pop("applies_to", None)
+                expanded_nodes.append(node)
+
+    # Phase 3: expand geom_ids and artifacts_to_save
+    # Patterns containing any {C...} placeholder are expanded once per compound.
+    def _expand_list(patterns: List[str]) -> List[str]:
+        result: List[str] = []
+        for pat in (patterns or []):
+            if isinstance(pat, str) and "{C" in pat:
+                subset = compounds
+                for c in subset:
+                    val = _deep_substitute(pat, c)
+                    if val not in result:
+                        result.append(val)
+            else:
+                if pat not in result:
+                    result.append(pat)
+        return result
+
+    new_plan = dict(plan)
+    new_plan["nodes"] = expanded_nodes
+    new_plan["geom_ids"] = _expand_list(plan.get("geom_ids") or [])
+    new_plan["artifacts_to_save"] = _expand_list(plan.get("artifacts_to_save") or [])
+
+    # Also expand {C} placeholders in final_report.fields and summarizer.report_fields
+    fr = plan.get("final_report")
+    if isinstance(fr, dict) and fr.get("fields"):
+        new_plan["final_report"] = {**fr, "fields": _expand_list(fr["fields"])}
+    summ = plan.get("summarizer")
+    if isinstance(summ, dict) and summ.get("report_fields"):
+        new_plan["summarizer"] = {**summ, "report_fields": _expand_list(summ["report_fields"])}
+
+    # Validation: no unresolved placeholders (catches both {C} and unknown variants like {C.foo})
+    import re as _re
+    raw = json.dumps(expanded_nodes)
+    leftover = _re.findall(r"\{C[^}]*\}", raw)
+    if leftover:
+        raise ValueError(
+            f"Unresolved placeholder(s) after template expansion: {set(leftover)}. "
+            f"Only {{C}}, {{C.name}}, {{C.role}} are supported."
+        )
+
+    # Validation: unique node IDs
+    ids = [n["id"] for n in expanded_nodes if isinstance(n, dict) and "id" in n]
+    dupes = {x for x in ids if ids.count(x) > 1}
+    if dupes:
+        raise ValueError(f"Duplicate node IDs after template expansion: {dupes}")
+
+    return new_plan
+
+
 def build_state(
     plan: Dict[str, Any],
     session: Any,
@@ -87,6 +231,7 @@ def build_state(
       missing keys.
     - Does NOT overwrite any non-None artifact values present in `seed`.
     """
+    plan = expand_template(plan)
     st: Dict[str, Any] = dict(seed or {})
     st["session"] = session
     st["plan"] = plan
@@ -262,6 +407,7 @@ def build_graph_from_plan(
     run_tool_node: Optional[ToolNodeRunner | AsyncToolNodeRunner] = None,
     openai_client: Optional[Any] = None,
 ):
+    plan = expand_template(plan)
     plan_nodes: List[Dict[str, Any]] = plan.get("nodes") or []
     if not plan_nodes:
         raise ValueError("plan['nodes'] is empty")
@@ -654,12 +800,19 @@ def build_graph_from_plan(
                             "site_ranking_json": "site_ranking",
                             "ranking_json":      "site_ranking",
                             "comparison_table_json": "comparison_table",
+                            # pKa: LLM may return pKa_X (variable from formula) instead of lowercase pka
+                            "pka": "pKa_X",
                         }
                         flat_out = {**values_dict, **{k: v for k, v in out.items() if k != "values"}}
+                        # Build case-insensitive fallback map for LLM key lookup
+                        _flat_out_lower = {k.lower(): v for k, v in flat_out.items()}
                         for art_key, src_key in product_spec.items():
                             val = flat_out.get(src_key)
                             if val is None:
                                 val = flat_out.get(_ALIAS_MAP.get(src_key, src_key))
+                            if val is None:
+                                # Case-insensitive fallback (e.g. "pKa_X" vs "pka")
+                                val = _flat_out_lower.get(src_key.lower())
                             if val is not None:
                                 cur_artifacts[art_key] = val
                         updates["artifacts"] = cur_artifacts
