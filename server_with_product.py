@@ -7,6 +7,11 @@ import re
 from pathlib import Path
 from typing import Literal, Optional, Dict, List
 
+# Redirect stdout → stderr during imports so that any library startup messages
+# don't corrupt the MCP stdio channel (critical in local mode).
+_real_stdout = sys.stdout
+sys.stdout = sys.stderr
+
 from mcp.server.fastmcp import FastMCP
 from pathlib import Path
 import shutil
@@ -319,6 +324,13 @@ def _classify_orca_error_code(out_text: str) -> Optional[str]:
         return "SCF_NOT_CONVERGED"
     if "***IMAGINARY MODE***" in upper:
         return "IMAG_FREQ"
+    if (
+        "THE CAS PROCEDURE HAS NOT CONVERGED" in upper
+        or "CASSCF ORBITAL OPTIMIZATION DID NOT CONVERGE" in upper
+        or "CAS PROCEDURE DID NOT CONVERGE" in upper
+        or ("CASSCF" in upper and "NOT CONVERGED" in upper)
+    ):
+        return "CASSCF_NOT_CONVERGED"
     return None
 
 
@@ -914,7 +926,7 @@ async def run_opt_job(
     wall_timeout_seconds: int = 1800,
     job_label: Optional[str] = None,
     ncores: int = 1,
-    xtb_preopt: bool = False,
+    xtb_preopt: bool = True,
     xtb_preopt_timeout: int = 300,
     clean_workdir: bool = True,
     debug: bool = False,
@@ -1926,7 +1938,9 @@ async def run_casscf_job(
     norb: int = 2,
     nroots: int = 1,
     basis: str = "def2-SVP",
+    maxiter: int = 300,
     scf_max_iter: int = 200,
+    avas_variant: Optional[str] = None,
     wall_timeout_seconds: int = 3600,
     job_label: Optional[str] = None,
     ncores: int = 1,
@@ -1935,6 +1949,9 @@ async def run_casscf_job(
 
     Requires active space: nel (active electrons) and norb (active orbitals).
     Set nroots > 1 for state-averaged SA-CASSCF.
+    Set avas_variant to activate AVAS orbital selection (ORCA 6 simple-keyword
+    interface): "VALENCE-D" (d-block metals), "DOUBLE-D" (3d+4d shells),
+    "VALENCE-DS" (d+s), "DOUBLE-DS", "VALENCE-F" (f-block), "DOUBLE-F".
     Returns energy_eh (total or SA-average) and energies_eh list (nroots > 1).
     """
     if not geometry_xyz.strip():
@@ -1944,23 +1961,29 @@ async def run_casscf_job(
     job_label = sanitize_label(job_label)
     workdir = Path(os.environ.get("ORCA_JOBS_DIR", "jobs")) / job_label
 
+    # In ORCA 6, AVAS is a simple keyword: ! CASSCF basis AVAS(VALENCE-D)
+    # No %avas block, no avas_* keywords inside %casscf.
+    avas_kw = f" AVAS({avas_variant})" if avas_variant else ""
+    method_kw = f"CASSCF{avas_kw}"
+
     calc = _build_calc(
         label=job_label, workdir=workdir, geometry_xyz=geometry_xyz,
         charge=charge, multiplicity=multiplicity,
-        method="CASSCF", basis=basis,
+        method=method_kw, basis=basis,
         job_type="casscf", use_ri=False,
         scf_max_iter=scf_max_iter, opt_max_iter=1,
         nbo=False, ncores=ncores,
     )
-    casscf_block = (
-        f"%casscf\n"
-        f"  nel    {nel}\n"
-        f"  norb   {norb}\n"
-        f"  nroots {nroots}\n"
-        f"  maxiter 500\n"
-        f"end"
-    )
-    calc.input.add_arbitrary_string(casscf_block)
+
+    casscf_lines = [
+        f"%casscf",
+        f"  nel    {nel}",
+        f"  norb   {norb}",
+        f"  nroots {nroots}",
+        f"  maxiter {maxiter}",
+        f"end",
+    ]
+    calc.input.add_arbitrary_string("\n".join(casscf_lines))
 
     try:
         output = await _run_calc_with_timeout(calc, wall_timeout_seconds)
@@ -1988,7 +2011,6 @@ async def run_casscf_job(
         "status": "ok",
         "label": job_label,
         "energy_eh": energy,
-        "product": "energy_eh",
     }
     if root_energies:
         ret["energies_eh"] = root_energies
@@ -2307,4 +2329,5 @@ async def structure_add_remove_proton(
     return json.dumps(res)
 
 
+sys.stdout = _real_stdout  # restore stdout for MCP stdio transport
 mcp.run(transport="stdio")

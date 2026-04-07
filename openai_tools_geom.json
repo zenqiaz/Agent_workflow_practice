@@ -1,43 +1,5 @@
 
-{	
-	"state_update": {
-		"type": "function",
-		"function": {
-			"name": "state_update",
-			"description": "Update session defaults (charge, multiplicity, method, basis, solvent, current_geom, etc.) in a uniform way.",
-			"parameters": {
-			"type": "object",
-			"properties": {
-				"set": {
-				"type": "object",
-				"description": "Key-value updates to apply.",
-				"additionalProperties": true
-				}
-			},
-			"required": ["set"]
-			}
-		}
-	},
-	"state_get_tool_args": {
-		"type": "function",
-		"function": {
-			"name": "state_get_tool_args",
-			"description": "Fetch all arguments needed for a specific MCP tool using current session state (injects geometry_xyz and defaults).",
-			"parameters": {
-			"type": "object",
-			"properties": {
-				"tool_name": { "type": "string" },
-				"overrides": {
-				"type": "object",
-				"description": "Optional explicit overrides to apply on top of state defaults.",
-				"additionalProperties": true
-				}
-			},
-			"required": ["tool_name"]
-			}
-		}
-	},
-
+{
 	"name_to_geometry_xyz": {
 		"type": "function",
 		"function": {
@@ -392,16 +354,18 @@
         "type": "function",
         "function": {
             "name": "run_casscf_job",
-            "description": "Run a CASSCF single-point calculation with ORCA. Requires specifying the active space: nel (number of active electrons) and norb (number of active orbitals). Set nroots > 1 for state-averaged SA-CASSCF over multiple roots. Returns energy_eh (total or SA-average energy) and energies_eh list when nroots > 1. Use after geometry optimization.",
+            "description": "Run a CASSCF single-point calculation with ORCA. Requires nel (active electrons) and norb (active orbitals). Set nroots > 1 for SA-CASSCF. Set avas_variant to activate AVAS orbital pre-rotation (ORCA 6 interface) — strongly recommended for transition metals. Returns energy_eh (total or SA-average) and energies_eh list when nroots > 1.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "input_geom_id": { "type": "string", "description": "GeometryRegistry id to read xyz/charge/multiplicity from." },
-                    "nel":   { "type": "integer", "description": "Number of active electrons in the CAS active space, e.g. 5 for Fe(III) d5." },
-                    "norb":  { "type": "integer", "description": "Number of active orbitals in the CAS active space, e.g. 5 for Fe d-orbitals." },
-                    "nroots": { "type": "integer", "default": 1, "description": "Number of roots for state-averaged SA-CASSCF (default 1 = single-state CASSCF)." },
-                    "basis":           { "type": "string",  "default": "def2-SVP" },
-                    "scf_max_iter":    { "type": "integer", "default": 200 },
+                    "nel":   { "type": "integer", "description": "Number of active electrons, e.g. 5 for Fe(III) d5." },
+                    "norb":  { "type": "integer", "description": "Number of active orbitals, e.g. 5 for Fe d-orbitals." },
+                    "nroots": { "type": "integer", "default": 1, "description": "Number of roots for SA-CASSCF (default 1 = single-state)." },
+                    "basis": { "type": "string", "default": "def2-SVP" },
+                    "maxiter": { "type": "integer", "default": 300, "description": "Max CASSCF macro-iterations. Fail fast — let on_error cascade handle retries." },
+                    "avas_variant": { "type": "string", "description": "AVAS orbital selection variant (ORCA 6 simple-keyword interface). Options: 'VALENCE-D' (d-block metals, most common), 'DOUBLE-D' (3d+4d shells), 'VALENCE-DS' (d+s), 'DOUBLE-DS', 'VALENCE-F' (f-block), 'DOUBLE-F'. Strongly recommended for transition metals." },
+                    "scf_max_iter": { "type": "integer", "default": 200, "description": "Max HF pre-SCF iterations." },
                     "wall_timeout_seconds": { "type": "integer", "default": 3600 }
                 },
                 "required": ["input_geom_id", "nel", "norb"]

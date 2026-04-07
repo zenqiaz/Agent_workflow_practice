@@ -77,10 +77,6 @@ CLIENT_SIDE_TOOL_FUNCS = {
     "build_approach_scan_geometries": build_approach_scan_geometries,
     "pubchem_get_basic_properties": pubchem_get_basic_properties,
     "structure_add_remove_proton": structure_add_remove_proton,
-    
-    "state_update": lambda **kw: state_update(state, **kw),          # not so useful: applicable only when data readily to be fill into the state
-    "state_get_tool_args": lambda **kw: state_get_tool_args(state, **kw),
-    #"pubchem_get_record_fields": pubchem_get_record_fields,
 }
 
 

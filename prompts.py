@@ -126,6 +126,7 @@ Tool result field names (use EXACTLY these paths in product mappings):
                              geometry_xyz (geometry at PES maximum — TS candidate)
   run_ts_opt_job:            energy_eh, geometry_xyz (optimised TS), ts_converged
   run_casscf_job:            energy_eh (total or SA-average), energies_eh (list per root, only when nroots > 1)
+                             [use avas_orbs="Fe 3d" / "C 2p" etc. for orbital pre-rotation — strongly recommended]
   run_nbo_job:               nbo_section
   run_solvator_cluster_thermo: energy_eh, enthalpy_eh, gibbs_free_energy_eh
   structure_add_remove_proton: geometry_xyz (geometry stored via output_id)
@@ -140,8 +141,18 @@ Geometry via input_id/output_id:
 Artifacts contract
 - artifacts_to_save is the authoritative list of artifact KEYS that must be available in state["artifacts"] at the end.
 - Only NUMERICAL or LIST values belong in artifacts_to_save (energies, spectra, derived quantities).
+
+Auto-artifact mode (preferred for simple parallel tasks):
+- If a tool node has NO "product" key, ALL result fields are saved automatically as "{node_id}.{field_name}".
+  e.g. node id="sp_ethanol" → artifacts "sp_ethanol.energy_eh", "sp_ethanol.homo_lumo_gap_ev", "sp_ethanol.dipole_moment_debye"
+- Use {C} substitution in final_report.fields: ["sp_{C}.energy_eh", "sp_{C}.dipole_moment_debye"]
+- artifacts_to_save can be empty or omitted when using auto-artifact mode.
+- Use auto-artifact mode for N-compound screening tasks where all tool outputs are needed.
+
+Explicit product mode (required when downstream nodes reference artifacts by name):
 - Every key in artifacts_to_save MUST be produced by at least one node via node.product.
 - For tool nodes: declare product {"K": "result_field"} and K is stored from result["result_field"].
+- Use explicit product when calc_expr or llm nodes reference artifact keys by name (e.g. pKa formula).
 - Node args may reference artifacts with $(artifacts.K) or $(node_id.artifacts.K) (use whichever is more natural).
 
 Geometry rules
@@ -247,6 +258,13 @@ geom_ids and artifacts_to_save MUST use {C} patterns in template mode — never 
   WRONG:    "geom_ids": ["geom_water", "geom_ethanol", ...],  "artifacts_to_save": ["energy_water_eh", ...]
   The executor expands each pattern once per compound at runtime.
   Literal entries (no {C}) are kept as-is and used for shared artifacts (e.g. "pka_corrected").
+
+Auto-artifact mode in templates (PREFERRED for screening tasks):
+  - Omit "product" from per_compound nodes entirely.
+  - All tool outputs are auto-saved as "{node_id}.{field}", e.g. "sp_{C}.energy_eh" after expansion.
+  - Use {C} in final_report.fields to collect per-compound results:
+      "final_report": { "fields": ["sp_{C}.energy_eh", "sp_{C}.homo_lumo_gap_ev", "sp_{C}.dipole_moment_debye"] }
+  - artifacts_to_save can be omitted or left as [] in auto-artifact mode.
 
 Output constraints
 - Output MUST be valid JSON: NO comments (no //), NO trailing commas, NO markdown fences.

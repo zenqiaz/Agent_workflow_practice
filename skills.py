@@ -316,47 +316,85 @@ SKILL: CASSCF / SA-CASSCF calculations
 Tool
   run_casscf_job
   Required: nel (active electrons), norb (active orbitals)
-  Optional: nroots (default 1), basis (default def2-SVP)
+  Optional: nroots (default 1), basis (default def2-SVP), maxiter (default 300),
+            avas_variant, scf_max_iter (default 200)
   Returns: energy_eh (total or SA-average), energies_eh list (only when nroots > 1)
 
-Active space selection guide
-  - Fe(III) d5 system:        CAS(5,5)  — 5 d-electrons in 5 d-orbitals
-  - Fe(II)  d6 system:        CAS(6,5)  — 6 d-electrons in 5 d-orbitals
-  - Ni(II)  d8 system:        CAS(8,5)  — 8 d-electrons in 5 d-orbitals
-  - Simple bond dissociation: CAS(2,2)  — bonding + antibonding pair
-  - Aromatic pi system:       CAS(N,N)  — N electrons in N pi orbitals (benzene: CAS(6,6))
-  If unsure, ask the user or use the minimal valence active space.
+AVAS (strongly recommended for all transition metal and pi systems)
+  ORCA 6 uses avas_variant as a simple keyword — no separate block, no orbital strings.
+  AVAS rotates the best starting orbitals into the active space before CASSCF,
+  dramatically reducing macro-iterations and avoiding saddle-point traps.
 
-Spin state comparison (SA-CASSCF)
-  - To compare multiple spin states simultaneously, set nroots to the number of states.
-  - The multiplicity parameter controls the spin of root 0; SA averages over all roots.
-  - For spin-state energy differences, prefer running separate CASSCF jobs with the
-    correct multiplicity for each state (single-state CASSCF, nroots=1).
+  avas_variant options:
+    "VALENCE-D"  — valence d orbitals of all transition metals in the molecule (most common)
+    "DOUBLE-D"   — 3d + 4d shells (for heavy 4d metals or double-shell CASSCF)
+    "VALENCE-DS" — d + s valence
+    "DOUBLE-DS"  — double d + s
+    "VALENCE-F"  — valence f orbitals (lanthanides/actinides)
+    "DOUBLE-F"   — double f shell
+
+  For most d-block metal complexes: use "VALENCE-D".
+  Omit avas_variant for simple non-metal systems (e.g. bond dissociation CAS(2,2)).
+
+Active space selection guide
+  - Fe(III) d5:               CAS(5,5),  avas_variant: "VALENCE-D"
+  - Fe(II)  d6:               CAS(6,5),  avas_variant: "VALENCE-D"
+  - Ni(II)  d8:               CAS(8,5),  avas_variant: "VALENCE-D"
+  - Simple bond dissociation: CAS(2,2),  no AVAS needed
+  - Benzene pi (non-metal):   CAS(6,6),  no AVAS (AVAS variants target metals)
+  If unsure, use the minimal valence active space.
+
+Convergence
+  Use maxiter as the primary convergence knob; default 300 is generous.
+  Do not increase maxiter in retries — change the orbital or basis strategy instead.
+
+Spin state comparison
+  Prefer separate single-state CASSCF jobs (nroots=1) for each spin state.
+  Use SA-CASSCF (nroots > 1) only when states are strongly mixed.
 
 Basis sets
   - def2-SVP: good starting point; affordable
-  - def2-TZVP or cc-pVTZ: better accuracy for final results
-  - ANO-RCC or def2-TZVPP recommended for high-accuracy metal active spaces
+  - def2-TZVP: better accuracy for final results
+  - ANO-RCC or def2-TZVPP: high-accuracy metal active spaces
 
-Typical plan pattern (spin-state gap)
+Typical plan pattern (Fe spin-state gap with AVAS)
   nodes:
     - {id: casscf_hs, kind: tool, tool: run_casscf_job,
-       input_id: mol_hs, args: {nel: 5, norb: 5, nroots: 1},
-       product: {e_hs_eh: energy_eh}}
+       input_id: mol_hs, args: {nel: 5, norb: 5, avas_variant: "VALENCE-D"}}
     - {id: casscf_ls, kind: tool, tool: run_casscf_job,
-       input_id: mol_ls, args: {nel: 5, norb: 5, nroots: 1},
-       product: {e_ls_eh: energy_eh}}
+       input_id: mol_ls, args: {nel: 5, norb: 5, avas_variant: "VALENCE-D"}}
     - {id: calc_gap, kind: llm, task: compute_spin_gap,
-       needs: [casscf_hs, casscf_ls], needs_artifacts: [e_hs_eh, e_ls_eh],
+       needs: [casscf_hs, casscf_ls],
+       needs_artifacts: [casscf_hs.energy_eh, casscf_ls.energy_eh],
        product: {delta_E_kcal: delta_E_kcal}}
 
 No geometry optimization with CASSCF
-  run_casscf_job is SP-only. If you need CASSCF-optimised geometry,
-  first optimize with DFT (run_opt_job), then run run_casscf_job on the
-  DFT-optimized structure.
+  run_casscf_job is SP-only. Optimize with DFT first (run_opt_job), then run CASSCF.
 
-on_error rules
-  - SCF_NOT_CONVERGED → patch: {scf_max_iter: 500}, max_attempts: 1
+on_error cascade (include ALL rules in every CASSCF node)
+  Design principle: cheaper changes first. Each retry must change the strategy —
+  never retry with only more iterations of the same approach.
+
+  on_error:
+    # Stage 1: HF pre-SCF failed → more SCF iterations (cheap, orthogonal problem)
+    - if: {code_in: [SCF_NOT_CONVERGED]}
+      patch: {scf_max_iter: 500}
+      max_attempts: 1
+
+    # Stage 2: CASSCF not converged → upgrade basis (reshapes virtual space,
+    #   resolves near-degeneracies def2-SVP cannot represent)
+    - if: {code_in: [CASSCF_NOT_CONVERGED]}
+      patch: {basis: def2-TZVP}
+      max_attempts: 1
+
+    # Stage 3: Timeout → extend wall time (safety net only)
+    - if: {code_in: [RESOURCE_LIMIT]}
+      patch: {wall_timeout_seconds: 7200}
+      max_attempts: 1
+
+  If Stage 2 fails: the active space choice is wrong, not the numerics.
+  Manual intervention needed — wrong nel/norb, wrong avas_variant, or the system
+  requires a different approach (NEVPT2, DMRG, or larger CAS).
 """.strip()
 
 

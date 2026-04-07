@@ -322,6 +322,7 @@ def compile_expr(expr: str) -> Callable[[Dict[str, float]], float]:
 _PATCHABLE_TOOL_ARGS: set = {
     "method", "basis", "use_ri", "scf_max_iter", "opt_max_iter",
     "ncores", "wall_timeout_seconds", "nroots", "calc_hess", "xtb_preopt",
+    "maxiter", "avas_variant",
 }
 
 
@@ -346,6 +347,8 @@ def _infer_error_code(tool_payload: Dict[str, Any]) -> Optional[str]:
         return "SCF_NOT_CONVERGED"
     if "IMAGINARY" in text and ("MODE" in text or "FREQ" in text):
         return "IMAG_FREQ"
+    if "CASSCF" in text and "NOT CONVERGED" in text:
+        return "CASSCF_NOT_CONVERGED"
     if "GEOM" in text and ("INVALID" in text or "FAILED" in text or "BAD" in text):
         return "GEOM_INVALID"
     if "RESOURCE" in text or "TIME LIMIT" in text:
@@ -504,9 +507,9 @@ def build_graph_from_plan(
 
         # Convention: tools may return a primary output via a "product" field.
         # Example: {"status":"ok","product":"energy","energy":-76.32,...}
-        product = result.get("product")  # primary output key of result dict
         product_spec = spec.get("product") or {}  # artifact key → result field path
-        if isinstance(product_spec, dict):
+        if isinstance(product_spec, dict) and product_spec:
+            # Explicit product mapping: planner-specified artifact names.
             for out_key, src in product_spec.items():
                 if isinstance(src, dict):
                     # src is {artifact_subkey: result_field_path, ...} → collect as dict
@@ -518,6 +521,13 @@ def build_graph_from_plan(
                     v = _get_by_path(result, src)
                     if v is not None:
                         artifacts[out_key] = v
+        else:
+            # Auto-artifact mode: no product dict → save every tool output field
+            # as "{node_id}.{field}", skipping orchestration-internal keys.
+            _INTERNAL = {"status", "product", "error"}
+            for field, val in result.items():
+                if field not in _INTERNAL and val is not None:
+                    artifacts[f"{node_id}.{field}"] = val
 
         upd["artifacts"] = artifacts
         return upd
@@ -820,6 +830,7 @@ def build_graph_from_plan(
                     expr = spec.get("expr")
                     inputs = spec.get("inputs") or {}
                     constants = spec.get("constants") or {}
+                    needs_artifacts_calc = spec.get("needs_artifacts") or []
                     output_key = spec.get("output_key")  # optional, e.g. "results.pKa"
 
                     result: Dict[str, Any] = {"status": "error"}
@@ -828,6 +839,22 @@ def build_graph_from_plan(
                             raise ValueError("missing expr")
 
                         env: Dict[str, float] = {}
+
+                        # Inject artifacts from needs_artifacts: key "a.b" → variable "a_b"
+                        artifacts_state = state.get("artifacts") or {}
+                        missing_arts = []
+                        for art_key in needs_artifacts_calc:
+                            val = artifacts_state.get(art_key)
+                            if val is None:
+                                missing_arts.append(art_key)
+                            else:
+                                sym = art_key.replace(".", "_")
+                                try:
+                                    env[sym] = float(val)
+                                except (TypeError, ValueError):
+                                    missing_arts.append(art_key)
+                        if missing_arts:
+                            raise KeyError(f"needs_artifacts not found or non-numeric: {missing_arts}")
 
                         if not isinstance(inputs, dict):
                             raise ValueError("inputs must be a dict")
@@ -870,7 +897,9 @@ def build_graph_from_plan(
                             "duration_ms": duration_ms,
                         }],
                     })
-                    updates.update(_stash_artifacts(node_id, spec, result, state))
+                    # _stash_artifacts expects a state-like dict with last_tool_result;
+                    # merge updates into state so product mapping sees the result.
+                    updates.update(_stash_artifacts(node_id, spec, {**state, **updates}, {**state, **updates}))
 
                 else:
                     status = "error"
