@@ -312,12 +312,11 @@ def _build_mcp_server_params():
         )
     # ssh mode (default)
     _ssh_bin  = os.getenv("MCP_SSH_BIN",  "ssh")
-    _ssh_key  = os.getenv("MCP_SSH_KEY",  "C:/Users/zrqrc/.ssh/droplet1")
-    _ssh_host = os.getenv("MCP_SSH_HOST", "root@188.166.232.163")
+    _ssh_key  = os.getenv("MCP_SSH_KEY",  "PATH_TO_YOUR_KEY")
+    _ssh_host = os.getenv("MCP_SSH_HOST", "YOUR_HOST")
     _ssh_cmd  = os.getenv(
         "MCP_SERVER_CMD",
-        "source ~/venvs/QCagent/bin/activate && cd /root/nbo_agent && "
-        "PATH=/root/ORCA/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg:$PATH python server_with_product.py",
+        "RUN_PYTHON_ON_YOUR_HOST",
     )
     return StdioServerParameters(
         command=_ssh_bin,
