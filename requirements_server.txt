@@ -1,0 +1,31 @@
+# QC Agent — server-side dependencies (local ORCA mode only)
+# Install these in addition to requirements.txt when running server_with_product.py locally.
+# Python 3.11 or 3.12 required.
+#
+# You also need:
+#   - ORCA 6.1.1 binary (download from https://orcaforum.kofo.mpg.de after free registration)
+#   - Set OPI_ORCA=/path/to/orca in your .env
+
+# ORCA Python Interface
+opi>=1.0
+
+# MCP server framework (already in requirements.txt but listed for completeness)
+mcp>=1.18
+
+# --- Optional tools ---
+# molSimplify: only needed for build_coordination_complex tool
+# tensorflow is a molSimplify dependency — install method depends on your platform:
+#
+#   macOS Apple Silicon (M1/M2/M3):
+#     pip install tensorflow-macos tensorflow-metal
+#     pip install molSimplify
+#
+#   macOS Intel / Linux:
+#     pip install tensorflow
+#     pip install molSimplify
+#
+# If you do not need coordination complex building, skip molSimplify entirely.
+# The server starts fine without it and returns a graceful error if the tool is called.
+
+# SOLVATOR: only needed for run_solvator_cluster / run_solvator_cluster_thermo
+# Install separately per the SOLVATOR documentation.

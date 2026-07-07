@@ -1,0 +1,42 @@
+work
+
+RAG
+claude --resume a89796f2-5049-4a3a-a217-9194fc518faa
+
+review
+
+claude --resume c126e03a-3946-491e-8c3b-0133be75544b
+
+MD(D:\brick\D\20260421\solvator_MD\working)
+
+claude --resume 51e3a17b-ef81-4ddf-9164-f93de0340792
+
+Agentic_RL
+
+claude --resume 344b5492-e76c-40aa-8743-98a7ac7bb016
+
+skill integration
+
+claude --resume fa0364d2-a1ce-4054-894f-13b0348d86d6
+
+paper(D:\brick\D\20260312\paper\working)
+
+claude --resume d818f12c-3cfb-41a4-9bcc-7cef6e22db3a
+
+image(D:\brick\D\20260312\paper\working)
+
+claude --resume 8c6f5e6a-7bc8-40ad-9836-f3521320aedc
+
+misc
+group rep theory
+
+claude --resume a6cb1564-79f0-4d78-a46e-fc002e9c56d0
+
+06
+
+tight-bonding
+claude --resume 9bcee871-f9ab-45f9-a465-f85a85c88c14
+
+SFT/RAG on NOMAD
+claude --resume 16467cff-3f02-4a9f-b3cf-823579aab05f
+

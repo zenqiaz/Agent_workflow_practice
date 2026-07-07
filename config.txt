@@ -1,0 +1,8 @@
+188.166.232.163 port 22
+
+C:\Users\zrqrc\.ssh\droplet1.ppk
+C:\Users\zrqrc\.ssh\droplet1.pub
+
+C:\Users\zrqrc\.ssh\droplet1
+
+user: root

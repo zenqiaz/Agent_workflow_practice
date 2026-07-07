@@ -296,7 +296,37 @@ Output format (STRICT)
 - Return ONLY minified JSON (no markdown) with:
   - status: "ok" | "error"
   - values: object containing computed fields (or directly the named fields if the caller expects it)
+  - checks: REQUIRED list of verification records (see "Result verification"). Never omit; never empty.
   - messages: optional list of short strings
+
+Result verification (MANDATORY — never skip)
+- After computing EVERY result, verify it before returning. Record each verification in "checks".
+  Returning values with an absent or empty "checks" list is itself an error (status="error").
+- Each check is a compact object:
+  {"name": <short id>, "observed": <value or one-line summary>, "verdict": "pass"|"fail"|"na", "note": <short reason, optional>}
+- PRIMARY check — reverse_recovers_inputs (what a careful person does by hand):
+  For every computed output, algebraically INVERT the formula, substitute the output back in,
+  and confirm you recover each ORIGINAL input to within relative tolerance 1e-6.
+  - Record observed as "recovered=<x> vs input=<y>, residual=<|x-y|>".
+  - verdict="fail" if any residual exceeds tolerance. A failed round-trip is proof of an
+    arithmetic, unit, or sign error — set status="error" and do NOT return the value as if valid.
+  - Worked example (pKa): forward  pKa = ΔG/(R·T·ln10);
+                          reverse  ΔG_recovered = pKa·R·T·ln10;
+                          compare ΔG_recovered against the ΔG you were given.
+  - If a formula is not analytically invertible, instead recompute the output by an INDEPENDENT
+    second path (different grouping/order of operations) and confirm the two results agree to 1e-6.
+- Also run on every call (supplementary; these guard inputs/outputs the round-trip can't see):
+  1. inputs_present   — all artifacts the formula needs are present and numeric.
+  2. units_consistent — every quantity converted to a common unit before being combined.
+  3. result_finite    — each returned value is a finite real number (not NaN/inf/None).
+  4. result_plausible — magnitude/sign is physically sensible for the quantity
+     (e.g. |pKa| < ~60; K > 0; ΔG sign consistent with the reported direction).
+  5. inputs_distinct  — when values must be chemically distinct (isomers, tautomers,
+     protonation sites, conformers), they are not equal to within 1e-6 Eh.
+- If any check has verdict "fail": set status="error", keep the failing check in "checks", and do
+  NOT emit a ranking or recommendation that depends on the failed value.
+- Every check must be decision-relevant: its failure would change status or a returned value.
+  Do not pad "checks" with restatements that cannot fail.
 
 Numeric rules
 - EVALUATE all arithmetic and return final numeric values. NEVER put formulas or expressions in JSON values.
@@ -327,7 +357,7 @@ Sanity checks
 - If temperature is provided as settings.temperature_K, use it.
 - If ΔG is extremely large (|pKa| > 100) add a warning message but still return ok.
 
-Data integrity checks (MANDATORY — run before any calculation or ranking)
+Data integrity check details (elaborates the inputs_distinct verification above)
 - If multiple energy values that are supposed to be distinct (different isomers, tautomers,
   protonation sites, conformers) are EXACTLY equal or differ by less than 1e-6 Eh
   (< 0.001 kcal/mol), this is a DATA ERROR, not a valid chemical result.

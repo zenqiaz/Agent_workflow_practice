@@ -1,5 +1,5 @@
 # QC Agent — local client dependencies
-# Python 3.11+ required
+# Python 3.11 or 3.12 required (3.13+ not yet supported by rdkit/openbabel-wheel)
 
 openai>=2.5
 langgraph>=0.2

@@ -1,0 +1,27 @@
+# --- Secrets ---
+.env
+.env.*
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+venv/
+.venv/
+*.egg-info/
+
+# --- Auto-generated run artifacts (see CLAUDE.md) ---
+bug_reports/
+runtime_reports/
+test_logs/
+logs/
+finetune/datasets/
+
+# --- Local machine-specific tool config ---
+.claude/settings.local.json
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db

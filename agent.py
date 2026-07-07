@@ -296,11 +296,26 @@ async def identify_and_confirm_compounds(
 def _build_mcp_server_params():
     """Build StdioServerParameters for the MCP server.
 
-    MCP_MODE=local  — spawn server_with_product.py as a local subprocess (no SSH).
-                      Set MCP_SERVER_CMD to override the default 'python server_with_product.py'.
-    MCP_MODE=ssh    — (default) connect via SSH, controlled by MCP_SSH_BIN/KEY/HOST/SERVER_CMD.
+    All connection settings come from the active env file (ENV_FILE, default
+    .env). No personal key paths, hosts, or server commands are baked into
+    source — the SSH-specific values must be supplied by the env file.
+
+    MCP_MODE=local  — spawn the server as a local subprocess (no SSH).
+                      Set MCP_SERVER_CMD (default 'python server_with_product.py').
+    MCP_MODE=ssh    — (default) connect via SSH, controlled by
+                      MCP_SSH_BIN / MCP_SSH_KEY / MCP_SSH_HOST / MCP_SERVER_CMD.
     """
     from mcp import StdioServerParameters
+
+    def _require(name: str) -> str:
+        val = os.getenv(name, "").strip()
+        if not val:
+            raise RuntimeError(
+                f"{name} is not set. Define it in your env file "
+                f"(ENV_FILE={os.environ.get('ENV_FILE', '.env')})."
+            )
+        return val
+
     _mode = os.getenv("MCP_MODE", "ssh").strip().lower()
     if _mode == "local":
         _cmd = os.getenv("MCP_SERVER_CMD", "python server_with_product.py")
@@ -310,14 +325,11 @@ def _build_mcp_server_params():
             args=parts[1:],
             env=dict(os.environ),
         )
-    # ssh mode (default)
-    _ssh_bin  = os.getenv("MCP_SSH_BIN",  "ssh")
-    _ssh_key  = os.getenv("MCP_SSH_KEY",  "PATH_TO_YOUR_KEY")
-    _ssh_host = os.getenv("MCP_SSH_HOST", "YOUR_HOST")
-    _ssh_cmd  = os.getenv(
-        "MCP_SERVER_CMD",
-        "RUN_PYTHON_ON_YOUR_HOST",
-    )
+    # ssh mode (default) — SSH target/key/command come only from the env file
+    _ssh_bin  = os.getenv("MCP_SSH_BIN", "ssh")
+    _ssh_key  = _require("MCP_SSH_KEY")
+    _ssh_host = _require("MCP_SSH_HOST")
+    _ssh_cmd  = _require("MCP_SERVER_CMD")
     return StdioServerParameters(
         command=_ssh_bin,
         args=["-i", _ssh_key, "-o", "StrictHostKeyChecking=no",
