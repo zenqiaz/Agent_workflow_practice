@@ -46,6 +46,10 @@ DEFAULT_SOURCES = (
 # we'd rather hand the planner zero examples than a misleading one.
 MIN_SCORE = 0.5
 
+# Cells smaller than this can't be ranked meaningfully on their own; see
+# _cell_filter for the widen-to-system_type fallback this triggers.
+MIN_CELL_SIZE = 30
+
 # Free-text keyword -> canonical task_type, checked in this order (first match wins).
 _TASK_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("TDDFT",  ("uv-vis", "uv/vis", "absorption", "excited state", "tddft", "spectrum")),
@@ -168,17 +172,42 @@ def build_query_features(user_text: str, state: dict) -> dict:
 # Retrieval
 # ---------------------------------------------------------------------------
 
+_METAL_SYSTEM_TYPES = frozenset({"TM_open", "TM_closed", "heavy_elem"})
+
+
+def _in_cell(rec: dict, target_cell: str) -> bool:
+    """
+    True if `rec` belongs to `target_cell`. For metal_general this checks
+    system_type membership rather than the literal specialist_cell string:
+    ~6,400 corpus records carry stale pre-consolidation labels (TM_general,
+    highlevel_SP, heavy_general, heavy_TDDFT) with a correct system_type but
+    a specialist_cell that predates the metal_general merge -- matching on
+    system_type recovers them instead of silently dropping them. The other
+    cells (organic_general/organic_TDDFT/rag_protocol/rag_casscf) don't show
+    this staleness, so they still match on the literal label.
+    """
+    if target_cell == "metal_general":
+        return rec.get("system_type") in _METAL_SYSTEM_TYPES
+    return rec.get("specialist_cell") == target_cell
+
+
 def _cell_filter(features: dict, records: list[dict]) -> list[int]:
     """
-    Candidate indices sharing the query's specialist_cell. Widens to the
-    broad system_type (organic / TM_open / TM_closed / heavy_elem) if the
-    exact cell is empty -- e.g. a heavy TM with no dedicated corpus records
-    still gets metal_general examples rather than nothing.
+    Candidate indices sharing the query's specialist_cell, unioned with the
+    broader system_type (organic / TM_open / TM_closed / heavy_elem) pool
+    whenever the exact cell has fewer than MIN_CELL_SIZE records. A handful
+    of records (e.g. rag_protocol: 15, all TS_OPT; rag_casscf: 16) can't be
+    ranked meaningfully on their own -- element composition drives DFT
+    method/basis choice far more than exact task_type does, so borrowing from
+    the same system_type is a reasonable fallback. BM25 still naturally
+    prefers the exact-cell hits when they exist, since they share the
+    task_type token too.
     """
-    exact = [i for i, r in enumerate(records) if r.get("specialist_cell") == features["specialist_cell"]]
-    if exact:
+    exact = [i for i, r in enumerate(records) if _in_cell(r, features["specialist_cell"])]
+    if len(exact) >= MIN_CELL_SIZE:
         return exact
-    return [i for i, r in enumerate(records) if r.get("system_type") == features["system_type"]]
+    broad = [i for i, r in enumerate(records) if r.get("system_type") == features["system_type"]]
+    return sorted(set(exact) | set(broad))
 
 
 def query(index: Index, features: dict, k: int = 5, min_score: float = MIN_SCORE) -> list[dict]:
