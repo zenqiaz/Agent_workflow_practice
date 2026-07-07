@@ -1,27 +1,20 @@
-# --- Secrets ---
-.env
-.env.*
+# This branch intentionally tracks only the planner_agent file set + rag.py.
+# Ignore everything else at the repo root (test scripts, figures, local docs,
+# generated reports/logs, secrets, caches) so `git add -A` stays scoped to it.
+/*
 
-# --- Python ---
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
-.ruff_cache/
-venv/
-.venv/
-*.egg-info/
-
-# --- Auto-generated run artifacts (see CLAUDE.md) ---
-bug_reports/
-runtime_reports/
-test_logs/
-logs/
-finetune/datasets/
-
-# --- Local machine-specific tool config ---
-.claude/settings.local.json
-
-# --- OS / editor cruft ---
-.DS_Store
-Thumbs.db
+!/.gitignore
+!/agent.py
+!/build_graph_from_plan.py
+!/client_helpers.py
+!/geometry_helpers.py
+!/openai_tools_geom.json
+!/orchestrator_reporter.py
+!/prompts.py
+!/rag.py
+!/readme.md
+!/requirements.txt
+!/server_helpers.py
+!/server_with_product.py
+!/skills.py
+!/test_success_rate.py
