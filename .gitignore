@@ -6,6 +6,7 @@
 !/.gitignore
 !/agent.py
 !/build_graph_from_plan.py
+!/canonical_ir.py
 !/client_helpers.py
 !/geometry_helpers.py
 !/openai_tools_geom.json
@@ -14,6 +15,7 @@
 !/rag.py
 !/readme.md
 !/requirements.txt
+!/sample_methods.py
 !/server_helpers.py
 !/server_with_product.py
 !/skills.py
