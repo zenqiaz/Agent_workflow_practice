@@ -21,7 +21,9 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
+import random
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +52,27 @@ MIN_SCORE = 0.5
 # _cell_filter for the widen-to-system_type fallback this triggers.
 MIN_CELL_SIZE = 30
 
+# Records with these functionals are dropped from the pool entirely, before
+# any other processing. LDA is popular in the raw corpus (38.7% of records)
+# purely because a handful of bulk screening uploads used it, not because
+# it's a good recommendation -- it lacks dispersion correction and is
+# generally an outdated choice for the SP/OPT/TDDFT tasks this corpus covers.
+# Mirrors generate_sft.py's EXCLUDED_FUNCTIONALS so RAG and the LoRA
+# specialists apply the same quality bar to what they'll ever surface.
+EXCLUDED_FUNCTIONALS: frozenset[str] = frozenset({"LDA"})
+
+# Cap on how many records a single upload_id may contribute to the pool.
+# Without this, a few large batch-screening uploads (each running thousands
+# of near-identical molecules at one functional) dominate BM25 ties in dense
+# cells -- pre-cap, the top 10 uploads supplied 86.8% of all LDA records and
+# 79.6% of all PBE0 records. Looser than sample_methods.py's SFT upload_cap
+# (20): RAG wants more raw diversity per upload than SFT training balance
+# needs. Empirically (see session scratch tfidf_proof.py /
+# tddft_tf_investigation.py), cap=50 recovers 40 of the corpus's 43 distinct
+# functionals into real representation, vs. ~3 functionals visible pre-cap,
+# while cutting the top-3 functional share from ~90% to ~57%.
+DEFAULT_UPLOAD_CAP = 50
+
 # Free-text keyword -> canonical task_type, checked in this order (first match wins).
 _TASK_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("TDDFT",  ("uv-vis", "uv/vis", "absorption", "excited state", "tddft", "spectrum")),
@@ -74,13 +97,52 @@ class Index:
 # Corpus loading + indexing
 # ---------------------------------------------------------------------------
 
-def load_pool(paths: list[str] | None = None, base_dir: str | Path | None = None) -> list[dict]:
-    """Load and concatenate the full per-source record pool."""
+def _cap_by_upload(records: list[dict], cap: int, seed: int = 0) -> list[dict]:
+    """Randomly downsample any upload_id contributing more than `cap` records."""
+    rng = random.Random(seed)
+    by_upload: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        by_upload[r.get("upload_id")].append(r)
+
+    capped: list[dict] = []
+    for recs in by_upload.values():
+        capped.extend(recs if len(recs) <= cap else rng.sample(recs, cap))
+    return capped
+
+
+def load_pool(
+    paths: list[str] | None = None,
+    base_dir: str | Path | None = None,
+    upload_cap: int | None = DEFAULT_UPLOAD_CAP,
+    exclude_functionals: frozenset[str] = EXCLUDED_FUNCTIONALS,
+    seed: int = 0,
+) -> list[dict]:
+    """
+    Load and concatenate the full per-source record pool, then:
+      1. drop records whose functional is in `exclude_functionals` (quality
+         filter -- e.g. LDA, regardless of how often it appears)
+      2. cap any single upload_id's contribution to `upload_cap` records
+         (redundancy filter -- stops one bulk study from dominating ties)
+    Pass upload_cap=None or exclude_functionals=frozenset() to disable either
+    step, e.g. for diagnostics that want the raw, uncapped pool.
+    """
     base = Path(base_dir) if base_dir is not None else BASE_DIR
     records: list[dict] = []
     for rel in (paths or DEFAULT_SOURCES):
         with (base / rel).open(encoding="utf-8") as f:
             records.extend(json.loads(line) for line in f if line.strip())
+
+    if exclude_functionals:
+        before = len(records)
+        records = [r for r in records if r.get("functional") not in exclude_functionals]
+        print(f"[rag] excluded {before - len(records)} records with functional in "
+              f"{sorted(exclude_functionals)}", file=sys.stderr)
+
+    if upload_cap is not None:
+        before = len(records)
+        records = _cap_by_upload(records, upload_cap, seed=seed)
+        print(f"[rag] upload_cap={upload_cap}: {before} -> {len(records)} records", file=sys.stderr)
+
     return records
 
 
@@ -266,10 +328,19 @@ if __name__ == "__main__":
     parser.add_argument("--base-dir", default=None, help="Directory containing the *_methods.jsonl sources")
     parser.add_argument("--out", default="jsonl/rag_index.pkl")
     parser.add_argument("--query-text", default=None, help="If given, run a test query and print the result")
+    parser.add_argument("--upload-cap", type=int, default=DEFAULT_UPLOAD_CAP,
+                         help="Max records per upload_id (0 disables capping)")
+    parser.add_argument("--include-lda", action="store_true",
+                         help="Keep LDA records instead of excluding them (default: excluded)")
     args = parser.parse_args()
 
-    pool = load_pool(base_dir=args.base_dir)
-    print(f"Loaded {len(pool)} records from {len(DEFAULT_SOURCES)} sources")
+    pool = load_pool(
+        base_dir=args.base_dir,
+        upload_cap=(args.upload_cap or None),
+        exclude_functionals=frozenset() if args.include_lda else EXCLUDED_FUNCTIONALS,
+    )
+    print(f"Loaded {len(pool)} records from {len(DEFAULT_SOURCES)} sources "
+          f"(upload_cap={args.upload_cap or 'off'}, exclude_lda={not args.include_lda})")
 
     idx = build_index(pool)
     if idx.bm25 is None:
