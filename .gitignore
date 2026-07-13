@@ -13,6 +13,7 @@
 !/orchestrator_reporter.py
 !/prompts.py
 !/rag.py
+!/rag_eval_holdout.py
 !/readme.md
 !/requirements.txt
 !/sample_methods.py

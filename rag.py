@@ -19,6 +19,7 @@ in sync.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pickle
 import random
@@ -35,6 +36,13 @@ try:
 except ImportError:
     BM25Okapi = None
 
+try:
+    from rdkit import Chem, DataStructs
+    from rdkit.Chem import AllChem
+except ImportError:
+    Chem = None
+    DataStructs = None
+
 BASE_DIR = Path(__file__).resolve().parent
 
 DEFAULT_SOURCES = (
@@ -47,6 +55,19 @@ DEFAULT_SOURCES = (
 # BM25 score floor: a hit below this is treated as noise, not a real match --
 # we'd rather hand the planner zero examples than a misleading one.
 MIN_SCORE = 0.5
+
+# Tanimoto floor for the structural rerank in query(): below this, a match is
+# indistinguishable from two unrelated molecules in the same cell -- NOT a
+# real structural match. Calibrated empirically against this corpus (random
+# within-cell pairs): organic_general p90=0.147/p95=0.172, metal_general
+# p90=0.139/p95=0.172 -- both cells checked land on essentially the same
+# background distribution, so one global floor covers them.
+SMILES_SIM_FLOOR = 0.17
+
+# How many BM25 candidates (above MIN_SCORE) to consider for structural
+# reranking before truncating to k -- wider than k so a strong structural
+# match that BM25 alone ranked outside the top-k can still surface.
+DEFAULT_RERANK_POOL = 20
 
 # Cells smaller than this can't be ranked meaningfully on their own; see
 # _cell_filter for the widen-to-system_type fallback this triggers.
@@ -72,6 +93,22 @@ EXCLUDED_FUNCTIONALS: frozenset[str] = frozenset({"LDA"})
 # functionals into real representation, vs. ~3 functionals visible pre-cap,
 # while cutting the top-3 functional share from ~90% to ~57%.
 DEFAULT_UPLOAD_CAP = 50
+
+# tmQM_methods.jsonl assigns every one of its ~19K records the same
+# upload_id ("tmQM") -- unlike a real NOMAD deposit, this isn't a correlated
+# batch grouping (all tmQM records already share one fixed method: TPSSh-
+# D3BJ/def2-SVP, so there's no per-upload methodology to leak). But
+# _cap_by_upload() groups strictly by upload_id, so without this fix the
+# entire tmQM source -- 18,971 records, 100% SMILES coverage, 14 TM elements
+# -- gets capped down to DEFAULT_UPLOAD_CAP (50) records total, a 99.7% drop.
+# Same root cause as the SFT-side bug fixed in merge_methods.py this week;
+# ported here since load_pool() has its own independent upload_cap step.
+TMQM_UPLOAD_BUCKETS = 50
+
+
+def _bucket_tmqm_upload_id(entry_id: str) -> str:
+    h = int(hashlib.sha1(entry_id.encode("utf-8")).hexdigest(), 16)
+    return f"tmQM_batch_{h % TMQM_UPLOAD_BUCKETS:02d}"
 
 # Free-text keyword -> canonical task_type, checked in this order (first match wins).
 _TASK_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -132,6 +169,10 @@ def load_pool(
         with (base / rel).open(encoding="utf-8") as f:
             records.extend(json.loads(line) for line in f if line.strip())
 
+    for r in records:
+        if r.get("upload_id") == "tmQM":
+            r["upload_id"] = _bucket_tmqm_upload_id(r.get("entry_id", ""))
+
     if exclude_functionals:
         before = len(records)
         records = [r for r in records if r.get("functional") not in exclude_functionals]
@@ -173,6 +214,75 @@ def save_index(index: Index, path: str | Path) -> None:
 def load_index(path: str | Path) -> Index:
     with Path(path).open("rb") as f:
         return pickle.load(f)
+
+
+# ---------------------------------------------------------------------------
+# SMILES fingerprint cache
+#
+# Morgan fingerprint generation (RDKit mol parsing + circular-environment
+# perception) is the expensive, repeatable step -- Tanimoto similarity on the
+# resulting bitvectors is cheap and always computed fresh per query anyway
+# (the query molecule changes every call), so only the fingerprint itself is
+# worth caching. Keyed on (canonical SMILES, radius, n_bits), not record ID,
+# so duplicate structures across different method choices share one entry.
+# ---------------------------------------------------------------------------
+
+FP_CACHE_PATH = BASE_DIR / "jsonl" / "fp_cache.pkl"
+FP_RADIUS = 2
+FP_NBITS = 2048
+
+_fp_cache: dict[tuple[str, int, int], object] | None = None  # values are rdkit ExplicitBitVect
+
+
+def _load_fp_cache(path: str | Path = FP_CACHE_PATH) -> dict[tuple[str, int, int], object]:
+    global _fp_cache
+    if _fp_cache is None:
+        if Path(path).exists():
+            with Path(path).open("rb") as f:
+                _fp_cache = pickle.load(f)
+        else:
+            _fp_cache = {}
+    return _fp_cache
+
+
+def save_fp_cache(path: str | Path = FP_CACHE_PATH) -> None:
+    """Persist the in-process fingerprint cache to disk. Call after a batch
+    of get_fingerprint() calls (e.g. at the end of index building) so future
+    runs don't recompute fingerprints already seen."""
+    if _fp_cache is None:
+        return
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with Path(path).open("wb") as f:
+        pickle.dump(_fp_cache, f)
+
+
+def get_fingerprint(smiles: str, radius: int = FP_RADIUS, n_bits: int = FP_NBITS):
+    """Morgan (ECFP-style) fingerprint for `smiles`, cached in-process and on
+    disk. Raises ValueError on unparseable SMILES."""
+    if Chem is None:
+        raise RuntimeError("rdkit not installed -- pip install rdkit")
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"invalid SMILES: {smiles!r}")
+    canonical = Chem.MolToSmiles(mol)
+
+    cache = _load_fp_cache()
+    key = (canonical, radius, n_bits)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+    cache[key] = fp
+    return fp
+
+
+def smiles_tanimoto(smiles_a: str, smiles_b: str, radius: int = FP_RADIUS, n_bits: int = FP_NBITS) -> float:
+    """Tanimoto similarity between two SMILES strings' Morgan fingerprints."""
+    fp_a = get_fingerprint(smiles_a, radius, n_bits)
+    fp_b = get_fingerprint(smiles_b, radius, n_bits)
+    return DataStructs.TanimotoSimilarity(fp_a, fp_b)
 
 
 # ---------------------------------------------------------------------------
@@ -272,13 +382,38 @@ def _cell_filter(features: dict, records: list[dict]) -> list[int]:
     return sorted(set(exact) | set(broad))
 
 
-def query(index: Index, features: dict, k: int = 5, min_score: float = MIN_SCORE) -> list[dict]:
+def query(
+    index: Index,
+    features: dict,
+    k: int = 5,
+    min_score: float = MIN_SCORE,
+    query_smiles: str | None = None,
+    sim_floor: float = SMILES_SIM_FLOOR,
+    rerank_pool: int = DEFAULT_RERANK_POOL,
+) -> list[dict]:
     """
     Retrieve up to k examples similar to `features`. Returns fewer than k (or
     zero) rather than padding with weak matches -- a misleading few-shot
     example is worse than none. Low/no-match queries are logged to stderr
     with their cell, which doubles as a signal for where the corpus needs
     more data.
+
+    If `query_smiles` is given (and rdkit is installed), applies a tiered
+    structural rerank on top of the BM25 ranking, over a widened pool of up
+    to `rerank_pool` BM25 candidates above min_score (not just the raw top-k
+    -- a strong structural match BM25 alone ranked outside the top-k can
+    still surface):
+      1. candidates with a parseable smiles AND Tanimoto >= sim_floor,
+         ranked by similarity (original BM25 rank as tiebreak) -- the
+         structural signal is trusted here.
+      2. candidates with no smiles / an unparseable smiles, in original
+         BM25 order.
+      3. candidates whose smiles parses but scores below sim_floor, in
+         original BM25 order -- ranked *below* tier 2 deliberately: a
+         low-confidence structural mismatch shouldn't outrank a record that
+         simply never offered the signal.
+    Without `query_smiles` (or without rdkit), behaves exactly as plain BM25
+    retrieval.
     """
     if index.bm25 is None:
         raise RuntimeError("rank_bm25 not installed -- pip install rank_bm25")
@@ -289,15 +424,59 @@ def query(index: Index, features: dict, k: int = 5, min_score: float = MIN_SCORE
               f"system_type={features['system_type']!r}", file=sys.stderr)
         return []
 
+    def _warn_if_short(hits: list[int]) -> None:
+        if len(hits) < k:
+            print(f"[rag] only {len(hits)}/{k} hits above min_score={min_score} "
+                  f"for cell={features['specialist_cell']!r}", file=sys.stderr)
+
     q_tokens = _record_to_tokens(features)
     scores = index.bm25.get_scores(q_tokens)
     ranked = sorted(candidate_idx, key=lambda i: scores[i], reverse=True)
-    hits = [i for i in ranked[:k] if scores[i] >= min_score]
 
-    if len(hits) < k:
-        print(f"[rag] only {len(hits)}/{k} hits above min_score={min_score} "
-              f"for cell={features['specialist_cell']!r}", file=sys.stderr)
+    if not query_smiles or Chem is None:
+        hits = [i for i in ranked[:k] if scores[i] >= min_score]
+        _warn_if_short(hits)
+        return [index.records[i] for i in hits]
 
+    pool = [i for i in ranked if scores[i] >= min_score][:max(rerank_pool, k)]
+    if not pool:
+        _warn_if_short(pool)
+        return []
+
+    try:
+        q_fp = get_fingerprint(query_smiles)
+    except ValueError:
+        print(f"[rag] query smiles unparseable ({query_smiles!r}), "
+              f"falling back to BM25-only ranking", file=sys.stderr)
+        hits = pool[:k]
+        _warn_if_short(hits)
+        return [index.records[i] for i in hits]
+
+    boosted: list[tuple[float, int, int]] = []   # (similarity, bm25_rank, idx)
+    no_smiles: list[tuple[int, int]] = []         # (bm25_rank, idx)
+    below_floor: list[tuple[int, int]] = []       # (bm25_rank, idx)
+    for rank, i in enumerate(pool):
+        smiles = index.records[i].get("smiles")
+        sim = None
+        if smiles:
+            try:
+                sim = DataStructs.TanimotoSimilarity(q_fp, get_fingerprint(smiles))
+            except ValueError:
+                sim = None
+        if sim is None:
+            no_smiles.append((rank, i))
+        elif sim >= sim_floor:
+            boosted.append((sim, rank, i))
+        else:
+            below_floor.append((rank, i))
+
+    boosted.sort(key=lambda t: (-t[0], t[1]))
+    no_smiles.sort(key=lambda t: t[0])
+    below_floor.sort(key=lambda t: t[0])
+    ordered = [i for _, _, i in boosted] + [i for _, i in no_smiles] + [i for _, i in below_floor]
+
+    hits = ordered[:k]
+    _warn_if_short(hits)
     return [index.records[i] for i in hits]
 
 
@@ -328,6 +507,8 @@ if __name__ == "__main__":
     parser.add_argument("--base-dir", default=None, help="Directory containing the *_methods.jsonl sources")
     parser.add_argument("--out", default="jsonl/rag_index.pkl")
     parser.add_argument("--query-text", default=None, help="If given, run a test query and print the result")
+    parser.add_argument("--query-smiles", default=None,
+                         help="Optional SMILES for the test query -- enables the structural rerank")
     parser.add_argument("--upload-cap", type=int, default=DEFAULT_UPLOAD_CAP,
                          help="Max records per upload_id (0 disables capping)")
     parser.add_argument("--include-lda", action="store_true",
@@ -354,6 +535,6 @@ if __name__ == "__main__":
     if args.query_text and idx.bm25 is not None:
         features = build_query_features(args.query_text, state={})
         print("Query features:", features)
-        hits = query(idx, features, k=5)
+        hits = query(idx, features, k=5, query_smiles=args.query_smiles)
         print(f"{len(hits)} hit(s):\n")
         print(format_examples(hits))
