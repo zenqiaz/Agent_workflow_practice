@@ -52,25 +52,44 @@ def _reclassify(records: list[dict]) -> list[dict]:
 
 def split_by_upload(records: list[dict], val_frac: float = 0.10, seed: int = 42
                      ) -> tuple[list[dict], list[dict]]:
-    """Split by upload_id so correlated entries stay in the same split.
-    Mirrors generate_sft.py's split_by_upload (MOSAIC project) exactly, so
-    this eval uses the same train/val boundary logic as the SFT data."""
+    """Split by upload_id so correlated entries stay in the same split,
+    stratified by (specialist_cell, dominant functional) so a minority
+    functional gets proportional train/val representation instead of being
+    at the mercy of one blind upload shuffle. Ported from generate_sft.py's
+    split_by_upload (MOSAIC project) -- that version stratifies but (like
+    this file, until the sibling fix above) rebuilt train/val by iterating
+    a Python `set` of upload_ids, which is hash-seed-order-dependent; this
+    port keeps the stratification but expands back to records via
+    deterministic lists, same fix as above."""
     by_upload: dict[str, list[dict]] = defaultdict(list)
     for r in records:
         uid = r.get("upload_id") or r.get("entry_id", "")
         by_upload[uid].append(r)
 
-    uploads = list(by_upload.keys())
-    rng = random.Random(seed)
-    rng.shuffle(uploads)
-    n_val = max(1, int(val_frac * len(uploads)))
+    upload_stratum: dict[str, tuple[str, str | None]] = {}
+    for uid, recs in by_upload.items():
+        cell = Counter(r.get("specialist_cell") for r in recs).most_common(1)[0][0]
+        func = Counter(r.get("functional") for r in recs).most_common(1)[0][0]
+        upload_stratum[uid] = (cell, func)
 
-    # Keep list order (not set order) when expanding back to records: set
-    # iteration over str keys depends on the process hash seed (randomized
-    # per launch), which silently reshuffled the BM25 train corpus and made
-    # tie-broken results (e.g. organic_general) non-reproducible run to run.
-    val_uploads = uploads[:n_val]
-    train_uploads = uploads[n_val:]
+    strata: dict[tuple[str, str | None], list[str]] = defaultdict(list)
+    for uid, stratum in upload_stratum.items():
+        strata[stratum].append(uid)
+
+    rng = random.Random(seed)
+    val_uploads: list[str] = []
+    for stratum in sorted(strata, key=lambda s: (s[0], s[1] or "")):
+        uids = sorted(strata[stratum])
+        rng.shuffle(uids)
+        if len(uids) < 2:
+            continue  # can't split a 1-upload stratum; it stays entirely in train
+        n_val = max(1, round(val_frac * len(uids)))
+        n_val = min(n_val, len(uids) - 1)
+        val_uploads.extend(uids[:n_val])
+
+    val_set = set(val_uploads)
+    train_uploads = [uid for uid in by_upload if uid not in val_set]  # dict iteration: insertion order, deterministic
+
     train = [r for uid in train_uploads for r in by_upload[uid]]
     val = [r for uid in val_uploads for r in by_upload[uid]]
     return train, val
