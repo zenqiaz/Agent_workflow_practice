@@ -65,14 +65,29 @@ def split_by_upload(records: list[dict], val_frac: float = 0.10, seed: int = 42
     rng.shuffle(uploads)
     n_val = max(1, int(val_frac * len(uploads)))
 
-    val_set = set(uploads[:n_val])
-    train_set = set(uploads[n_val:])
-    train = [r for uid in train_set for r in by_upload[uid]]
-    val = [r for uid in val_set for r in by_upload[uid]]
+    # Keep list order (not set order) when expanding back to records: set
+    # iteration over str keys depends on the process hash seed (randomized
+    # per launch), which silently reshuffled the BM25 train corpus and made
+    # tie-broken results (e.g. organic_general) non-reproducible run to run.
+    val_uploads = uploads[:n_val]
+    train_uploads = uploads[n_val:]
+    train = [r for uid in train_uploads for r in by_upload[uid]]
+    val = [r for uid in val_uploads for r in by_upload[uid]]
     return train, val
 
 
-def eval_record(train_idx, rec: dict, k: int) -> dict:
+def _blind_majority_by_cell(train_records: list[dict]) -> dict[str, str | None]:
+    """The single most common functional per cell in TRAIN only -- an honest
+    'always guess the corpus majority class' baseline, independent of
+    retrieval. (Not to be confused with majority_func below, which is a
+    majority vote among one query's own k=5 retrieved hits.)"""
+    by_cell: dict[str, Counter] = defaultdict(Counter)
+    for r in train_records:
+        by_cell[r.get("specialist_cell") or "?"][r.get("functional")] += 1
+    return {cell: counts.most_common(1)[0][0] for cell, counts in by_cell.items()}
+
+
+def eval_record(train_idx, rec: dict, k: int, blind_majority: dict[str, str | None]) -> dict:
     features = {
         "elements": rec.get("elements") or [],
         "n_atoms": rec.get("n_atoms"),
@@ -101,6 +116,9 @@ def eval_record(train_idx, rec: dict, k: int) -> dict:
     majority_func_label, _ = funcs.most_common(1)[0]
     majority_func = majority_func_label == true_func
 
+    cell = rec.get("specialist_cell") or "?"
+    blind_majority_func = blind_majority.get(cell) == true_func
+
     return {
         "n_hits": len(hits),
         "top1_func": top1_func,
@@ -108,6 +126,7 @@ def eval_record(train_idx, rec: dict, k: int) -> dict:
         "top1_exact": top1_func and top1_basis,
         "any5_func": any5_func,
         "majority_func": majority_func,
+        "blind_majority_func": blind_majority_func,
     }
 
 
@@ -128,12 +147,13 @@ def main():
         print(f"[eval] restricted to cell={args.cell!r}: {len(val_records)} val records", file=sys.stderr)
 
     train_idx = rag.build_index(train_records)
+    blind_majority = _blind_majority_by_cell(train_records)
 
     per_cell_results: dict[str, list[dict]] = defaultdict(list)
     t0 = time.monotonic()
     for i, rec in enumerate(val_records):
         cell = rec.get("specialist_cell") or "?"
-        result = eval_record(train_idx, rec, args.k)
+        result = eval_record(train_idx, rec, args.k, blind_majority)
         per_cell_results[cell].append(result)
         if (i + 1) % 50 == 0:
             print(f"[eval] {i+1}/{len(val_records)}", file=sys.stderr)
@@ -152,6 +172,7 @@ def main():
             "top1_exact_pct": 100 * sum(r["top1_exact"] for r in results) / n,
             "any5_func_pct": 100 * sum(r["any5_func"] for r in results) / n,
             "majority_func_pct": 100 * sum(r["majority_func"] for r in results) / n,
+            "blind_majority_func_pct": 100 * sum(r["blind_majority_func"] for r in results) / n,
         }
 
     print("\n" + "=" * 100)
@@ -159,7 +180,7 @@ def main():
           f"{duration_s:.1f}s, no LLM calls)")
     print("=" * 100)
     print(f"{'cell':<20} {'n':>5} {'no_hit%':>8} {'top1_func%':>11} {'top1_basis%':>12} "
-          f"{'top1_exact%':>12} {'any5_func%':>11} {'majority_func%':>15}")
+          f"{'top1_exact%':>12} {'any5_func%':>11} {'ret_maj%':>10} {'blind_maj%':>12}")
 
     all_results = [r for rs in per_cell_results.values() for r in rs]
     summary_by_cell = {}
@@ -168,14 +189,15 @@ def main():
         summary_by_cell[cell] = s
         print(f"{cell:<20} {s['n']:>5} {s['no_hit_pct']:>7.1f}% {s['top1_func_pct']:>10.1f}% "
               f"{s['top1_basis_pct']:>11.1f}% {s['top1_exact_pct']:>11.1f}% "
-              f"{s['any5_func_pct']:>10.1f}% {s['majority_func_pct']:>14.1f}%")
+              f"{s['any5_func_pct']:>10.1f}% {s['majority_func_pct']:>9.1f}% "
+              f"{s['blind_majority_func_pct']:>11.1f}%")
 
     overall = summarize(all_results)
     print("-" * 100)
     print(f"{'OVERALL':<20} {overall['n']:>5} {overall['no_hit_pct']:>7.1f}% "
           f"{overall['top1_func_pct']:>10.1f}% {overall['top1_basis_pct']:>11.1f}% "
           f"{overall['top1_exact_pct']:>11.1f}% {overall['any5_func_pct']:>10.1f}% "
-          f"{overall['majority_func_pct']:>14.1f}%")
+          f"{overall['majority_func_pct']:>9.1f}% {overall['blind_majority_func_pct']:>11.1f}%")
 
     out = {
         "type": "rag_eval_holdout",
