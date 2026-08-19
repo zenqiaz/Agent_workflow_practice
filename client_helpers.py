@@ -2809,6 +2809,10 @@ def check_struct(plan: dict, valid_tools: set) -> Dict[str, bool]:
     """
     nodes     = plan.get("nodes") or []
     artifacts = plan.get("artifacts_to_save") or []
+    # Auto-artifact mode: artifacts_to_save may be empty; final_report.fields holds outputs.
+    if not artifacts:
+        fr = plan.get("final_report") or {}
+        artifacts = fr.get("fields") or []
     tool_nodes_valid = all(
         n.get("tool") in valid_tools
         for n in nodes if n.get("kind") == "tool"
@@ -2821,7 +2825,25 @@ def check_struct(plan: dict, valid_tools: set) -> Dict[str, bool]:
         "nodes_have_id":       all(n.get("id") for n in nodes),
         "nodes_have_kind":     all(n.get("kind") for n in nodes),
         "tools_valid":         tool_nodes_valid,
+        "dep_graph_valid":     _check_dep_graph(plan),
     }
+
+
+def _check_dep_graph(plan: dict) -> bool:
+    """Return True if every tool node's input_id was produced by a prior node or is a declared geom_id."""
+    nodes = plan.get("nodes") or []
+    geom_ids = set(plan.get("geom_ids") or [])
+    output_ids: set = set()
+    for n in nodes:
+        if n.get("output_id"):
+            output_ids.add(n["output_id"])
+    for n in nodes:
+        if n.get("kind") != "tool":
+            continue
+        input_id = n.get("input_id") or (n.get("args") or {}).get("input_geom_id")
+        if input_id and input_id not in output_ids and input_id not in geom_ids:
+            return False
+    return True
 
 
 def format_plan_validation_feedback(checks: Dict[str, bool], error: str = "") -> str:
