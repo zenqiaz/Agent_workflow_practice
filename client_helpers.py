@@ -1112,6 +1112,72 @@ def structure_add_remove_proton(
     )
 
 
+def compute_pka_calibrated(
+    G_HA_eh: float,
+    G_A_minus_eh: float,
+    references: List[Dict[str, float]],
+    G_H_plus_ref_eh: float = -0.01372,
+    temperature_K: float = 298.15,
+) -> dict:
+    """Deterministic reference-acid-calibrated pKa (no LLM arithmetic).
+
+    Generalizes the standard isodesmic-correction formula used throughout the
+    pKa skill to N >= 1 reference acids: for each reference, back out the
+    systematic gas-phase error (epsilon_i = pKa_calc,i - pKa_exp,i) from its
+    own computed Gibbs energies and known experimental pKa, then apply the
+    mean correction across all references to the target compound.
+
+    N == 0 (empty references) skips calibration entirely and returns the raw
+    formula pKa — this is the plain, uncalibrated pKa case (e.g. a simple
+    carboxylic-acid O-H pKa with no reference-acid correction). N == 1
+    reproduces the single-reference isodesmic scheme (e.g. ethanal for alpha-CH
+    pKa). N > 1 reproduces the multi-reference-acid averaging scheme (e.g. the
+    El Agente pKa-of-carboxylic-acids benchmark). One function covers all three
+    cases so a skill only needs to document a single tool/node pattern.
+
+    Args:
+        G_HA_eh: Gibbs free energy of the target neutral acid (Hartree).
+        G_A_minus_eh: Gibbs free energy of the target conjugate base (Hartree).
+        references: list of {"G_HA_eh": ..., "G_A_minus_eh": ..., "pka_exp": ...}
+            dicts, one per reference acid. Empty list = no calibration.
+        G_H_plus_ref_eh: reference proton free energy (Hartree); Tissandier et al.
+            1998 default, -0.01372 Eh.
+        temperature_K: temperature for the RT ln10 conversion (default 298.15 K).
+
+    Returns:
+        {"status": "ok", "pka": float, "pka_raw": float, "epsilon_avg": float,
+         "per_reference_epsilon": [float, ...]}
+        or {"status": "error", "error": str} on invalid input.
+    """
+    R = 8.314462618          # J / (mol K)
+    LN10 = 2.302585093
+    EH_TO_J_PER_MOL = 2625499.638
+
+    def _raw_pka(g_ha: float, g_a: float) -> float:
+        dg_eh = g_a + G_H_plus_ref_eh - g_ha
+        dg_j = dg_eh * EH_TO_J_PER_MOL
+        return dg_j / (R * temperature_K * LN10)
+
+    try:
+        epsilons = []
+        for ref in (references or []):
+            pka_ref_calc = _raw_pka(float(ref["G_HA_eh"]), float(ref["G_A_minus_eh"]))
+            epsilons.append(pka_ref_calc - float(ref["pka_exp"]))
+        epsilon_avg = (sum(epsilons) / len(epsilons)) if epsilons else 0.0
+        pka_raw = _raw_pka(float(G_HA_eh), float(G_A_minus_eh))
+        pka = pka_raw - epsilon_avg
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"status": "error", "error": f"invalid reference/energy input: {exc}"}
+
+    return {
+        "status": "ok",
+        "pka": pka,
+        "pka_raw": pka_raw,
+        "epsilon_avg": epsilon_avg,
+        "per_reference_epsilon": epsilons,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pre-planning compound identification helpers
 # ---------------------------------------------------------------------------
@@ -2733,6 +2799,52 @@ def build_plan_review(plan: dict) -> dict:
     }
 
 
+def check_struct(plan: dict, valid_tools: set) -> Dict[str, bool]:
+    """Minimal structural validity every plan must pass, independent of task type.
+
+    Shared between the test harness (test_success_rate.py, which passes its own
+    _VALID_TOOLS) and production agent.py (which passes a set built from its own
+    CLIENT_SIDE_TOOL_FUNCS + the live MCP session's tool list) — this is the
+    validation gate a plan-retry loop checks against in both places.
+    """
+    nodes     = plan.get("nodes") or []
+    artifacts = plan.get("artifacts_to_save") or []
+    tool_nodes_valid = all(
+        n.get("tool") in valid_tools
+        for n in nodes if n.get("kind") == "tool"
+    )
+    return {
+        "is_dict":             isinstance(plan, dict),
+        "has_name":            bool(plan.get("name")),
+        "has_nodes":           len(nodes) > 0,
+        "has_artifacts":       len(artifacts) > 0,
+        "nodes_have_id":       all(n.get("id") for n in nodes),
+        "nodes_have_kind":     all(n.get("kind") for n in nodes),
+        "tools_valid":         tool_nodes_valid,
+    }
+
+
+def format_plan_validation_feedback(checks: Dict[str, bool], error: str = "") -> str:
+    """Turn a failed structural-check result into an LLM-readable retry message.
+
+    Used by the plan-retry loop (test harness and production agent.py) to tell
+    the planner exactly what was wrong with its previous plan before asking it
+    to try again, instead of just discarding the failure.
+    """
+    failed = [k for k, v in checks.items() if not v]
+    lines = [
+        "Your previous plan failed structural validation on these checks: "
+        + ", ".join(failed) + ".",
+    ]
+    if error:
+        lines.append(f"Error detail: {error}")
+    lines.append(
+        "Return a corrected plan as a single JSON object, fixing these issues. "
+        "Follow the same schema as before."
+    )
+    return "\n".join(lines)
+
+
 def print_plan_review(plan_pkg: dict) -> None:
     """Human-facing plan summary right after planning."""
     review = (plan_pkg or {}).get("review", {}) or {}
@@ -2793,6 +2905,32 @@ def _expand_settings_refs(obj: Any, settings: dict) -> Any:
     return obj
 
 
+def _expand_artifact_refs(obj: Any, artifacts: dict) -> Any:
+    """Expand '$(artifacts.KEY)' template strings using state['artifacts'] values.
+
+    Mirrors _expand_settings_refs exactly, against artifacts instead of plan
+    settings. Lets a kind:"tool" node consume a value computed by an earlier
+    node (e.g. a Gibbs free energy) as an argument, the same way calc_expr/llm
+    nodes already do via needs_artifacts. Recurses through dicts/lists so
+    nested structures (e.g. a "references": [{...}, ...] list) are covered.
+    """
+    import re as _re
+    if isinstance(obj, str):
+        m = _re.fullmatch(r'\$\(artifacts\.([^)]+)\)', obj)
+        if m:
+            return artifacts.get(m.group(1), obj)
+        return _re.sub(
+            r'\$\(artifacts\.([^)]+)\)',
+            lambda match: str(artifacts.get(match.group(1), match.group(0))),
+            obj,
+        )
+    if isinstance(obj, dict):
+        return {k: _expand_artifact_refs(v, artifacts) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_artifact_refs(v, artifacts) for v in obj]
+    return obj
+
+
 async def execute_tool_from_node_spec(*, state: Dict[str, Any], node_spec: Dict[str, Any]) -> Dict[str, Any]:
     tool_raw = node_spec.get("tool")
     tool_name = _normalize_tool_name(tool_raw)
@@ -2820,6 +2958,11 @@ async def execute_tool_from_node_spec(*, state: Dict[str, Any], node_spec: Dict[
     )
     if plan_settings:
         overrides = _expand_settings_refs(overrides, plan_settings)
+
+    # Expand $(artifacts.KEY) references using previously-computed artifacts.
+    artifacts_state = state.get("artifacts") if isinstance(state, dict) else None
+    if artifacts_state:
+        overrides = _expand_artifact_refs(overrides, artifacts_state)
     new_geometry = False
     if not input_geom_id or output_geom_id != input_geom_id:
         new_geometry = True

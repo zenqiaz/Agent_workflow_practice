@@ -82,9 +82,12 @@ from client_helpers import (
     state_get_tool_args,
     auto_display_spectra,
     result_dict_to_prompt,
+    check_struct as _check_struct_generic,
+    format_plan_validation_feedback,
 )
 from prompts import SYSTEM_PROMPT, REPORTER_SYSTEM_PROMPT
-from skills import run_planning_skills, SKILL_REGISTRY
+from skills import run_planning_skills, SKILL_REGISTRY, collect_skill_client_tools
+from build_graph_from_plan import expand_template
 
 LLM_MODEL    = os.getenv("LLM_MODEL", "gpt-4.1-mini")
 _LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip() or None
@@ -98,6 +101,13 @@ N_RUNS      = 10
 MODE        = "plan"   # "plan" | "full"
 WITH_SKILLS = True
 CHECKER     = "auto"   # "auto" | "pka" | "sp" | "nbo" | "solvation" | "struct"
+
+# Structural-validation retry budget: on failure, the checker's failed-check
+# list is fed back to the planner and it's asked to try again, up to this many
+# extra attempts (so MAX_PLAN_RETRIES=2 allows up to 3 planner calls total).
+# Matches the paper's own precedent of "a corrected plan generated in a second
+# planner call" (the pKa Level A missing-opt-step catch).
+MAX_PLAN_RETRIES = 2
 
 # Optional: pre-confirmed compound context injected into every planning call.
 # Leave "" to skip.  Used to match normal REPL flow without interactive prompts.
@@ -145,6 +155,9 @@ CLIENT_SIDE_TOOL_FUNCS = {
     "build_dimer_xyz": build_dimer_xyz,
     "set_geometry_xyz": set_geometry_xyz,
     "build_approach_scan_geometries": build_approach_scan_geometries,
+    # Skill-owned deterministic tools (e.g. PKaSkill's compute_pka_calibrated)
+    # are installed here automatically — no manual edit needed per skill.
+    **collect_skill_client_tools(),
 }
 
 
@@ -205,48 +218,18 @@ _VALID_TOOLS = {
     "build_approach_scan_geometries",
     # server-side MCP tools (also valid in plans):
     "build_coordination_complex",
-}
+} | set(collect_skill_client_tools().keys())
 
 
 def check_struct(plan: dict) -> Dict[str, bool]:
-    """Minimal structural validity — every plan must pass these."""
-    nodes     = plan.get("nodes") or []
-    artifacts = plan.get("artifacts_to_save") or []
-    # Auto-artifact mode: artifacts_to_save may be empty; final_report.fields holds outputs.
-    if not artifacts:
-        fr = plan.get("final_report") or {}
-        artifacts = fr.get("fields") or []
-    tool_nodes_valid = all(
-        n.get("tool") in _VALID_TOOLS
-        for n in nodes if n.get("kind") == "tool"
-    )
-    return {
-        "is_dict":             isinstance(plan, dict),
-        "has_name":            bool(plan.get("name")),
-        "has_nodes":           len(nodes) > 0,
-        "has_artifacts":       len(artifacts) > 0,
-        "nodes_have_id":       all(n.get("id") for n in nodes),
-        "nodes_have_kind":     all(n.get("kind") for n in nodes),
-        "tools_valid":         tool_nodes_valid,
-        "dep_graph_valid":     _check_dep_graph(plan),
-    }
+    """Minimal structural validity — every plan must pass these.
 
-
-def _check_dep_graph(plan: dict) -> bool:
-    """Return True if every tool node's input_id was produced by a prior node or is a declared geom_id."""
-    nodes = plan.get("nodes") or []
-    geom_ids = set(plan.get("geom_ids") or [])
-    output_ids: set = set()
-    for n in nodes:
-        if n.get("output_id"):
-            output_ids.add(n["output_id"])
-    for n in nodes:
-        if n.get("kind") != "tool":
-            continue
-        input_id = n.get("input_id") or (n.get("args") or {}).get("input_geom_id")
-        if input_id and input_id not in output_ids and input_id not in geom_ids:
-            return False
-    return True
+    Thin wrapper around the shared, parameterized check_struct in
+    client_helpers.py (also used by production agent.py's plan-retry loop;
+    that shared version includes auto-artifact-mode and dep_graph_valid),
+    binding it to this file's own _VALID_TOOLS set.
+    """
+    return _check_struct_generic(plan, _VALID_TOOLS)
 
 
 def check_pka(plan: dict) -> Dict[str, bool]:
@@ -254,16 +237,23 @@ def check_pka(plan: dict) -> Dict[str, bool]:
     tools_used = {n.get("tool") for n in nodes if n.get("kind") == "tool"}
     settings   = plan.get("settings") or {}
     artifacts  = plan.get("artifacts_to_save") or []
-    llm_nodes  = [n for n in nodes if n.get("kind") == "llm"]
-    needs_arts = [a for n in llm_nodes for a in (n.get("needs_artifacts") or [])]
+    # pKa calibration arithmetic is a kind:"tool" node (compute_pka_calibrated,
+    # owned by PKaSkill), not kind:"llm" — LLM-executed arithmetic on this
+    # formula was found to silently produce errors of >100 pKa units.
+    calc_nodes = [n for n in nodes
+                  if n.get("kind") == "tool" and n.get("tool") == "compute_pka_calibrated"]
+    arts_referenced = [
+        m for n in calc_nodes
+        for m in re.findall(r'\$\(artifacts\.([^)]+)\)', json.dumps(n.get("args") or {}))
+    ]
 
     return {
         "uses_freq_not_sp":    "run_freq_job" in tools_used and "run_sp_energy" not in tools_used,
         "has_h_plus_ref":      "G_H_plus_ref_eh" in settings,
         "artifacts_G_eh":      any(a.startswith("G_") and a.endswith("_eh") for a in artifacts),
         "pka_in_artifacts":    any("pka" in a.lower() for a in artifacts),
-        "llm_node_exists":     len(llm_nodes) >= 1,
-        "freq_arts_in_needs":  any("G_" in a and "_eh" in a for a in needs_arts),
+        "calc_node_exists":    len(calc_nodes) >= 1,
+        "freq_arts_in_needs":  any("G_" in a and "_eh" in a for a in arts_referenced),
     }
 
 
@@ -841,7 +831,12 @@ def run_plan_once(
     preload_specs: Optional[List[str]] = None,
     checker_context: Optional[Dict[str, Any]] = None,
 ) -> RunResult:
-    """One planning run. Returns pass/fail + per-check breakdown."""
+    """One planning run. Returns pass/fail + per-check breakdown.
+
+    On structural-check failure, feeds the failed-check list back to the
+    planner and retries (up to MAX_PLAN_RETRIES extra attempts) before giving
+    up — see format_plan_validation_feedback in client_helpers.py.
+    """
     state = dict(EMPTY_STATE)
     if preload_specs:
         _preload_geometries(preload_specs, state)
@@ -849,30 +844,76 @@ def run_plan_once(
     error = ""
     plan  = {}
     all_checks: Dict[str, bool] = {}
+    retry_attempts = 0
 
     token_usage: Dict[str, int] = {"planner": 0, "calculator": 0, "total": 0}
+    retry_fired   = False   # did the loop attempt at least one retry?
+    retry_stalled = False   # did it stop early because the same failure recurred?
     try:
         skill_ctxs = run_planning_skills(message, state) if with_skills else []
         msgs       = _build_messages(message, state, skill_ctxs, compound_context)
-        plan, token_usage = _call_planner(client, msgs)
-        plan = expand_template(plan)
 
-        # Structural checks always run
-        all_checks.update(check_struct(plan))
+        prev_failed_signature = None
+        for attempt in range(MAX_PLAN_RETRIES + 1):
+            plan, attempt_tokens = _call_planner(client, msgs)
+            for k, v in attempt_tokens.items():
+                token_usage[k] = token_usage.get(k, 0) + (v or 0)
 
-        # Task-specific checks
-        checker_fn = _CHECKER_MAP.get(checker_name)
-        if checker_fn:
-            import inspect as _inspect
-            sig = _inspect.signature(checker_fn)
-            checks = checker_fn(plan, checker_context) if "context" in sig.parameters else checker_fn(plan)
-            # When geometries are preloaded: opt-before-TDDFT not required;
-            # LLM comparison node allowed (reporter handles comparison, but planner may add one too)
-            if preload_specs and checker_name == "tddft":
-                checks.pop("has_opt_node", None)
-                checks.pop("tddft_after_opt", None)
-                checks.pop("no_llm_node", None)
-            all_checks.update(checks)
+            checks: Dict[str, bool] = {}
+            expand_error = ""
+            try:
+                plan = expand_template(plan)
+            except Exception as exc_expand:
+                # Template expansion (e.g. duplicate node IDs from a missing
+                # applies_to:"once") is itself a retryable planner mistake —
+                # feed the error back instead of letting it escape the loop.
+                expand_error = str(exc_expand)
+                checks = {"template_expansion_ok": False}
+
+            if not expand_error:
+                checks.update(check_struct(plan))
+
+                checker_fn = _CHECKER_MAP.get(checker_name)
+                if checker_fn:
+                    import inspect as _inspect
+                    sig = _inspect.signature(checker_fn)
+                    task_checks = (checker_fn(plan, checker_context)
+                                   if "context" in sig.parameters else checker_fn(plan))
+                    # When geometries are preloaded: opt-before-TDDFT not required;
+                    # LLM comparison node allowed (reporter handles comparison, but planner may add one too)
+                    if preload_specs and checker_name == "tddft":
+                        task_checks.pop("has_opt_node", None)
+                        task_checks.pop("tddft_after_opt", None)
+                        task_checks.pop("no_llm_node", None)
+                    checks.update(task_checks)
+
+            if all(checks.values()):
+                break
+
+            retry_attempts = attempt + 1
+            failed_signature = frozenset(k for k, v in checks.items() if not v)
+
+            if failed_signature == prev_failed_signature:
+                # Same failure as last attempt — the planner isn't converging
+                # on this feedback. Stop spending retries rather than burning
+                # the rest of the budget on a loop that isn't making progress.
+                retry_stalled = True
+                print(f"  [plan_retry] attempt={attempt+1} "
+                      f"failed={sorted(failed_signature)} "
+                      f"-- identical to previous attempt, stopping early (not converging)")
+                break
+
+            if attempt < MAX_PLAN_RETRIES:
+                retry_fired = True
+                prev_failed_signature = failed_signature
+                print(f"  [plan_retry] attempt={attempt+1} "
+                      f"failed={sorted(failed_signature)}"
+                      + (f" error={expand_error}" if expand_error else ""))
+                msgs.append({"role": "assistant", "content": json.dumps(plan)})
+                msgs.append({"role": "user",
+                             "content": format_plan_validation_feedback(checks, expand_error)})
+
+        all_checks.update(checks)
 
     except Exception as exc:
         error = str(exc)
@@ -887,6 +928,9 @@ def run_plan_once(
         "error":       error,
         "duration_ms": duration_ms,
         "plan":        plan,
+        "retry_attempts": retry_attempts,
+        "retry_fired":     retry_fired,
+        "retry_stalled":   retry_stalled,
         "token_usage": token_usage,
     }
 
@@ -901,7 +945,12 @@ async def run_full_once(
     preload_specs: Optional[List[str]] = None,
     checker_context: Optional[Dict[str, Any]] = None,
 ) -> RunResult:
-    """One full run: plan → execute → check artifacts."""
+    """One full run: plan → execute → check artifacts.
+
+    On structural-check failure, feeds the failed-check list back to the
+    planner and retries (up to MAX_PLAN_RETRIES extra attempts) before giving
+    up — see format_plan_validation_feedback in client_helpers.py.
+    """
     from build_graph_from_plan import build_graph_from_plan, build_state
 
     state = dict(EMPTY_STATE)
@@ -911,6 +960,9 @@ async def run_full_once(
     error = ""
     plan  = {}
     all_checks: Dict[str, bool] = {}
+    retry_attempts = 0
+    retry_fired    = False
+    retry_stalled  = False
 
     token_usage: Dict[str, int] = {"planner": 0, "calculator": 0, "reporter": 0, "total": 0}
     agent_report = ""
@@ -918,22 +970,67 @@ async def run_full_once(
         # Step 1: generate plan
         skill_ctxs = run_planning_skills(message, state) if with_skills else []
         msgs       = _build_messages(message, state, skill_ctxs, compound_context)
-        plan, token_usage = _call_planner(client, msgs)
-        plan = expand_template(plan)
 
-        all_checks.update(check_struct(plan))
-        checker_fn = _CHECKER_MAP.get(checker_name)
-        if checker_fn:
-            import inspect as _inspect
-            sig = _inspect.signature(checker_fn)
-            checks = checker_fn(plan, checker_context) if "context" in sig.parameters else checker_fn(plan)
-            # When geometries are preloaded: opt-before-TDDFT not required;
-            # LLM comparison node allowed (reporter handles comparison, but planner may add one too)
-            if preload_specs and checker_name == "tddft":
-                checks.pop("has_opt_node", None)
-                checks.pop("tddft_after_opt", None)
-                checks.pop("no_llm_node", None)
-            all_checks.update(checks)
+        prev_failed_signature = None
+        for attempt in range(MAX_PLAN_RETRIES + 1):
+            plan, attempt_tokens = _call_planner(client, msgs)
+            for k, v in attempt_tokens.items():
+                token_usage[k] = token_usage.get(k, 0) + (v or 0)
+
+            checks: Dict[str, bool] = {}
+            expand_error = ""
+            try:
+                plan = expand_template(plan)
+            except Exception as exc_expand:
+                # Template expansion (e.g. duplicate node IDs from a missing
+                # applies_to:"once") is itself a retryable planner mistake —
+                # feed the error back instead of letting it escape the loop.
+                expand_error = str(exc_expand)
+                checks = {"template_expansion_ok": False}
+
+            if not expand_error:
+                checks.update(check_struct(plan))
+                checker_fn = _CHECKER_MAP.get(checker_name)
+                if checker_fn:
+                    import inspect as _inspect
+                    sig = _inspect.signature(checker_fn)
+                    task_checks = (checker_fn(plan, checker_context)
+                                   if "context" in sig.parameters else checker_fn(plan))
+                    # When geometries are preloaded: opt-before-TDDFT not required;
+                    # LLM comparison node allowed (reporter handles comparison, but planner may add one too)
+                    if preload_specs and checker_name == "tddft":
+                        task_checks.pop("has_opt_node", None)
+                        task_checks.pop("tddft_after_opt", None)
+                        task_checks.pop("no_llm_node", None)
+                    checks.update(task_checks)
+
+            if all(checks.values()):
+                break
+
+            retry_attempts = attempt + 1
+            failed_signature = frozenset(k for k, v in checks.items() if not v)
+
+            if failed_signature == prev_failed_signature:
+                # Same failure as last attempt — not converging, stop early
+                # rather than spending the rest of the retry budget on a loop
+                # that isn't making progress.
+                retry_stalled = True
+                print(f"  [plan_retry] attempt={attempt+1} "
+                      f"failed={sorted(failed_signature)} "
+                      f"-- identical to previous attempt, stopping early (not converging)")
+                break
+
+            if attempt < MAX_PLAN_RETRIES:
+                retry_fired = True
+                prev_failed_signature = failed_signature
+                print(f"  [plan_retry] attempt={attempt+1} "
+                      f"failed={sorted(failed_signature)}"
+                      + (f" error={expand_error}" if expand_error else ""))
+                msgs.append({"role": "assistant", "content": json.dumps(plan)})
+                msgs.append({"role": "user",
+                             "content": format_plan_validation_feedback(checks, expand_error)})
+
+        all_checks.update(checks)
 
         if not all(all_checks.values()):
             raise ValueError("Plan failed structural checks; skipping execution")
@@ -1002,6 +1099,9 @@ async def run_full_once(
         "error":       error,
         "duration_ms": duration_ms,
         "plan":        plan,
+        "retry_attempts": retry_attempts,
+        "retry_fired":     retry_fired,
+        "retry_stalled":   retry_stalled,
         "token_usage": token_usage,
         "agent_report": agent_report,
     }
@@ -1062,6 +1162,9 @@ def save_test_log(
                 "checks":      r["checks"],
                 "error":       r["error"],
                 "plan":        r["plan"],
+                "retry_attempts": r.get("retry_attempts", 0),
+                "retry_fired":    r.get("retry_fired", False),
+                "retry_stalled":  r.get("retry_stalled", False),
                 "token_usage": r.get("token_usage", {}),
             }
             for i, r in enumerate(results)
@@ -1254,7 +1357,7 @@ def parse_args():
 async def _run_full_suite(args):
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
-    from nbo_agent_planning import _build_mcp_server_params
+    from agent import _build_mcp_server_params
 
     server_params = _build_mcp_server_params()
 

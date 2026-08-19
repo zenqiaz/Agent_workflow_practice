@@ -44,6 +44,8 @@ from client_helpers import (
     parse_json_only,
     build_plan_review,
     print_plan_review,
+    check_struct,
+    format_plan_validation_feedback,
     #run_node_via_existing_executor,
     #run_plan_deterministically,
     run_tool_node,
@@ -58,9 +60,9 @@ from client_helpers import (
     render_spectrum_image,
     render_pes_plot,
 )
-from build_graph_from_plan import build_graph_from_plan, build_state
+from build_graph_from_plan import build_graph_from_plan, build_state, expand_template
 from prompts import SYSTEM_PROMPT, CALCULATOR_SYSTEM_PROMPT, REPORTER_SYSTEM_PROMPT
-from skills import run_planning_skills
+from skills import run_planning_skills, collect_skill_client_tools
 
 
 
@@ -77,6 +79,10 @@ CLIENT_SIDE_TOOL_FUNCS = {
     "build_approach_scan_geometries": build_approach_scan_geometries,
     "pubchem_get_basic_properties": pubchem_get_basic_properties,
     "structure_add_remove_proton": structure_add_remove_proton,
+    # Deterministic tool functions declared by skills (e.g. PKaSkill's
+    # compute_pka_calibrated) are installed here automatically — a new skill
+    # that needs its own calculator never requires editing this file.
+    **collect_skill_client_tools(),
 }
 
 
@@ -145,7 +151,8 @@ def _print_token_usage(state: dict) -> None:
 
 
 async def handle_user_turn(session, client, state, user_text: str, tools_for_this_call: list,
-                           compound_context: str = "", skill_contexts: list = []):
+                           compound_context: str = "", skill_contexts: list = [],
+                           valid_tools: set = frozenset()):
     # Build message list: general prompt → skills → state → compound identity → user
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
@@ -161,7 +168,18 @@ async def handle_user_turn(session, client, state, user_text: str, tools_for_thi
     messages.append({"role": "user", "content": user_text})
     state["last_user_text"] = user_text
 
+    # MAX_TOOL_ROUNDS is the plan-validation retry budget: on structural-check
+    # failure, the failed checks are fed back to the planner and it gets
+    # another attempt, up to this many total planner calls. Matches the
+    # paper's own precedent of "a corrected plan generated in a second
+    # planner call" (the pKa Level A missing-opt-step catch), now automatic.
     MAX_TOOL_ROUNDS = 4
+    plan = {}
+    checks: Dict[str, bool] = {}
+    retry_attempts = 0
+    retry_fired    = False
+    retry_stalled  = False
+    prev_failed_signature = None
     for _round in range(MAX_TOOL_ROUNDS):
         #print("TOOL NAMES FOR MODEL:", tool_names_for_model)
         #print("TOOLS SENT:", [t["function"]["name"] for t in tools_for_this_call])
@@ -177,14 +195,68 @@ async def handle_user_turn(session, client, state, user_text: str, tools_for_thi
         raw = (msg.content or "").strip()
         print(raw)
         plan = parse_json_only(raw)
-        review = build_plan_review(plan)
-        plan_pkg = {"plan": plan, "review": review, "ui": {"saved_files": {}}}
-        store_plan(state, plan_pkg)
-        print_plan_review(plan_pkg)
-        return plan_pkg
 
+        expand_error = ""
+        try:
+            plan = expand_template(plan)
+        except Exception as exc_expand:
+            # Template expansion (e.g. duplicate node IDs from a missing
+            # applies_to:"once") is itself a retryable planner mistake — catch
+            # it here (before the human ever sees the plan) instead of letting
+            # it surface later as a hard failure at execution time.
+            expand_error = str(exc_expand)
 
-    #print("\n[Final]\nEarly exit: too many tool rounds. Please rephrase or provide missing info.")
+        checks = ({"template_expansion_ok": False} if expand_error
+                   else (check_struct(plan, valid_tools) if valid_tools else {}))
+        if not checks or all(checks.values()):
+            review = build_plan_review(plan)
+            plan_pkg = {"plan": plan, "review": review, "ui": {"saved_files": {}},
+                        "retry_attempts": retry_attempts, "retry_fired": retry_fired,
+                        "retry_stalled": retry_stalled}
+            store_plan(state, plan_pkg)
+            print_plan_review(plan_pkg)
+            return plan_pkg
+
+        retry_attempts = _round + 1
+        failed_signature = frozenset(k for k, v in checks.items() if not v)
+
+        if failed_signature == prev_failed_signature:
+            # Same failure as last attempt — not converging, stop early
+            # rather than spending the rest of the retry budget on a loop
+            # that isn't making progress.
+            retry_stalled = True
+            print(f"  [plan_retry] attempt={_round+1} "
+                  f"failed={sorted(failed_signature)} "
+                  f"-- identical to previous attempt, stopping early (not converging)")
+            break
+
+        print(f"  [plan_retry] attempt={_round+1} "
+              f"failed={sorted(failed_signature)}"
+              + (f" error={expand_error}" if expand_error else ""))
+        if _round < MAX_TOOL_ROUNDS - 1:
+            retry_fired = True
+            prev_failed_signature = failed_signature
+            messages.append({"role": "user",
+                              "content": format_plan_validation_feedback(checks, expand_error)})
+
+    # Retries either exhausted or stalled (same failure recurred) and the plan
+    # still fails structural validation. Fail-open, not fail-silent: return
+    # the plan (the existing "Execute this plan? (y/N)" human confirmation is
+    # still the final safety net) but make the failure impossible to miss in
+    # the review the human sees.
+    review = build_plan_review(plan)
+    reason = "the same failure recurred" if retry_stalled else f"{MAX_TOOL_ROUNDS} attempts were exhausted"
+    review["validation_warning"] = (
+        f"WARNING: This plan failed automatic structural validation "
+        f"({reason}): {[k for k, v in checks.items() if not v]}"
+    )
+    plan_pkg = {"plan": plan, "review": review, "ui": {"saved_files": {}},
+                "retry_attempts": retry_attempts, "retry_fired": retry_fired,
+                "retry_stalled": retry_stalled}
+    store_plan(state, plan_pkg)
+    print_plan_review(plan_pkg)
+    print(review["validation_warning"])
+    return plan_pkg
 
 
 def _cache_confirmed_card(state: AgentState, name: str, card: dict) -> None:
@@ -381,6 +453,13 @@ async def main():
 
             tools = await session.list_tools()
             tool_names = [t.name for t in tools.tools]
+            # Authoritative "is this a real tool" set for the plan-retry loop's
+            # structural validator — every MCP tool plus every client-side tool
+            # (including skill-owned ones, via CLIENT_SIDE_TOOL_FUNCS), not the
+            # OPENAI_TOOLS-filtered subset below (that filtering is unrelated:
+            # it's for the native tool-calling schema, which the planner never
+            # actually invokes since tool_choice="none").
+            VALID_TOOLS = set(tool_names) | set(CLIENT_SIDE_TOOL_FUNCS.keys())
             print("MCP tools available:", tool_names)
             print(f"Compound mode: {compound_mode}  "
                   f"(change with: mode full|name|smiles|xyz)")
@@ -546,7 +625,8 @@ async def main():
                 skill_contexts = run_planning_skills(line, state)
                 await handle_user_turn(session, client, state, line, tools_for_this_call,
                                        compound_context=compound_context,
-                                       skill_contexts=skill_contexts)
+                                       skill_contexts=skill_contexts,
+                                       valid_tools=VALID_TOOLS)
 
 if __name__ == "__main__":
     asyncio.run(main())

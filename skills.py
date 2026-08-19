@@ -11,13 +11,27 @@ Usage:
     # → list[str], one entry per matched skill
 """
 from __future__ import annotations
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
+
+from client_helpers import compute_pka_calibrated
 
 
 class PlannerSkill:
     """Base class for planner skills."""
     name: str = ""
     priority: int = 50  # lower = injected earlier in message list
+
+    # Deterministic tool functions this skill owns, e.g.
+    # {"compute_pka_calibrated": compute_pka_calibrated}. Implementations may
+    # live anywhere (client_helpers.py by convention, alongside every other
+    # tool function) — declaring them here is what makes them discoverable and
+    # auto-installable into the executor's tool registry via
+    # collect_skill_client_tools(), instead of requiring a manual edit to
+    # CLIENT_SIDE_TOOL_FUNCS in agent.py / test_success_rate.py for every skill
+    # that needs its own calculation. Use this instead of kind:"llm" arithmetic
+    # or ad-hoc global tool registrations whenever a skill needs to compute a
+    # derived quantity deterministically.
+    client_tools: Dict[str, Callable] = {}
 
     def matches(self, user_text: str, state: Dict[str, Any]) -> bool:
         raise NotImplementedError
@@ -105,6 +119,12 @@ class PKaSkill(PlannerSkill):
     name = "pka_calibration"
     priority = 20
 
+    # Owns compute_pka_calibrated: deterministic pKa arithmetic (plain and
+    # reference-acid-calibrated, N >= 0 references) — replaces the kind:"llm"
+    # arithmetic node this skill used to instruct the planner to emit, which
+    # was found to silently produce arithmetic errors of >100 pKa units.
+    client_tools = {"compute_pka_calibrated": compute_pka_calibrated}
+
     _KEYWORDS = ("pka", "pk_a", "acid dissociation", "acidity", "deprotonation",
                  "conjugate base", "ionization constant", "ka ")
 
@@ -125,42 +145,76 @@ Required artifacts:
   Both MUST come from run_freq_job nodes, NOT from run_sp_energy.
   (SP energies lack zero-point and thermal corrections → unacceptable for pKa.)
 
-Formula (for the LLM calc node):
-  ΔG_eh  = G_A_minus_eh + G_H_plus_ref_eh − G_HA_eh
-  ΔG_J   = ΔG_eh × 2625499.638        (Hartree → J/mol)
-  pKa    = ΔG_J / (8.314462618 × 298.15 × 2.302585093)
+Formula (deterministic tool node — do NOT use kind:"llm" for this arithmetic;
+verified that LLM-executed arithmetic on this exact formula can be off by
+>100 pKa units, even though the underlying Gibbs energies are correct):
+
+  Use ONE kind:"tool", tool:"compute_pka_calibrated" node per target compound:
+
+  {
+    "id": "compute_pka_{C}",
+    "kind": "tool",
+    "tool": "compute_pka_calibrated",
+    "needs": ["freq_{C}_HA", "freq_{C}_A_minus"],
+    "args": {
+      "G_HA_eh": "$(artifacts.G_{C}_HA_eh)",
+      "G_A_minus_eh": "$(artifacts.G_{C}_A_minus_eh)",
+      "references": [],
+      "G_H_plus_ref_eh": "$(settings.G_H_plus_ref_eh)"
+    },
+    "product": {"pka_{C}": "pka"}
+  }
+
+  This computes the plain (uncalibrated) pKa: ΔG_eh = G_A_minus_eh +
+  G_H_plus_ref_eh − G_HA_eh, converted to pKa via ΔG_J/(R·T·ln10). Leave
+  "references" as an empty list for this case — the tool treats an empty list
+  as "no calibration" and returns the raw formula pKa.
 
 Recommended level of theory:
   Gas phase    : B3LYP/def2-SVP  (opt + freq on same level)
   Higher acc.  : opt B3LYP/def2-SVP → SP B3LYP/def2-TZVP
   Aqueous pKa  : use run_solvator_cluster_thermo (nsolv ≥ 3) for HA and A⁻
 
-Isodesmic calibration for alpha-CH pKa (REQUIRED for carbonyl alpha-H requests):
+Isodesmic / reference-acid calibration (REQUIRED for carbonyl alpha-H requests;
+also usable for any pKa calibrated against known reference-acid pKa values):
   Gas-phase B3LYP/def2-SVP has a large systematic error vs. aqueous experiment
-  (~200–250 pKa units too high) due to missing solvation. Cancel this error
-  using ethanal (acetaldehyde, CH₃CHO) as a calibration reference:
+  (~200–250 pKa units too high) due to missing solvation. Cancel this error by
+  calibrating against one or more reference acids with known experimental pKa
+  (e.g. ethanal/acetaldehyde, pKa=17.0, for alpha-CH acidity):
 
-    Experimental alpha-CH pKa(ethanal, aq) = 17.0
+  Plan must include opt+freq nodes for each reference acid's HA and A⁻ (same
+  level as targets). Then populate the SAME compute_pka_{C} tool node's
+  "references" list, one entry per reference acid, and add each reference's
+  freq nodes to "needs":
 
-  Plan must include opt+freq nodes for ethanal HA and A⁻ (same level as targets).
-  Artifact names: G_ethanal_HA_eh, G_ethanal_A_minus_eh
+  {
+    "id": "compute_pka_{C}",
+    "kind": "tool",
+    "tool": "compute_pka_calibrated",
+    "needs": ["freq_{C}_HA", "freq_{C}_A_minus",
+              "freq_ethanal_HA", "freq_ethanal_A_minus"],
+    "args": {
+      "G_HA_eh": "$(artifacts.G_{C}_HA_eh)",
+      "G_A_minus_eh": "$(artifacts.G_{C}_A_minus_eh)",
+      "references": [
+        {"G_HA_eh": "$(artifacts.G_ethanal_HA_eh)",
+         "G_A_minus_eh": "$(artifacts.G_ethanal_A_minus_eh)",
+         "pka_exp": 17.0}
+      ],
+      "G_H_plus_ref_eh": "$(settings.G_H_plus_ref_eh)"
+    },
+    "product": {"pka_{C}": "pka"}
+  }
 
-  In each per-compound pKa LLM node, include G_ethanal_HA_eh and
-  G_ethanal_A_minus_eh in needs_artifacts and apply:
+  This same pattern extends to N >= 2 reference acids (e.g. a multi-acid
+  calibration such as fitting the proton solvation free energy against several
+  carboxylic acids of known pKa) by adding more entries to "references" — no
+  extra nodes needed; the tool averages the per-reference correction
+  internally (epsilon_avg over all references).
 
-    ΔG_ref_eh  = G_ethanal_A_minus_eh + G_H_plus_ref_eh − G_ethanal_HA_eh
-    pKa_ref_calc = ΔG_ref_eh × 2625499.638 / (8.314462618 × 298.15 × 2.302585093)
-    epsilon    = pKa_ref_calc − 17.0          (systematic error to subtract)
-
-    ΔG_X_eh    = G_X_A_minus_eh + G_H_plus_ref_eh − G_X_HA_eh
-    pKa_X_raw  = ΔG_X_eh × 2625499.638 / (8.314462618 × 298.15 × 2.302585093)
-    pKa_X      = pKa_X_raw − epsilon          (calibrated pKa)
-
-  LLM node product mapping:
-    ALWAYS use  "product": {"pka_{C}": "pka"}  and instruct the LLM to return
-    JSON with the key "pka" (lowercase, exactly).  The prompt should end with:
-    "Return JSON: {status, pka}" — NOT "pKa_X", NOT "pKa", NOT any other variant.
-    The executor reads result["pka"]; wrong capitalisation → artifact stays null.
+  G_H_plus_ref_eh MUST be set in plan settings (single source of truth,
+  referenced via $(settings.G_H_plus_ref_eh) by every pKa node in the plan —
+  do not hardcode it as a literal per node).
 
 Deprotonation step — structure_add_remove_proton:
   Use  mode="remove"  with the correct  site_selector  (STRING, not a dict).
@@ -197,17 +251,23 @@ xTB pre-optimization for anion geometry (REQUIRED for alpha-carbon deprotonation
 Plan validation rules:
   ✓ artifacts_to_save MUST include G_HA_eh and G_A_minus_eh
   ✓ Both freq nodes must set  product: {"G_XX_eh": "gibbs_free_energy_eh"}
-  ✓ LLM calc node must list  needs_artifacts: ["G_HA_eh", "G_A_minus_eh"]
+  ✓ compute_pka_{C} tool node must set  args: {"G_HA_eh": "$(artifacts...)",
+    "G_A_minus_eh": "$(artifacts...)", "references": [...], "G_H_plus_ref_eh":
+    "$(settings.G_H_plus_ref_eh)"}  and  product: {"pka_{C}": "pka"}
   ✓ structure_add_remove_proton node: use input_id (not geometry_xyz in args), site_selector only
   ✗ Do NOT use SP energy as proxy for G in a pKa plan
+  ✗ Do NOT use kind:"llm" for the pKa calibration arithmetic — use the
+    compute_pka_calibrated tool node above
 
 Multi-compound pKa with calibration — use template mode (N >= 3 targets):
   Put all target compounds and ethanal in "compounds" list.
   Mark ethanal with role="reference".
   per_compound: load → deprot (alpha_carbon, xtb_preopt: true on A⁻ opt) → freq_HA → freq_A⁻
-  post_template: one compute_pka_{C} LLM node per target (applies_to="targets_only")
-    that reads G_{C}_HA_eh, G_{C}_A_minus_eh, G_ethanal_HA_eh, G_ethanal_A_minus_eh
-    (last two are literal — not {C} — because ethanal is the fixed reference).
+  post_template: one compute_pka_{C} kind:"tool" node per target
+    (applies_to="targets_only"), tool:"compute_pka_calibrated", reading
+    G_{C}_HA_eh, G_{C}_A_minus_eh via args as above, with "references" set to
+    G_ethanal_HA_eh / G_ethanal_A_minus_eh (literal — not {C} — because
+    ethanal is the fixed reference).
 
 on_error patches for run_opt_job / run_freq_job:
   RESOURCE_LIMIT (geometry slow to converge, wall time exceeded):
@@ -1481,3 +1541,26 @@ def run_planning_skills(
         print("[No domain skills matched]")
 
     return [s.render(user_text, state) for s in matched]
+
+
+def collect_skill_client_tools(registry: List[PlannerSkill] = SKILL_REGISTRY) -> Dict[str, Callable]:
+    """Merge client_tools declared by every registered skill into one dict.
+
+    This is how a skill's deterministic tool functions get installed into the
+    executor's tool registry (CLIENT_SIDE_TOOL_FUNCS in agent.py /
+    test_success_rate.py) automatically — adding a new skill-specific
+    calculator requires only implementing it and declaring it on the owning
+    skill's client_tools, never editing agent.py or test_success_rate.py.
+
+    Raises on a name collision between two different skills (fail loud rather
+    than silently letting one skill's tool shadow another's).
+    """
+    merged: Dict[str, Callable] = {}
+    for skill in registry:
+        for tool_name, fn in (getattr(skill, "client_tools", None) or {}).items():
+            if tool_name in merged and merged[tool_name] is not fn:
+                raise ValueError(
+                    f"client_tools collision: {tool_name!r} declared by multiple skills"
+                )
+            merged[tool_name] = fn
+    return merged

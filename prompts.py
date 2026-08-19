@@ -23,9 +23,25 @@ Operating model (control room vs assembly line)
 - Only include LLM “supervisor” steps for a SMALL, task-specific whitelist of potential patterns (typically 1–3). Do NOT design a general “fix everything” supervisor.
 
 Node types
-- There are 2 kinds of node in the workflow: tool and calc (LLM), each node should show their type in its kind field.
-- tools: running tools. kind: "tool"
-- calculation: computing NUMERIC derived quantities (e.g., pKa) from tool artifacts. kind: "llm"  (executed by QC-CALCULATOR, returns JSON only)
+- There are 3 kinds of node in the workflow: tool, calc_expr, and llm — each node should show its type in its kind field.
+- tools: running tools (including deterministic calculations a skill owns — see below). kind: "tool"
+- calc_expr: a single deterministic arithmetic expression evaluated with zero LLM tokens (no loops/lists — see the calc_expr node policy below). kind: "calc_expr"
+- llm: a bounded LLM call for cases neither of the above can express (e.g. a derived quantity with list/table-shaped output). kind: "llm"  (executed by QC-CALCULATOR, returns JSON only)
+
+Preference order for computing a NUMERIC derived quantity (e.g. pKa, ΔG, a spin
+gap) from tool artifacts:
+  1. If a skill already owns a deterministic tool for this exact formula (check
+     the active skill's instructions — e.g. PKaSkill owns compute_pka_calibrated
+     for pKa), use that tool node. This is a kind:"tool" node whose args may
+     reference earlier artifacts via "$(artifacts.KEY)" and plan settings via
+     "$(settings.KEY)" — the executor resolves both before calling the tool.
+  2. Otherwise, if the formula is a single closed-form scalar expression, use a
+     kind:"calc_expr" node instead of composing an LLM node.
+  3. Only use kind:"llm" when neither applies (e.g. the result is a list/table,
+     or genuinely requires judgment). Do NOT use kind:"llm" for arithmetic a
+     skill's tool or calc_expr can express — LLM-executed arithmetic has been
+     found to silently produce large errors (>100 units off) even when the
+     input values are correct.
 
 TOOL NODES
 - Always omit charge and multiplicity in tool input, do not guess the values.
@@ -102,11 +118,15 @@ Output a single JSON object with these top-level keys:
     },
     {
       "id": "compute_pka",
-      "kind": "llm",
-      "task": "compute_pka",
+      "kind": "tool",
+      "tool": "compute_pka_calibrated",
       "needs": ["freq_ha", "freq_a_anion"],
-      "prompt": "Compute pKa of acetic acid. deltaG_eh = G_A_minus_eh + G_H_plus_ref_eh - G_HA_eh. Convert to J/mol via Eh_to_J_mol. Then pKa = deltaG_J_mol / (R * T * ln10). G_H_plus_ref_eh is in plan settings. Return JSON with: status, deltaG_eh, deltaG_J_mol, pka.",
-      "needs_artifacts": ["G_HA_eh", "G_A_minus_eh"],
+      "args": {
+        "G_HA_eh": "$(artifacts.G_HA_eh)",
+        "G_A_minus_eh": "$(artifacts.G_A_minus_eh)",
+        "references": [],
+        "G_H_plus_ref_eh": "$(settings.G_H_plus_ref_eh)"
+      },
       "product": { "pka": "pka" }
     }
   ],
@@ -185,12 +205,18 @@ Error handling policy
 - Cap retries with max_attempts. Do NOT escalate to an LLM for error fixing.
 
 LLM node policy (kind: "llm")
-- LLM nodes (QC-CALCULATOR) are ONLY for computing scalar numeric derived quantities from tool artifacts.
-  Valid example: pKa from G_HA_eh, G_A_minus_eh, G_H_plus_ref_eh (one number from a formula).
+- LLM nodes (QC-CALCULATOR) are the LAST resort for computing scalar numeric derived
+  quantities from tool artifacts — see the preference order in "Node types" above.
+  pKa specifically is NEVER an llm node: PKaSkill owns a compute_pka_calibrated
+  tool node for it (plain and reference-acid-calibrated) — see that skill's
+  instructions when active. LLM-executed arithmetic on this exact formula was
+  found to silently produce errors of >100 pKa units even with correct inputs.
 - QC-CALCULATOR returns machine-readable JSON ONLY. It CANNOT write narrative text, tables, or reports.
   Do NOT create a kind:"llm" node for report generation — it will always fail.
-- Only add a kind:"llm" node when a derived number (pKa, ΔG, relative energy) must be computed via a
-  formula. If the tool output already contains all needed values, skip the LLM node entirely.
+- Only add a kind:"llm" node when a derived number (ΔG, relative energy, etc.) must be computed
+  via a formula AND no owning skill provides a tool for it AND it cannot be expressed as a single
+  calc_expr expression (e.g. it needs list/table-shaped reasoning). If the tool output already
+  contains all needed values, skip the LLM node entirely.
 - FORBIDDEN uses of kind:"llm" (the reporter handles all of these automatically):
     - Comparing spectra between compounds ("which absorbs more at 350 nm?") — reporter ranks by f
     - Ranking conformers by energy from scan_results — reporter identifies minimum directly
