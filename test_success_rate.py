@@ -83,13 +83,16 @@ from client_helpers import (
     auto_display_spectra,
     result_dict_to_prompt,
     check_struct as _check_struct_generic,
+    check_tool_arg_schemas,
+    build_tool_schemas,
+    try_offline_template_patch,
     format_plan_validation_feedback,
 )
 from prompts import SYSTEM_PROMPT, REPORTER_SYSTEM_PROMPT
 from skills import run_planning_skills, SKILL_REGISTRY, collect_skill_client_tools
 from build_graph_from_plan import expand_template
 
-LLM_MODEL    = os.getenv("LLM_MODEL", "gpt-4.1-mini")
+LLM_MODEL    = os.getenv("LLM_MODEL", "gpt-5.2")
 _LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip() or None
 
 # ─── TOP-LEVEL CONFIG (edit here or override with CLI flags) ───────────────────
@@ -237,19 +240,45 @@ def check_pka(plan: dict) -> Dict[str, bool]:
     tools_used = {n.get("tool") for n in nodes if n.get("kind") == "tool"}
     settings   = plan.get("settings") or {}
     artifacts  = plan.get("artifacts_to_save") or []
-    # pKa calibration arithmetic is a kind:"tool" node (compute_pka_calibrated,
-    # owned by PKaSkill), not kind:"llm" — LLM-executed arithmetic on this
-    # formula was found to silently produce errors of >100 pKa units.
-    calc_nodes = [n for n in nodes
-                  if n.get("kind") == "tool" and n.get("tool") == "compute_pka_calibrated"]
-    arts_referenced = [
-        m for n in calc_nodes
-        for m in re.findall(r'\$\(artifacts\.([^)]+)\)', json.dumps(n.get("args") or {}))
+    # The pKa must be produced by a dedicated calculation node consuming the
+    # Gibbs artifacts. Two forms are structurally acceptable:
+    #
+    #   tool form — a compute_pka_calibrated node (preferred; the skill that
+    #     owns that function instructs the planner to use it, because
+    #     LLM-executed arithmetic on this formula was found to produce errors
+    #     exceeding 100 pKa units).
+    #   llm form  — a kind:"llm" node given the formula in the skill's protocol
+    #     text. This is what a skill that ships no deterministic function must
+    #     fall back to, and it must remain structurally valid: the deterministic
+    #     function is optional to provide, and a checker that hard-required it
+    #     would make the skill layer's optionality untrue.
+    #
+    # Structural validity is all that is asserted here. Which form is more
+    # *reliable* is a separate question, answered in SI S5.4 and S5.13.
+    calc_tool_nodes = [n for n in nodes
+                       if n.get("kind") == "tool" and n.get("tool") == "compute_pka_calibrated"]
+    calc_llm_nodes = [
+        n for n in nodes
+        if n.get("kind") == "llm"
+        and any("pka" in str(k).lower() for k in (n.get("product") or {}))
     ]
+    calc_nodes = calc_tool_nodes + calc_llm_nodes
+
+    def _g_refs(n: dict) -> List[str]:
+        """Gibbs artifacts a calculation node consumes, in either form."""
+        if n.get("kind") == "llm":
+            return list(n.get("needs_artifacts") or [])
+        return re.findall(r'\$\(artifacts\.([^)]+)\)', json.dumps(n.get("args") or {}))
+
+    arts_referenced = [m for n in calc_nodes for m in _g_refs(n)]
 
     return {
         "uses_freq_not_sp":    "run_freq_job" in tools_used and "run_sp_energy" not in tools_used,
-        "has_h_plus_ref":      "G_H_plus_ref_eh" in settings,
+        # The proton reference may be supplied explicitly in settings, or left to
+        # compute_pka_calibrated, which selects the correct one for the call
+        # (aqueous when uncalibrated, thermal when calibrated, where it cancels).
+        # An llm-form node has no such default, so it must state it in settings.
+        "has_h_plus_ref":      ("G_H_plus_ref_eh" in settings) or bool(calc_tool_nodes),
         "artifacts_G_eh":      any(a.startswith("G_") and a.endswith("_eh") for a in artifacts),
         "pka_in_artifacts":    any("pka" in a.lower() for a in artifacts),
         "calc_node_exists":    len(calc_nodes) >= 1,
@@ -601,8 +630,41 @@ def check_coordination_sp(plan: dict) -> Dict[str, bool]:
     return result
 
 
+def check_pka_relaxed(plan: dict) -> Dict[str, bool]:
+    """check_pka, but accepting either way of supplying the proton reference.
+
+    The skill templates a fixed reference (G_H_plus_ref_eh in settings), but a
+    planner given reference acids with known pKa may instead fit an effective
+    proton free energy from them. Both are chemically valid; only the first is
+    what the skill suggests. Used for the El Agente naturalistic-prompt
+    comparison, where the prompt supplies reference acids and deliberately does
+    not prescribe a method.
+    """
+    base = check_pka(plan)
+    settings = plan.get("settings") or {}
+    if settings.get("G_H_plus_ref_eh") is not None:
+        base["has_h_plus_ref"] = True
+    else:
+        # Fitted-reference form: a node consuming >=2 reference acids' Gibbs
+        # energies (HA + A- each) to derive the proton reference.
+        fitted = False
+        for n in plan.get("nodes", []):
+            if n.get("kind") not in ("llm", "tool"):
+                continue
+            arts = n.get("needs_artifacts") or []
+            args_blob = json.dumps(n.get("args") or {})
+            if len(arts) >= 4 and "h_plus" in (n.get("id") or "").lower():
+                fitted = True
+            # Deterministic form: compute_pka_calibrated with >=2 references.
+            if n.get("tool") == "compute_pka_calibrated" and "references" in args_blob:
+                fitted = True
+        base["has_h_plus_ref"] = fitted
+    return base
+
+
 _CHECKER_MAP = {
     "pka":              check_pka,
+    "pka_relaxed":      check_pka_relaxed,
     "sp":               check_sp,
     "nbo":              check_nbo,
     "solvation":        check_solvation,
@@ -769,6 +831,7 @@ def check_interaction_scan_result(artifacts: dict) -> Dict[str, bool]:
 
 _RESULT_CHECKER_MAP = {
     "pka":              check_pka_result,
+    "pka_relaxed":      check_pka_result,
     "sp":               check_sp_result,
     "spectrum":         check_spectrum_result,
     "tddft":            check_tddft_result,
@@ -822,6 +885,100 @@ def _call_planner(client: OpenAI, msgs: list) -> Tuple[dict, dict]:
 RunResult = Dict[str, Any]   # keys: passed, checks, error, duration_ms, plan
 
 
+TOOL_SCHEMA_SNAPSHOT = "tool_schemas.json"
+
+
+def load_tool_schemas() -> Dict[str, dict]:
+    """Tool argument schemas for plan-mode validation.
+
+    Plan mode never opens an MCP session, so MCP schemas come from the
+    tool_schemas.json snapshot (refresh with `python dump_tool_schemas.py`).
+    Client-side tools are always introspected live — no snapshot needed.
+    Returns client-side-only schemas if no snapshot exists, so plan mode still
+    runs (with reduced coverage) rather than failing.
+    """
+    schemas = build_tool_schemas(client_side_funcs=CLIENT_SIDE_TOOL_FUNCS)
+    if os.path.exists(TOOL_SCHEMA_SNAPSHOT):
+        try:
+            with open(TOOL_SCHEMA_SNAPSHOT, encoding="utf-8") as fh:
+                snap = json.load(fh)
+            for name, sch in (snap.get("schemas") or {}).items():
+                schemas.setdefault(name, sch)
+        except Exception as exc:
+            print(f"  [tool_schemas] could not read {TOOL_SCHEMA_SNAPSHOT}: {exc}")
+    else:
+        print(f"  [tool_schemas] no {TOOL_SCHEMA_SNAPSHOT}; "
+              f"MCP tool args unvalidated (run dump_tool_schemas.py)")
+    return schemas
+
+
+def _validate_plan_attempt(
+    plan_raw: dict,
+    checker_name: str,
+    checker_context: Optional[Dict[str, Any]],
+    preload_specs: Optional[List[str]],
+    tool_schemas: Optional[Dict[str, dict]] = None,
+) -> Tuple[dict, Dict[str, bool], str, bool]:
+    """Expand and validate one planner attempt.
+
+    Shared by run_plan_once and run_full_once so both apply the identical
+    validation ladder: template expansion (with deterministic offline repair
+    before spending a retry) -> structural checks -> tool-argument schemas ->
+    task-specific checker.
+
+    Returns (plan, checks, error_detail, offline_patch_used). `plan` is the
+    expanded plan when expansion succeeded, otherwise the raw plan.
+    """
+    checks: Dict[str, bool] = {}
+    error_detail = ""
+    offline_patch_used = False
+    plan = plan_raw
+    expansion_failed = False
+
+    try:
+        plan = expand_template(plan_raw)
+    except Exception as exc_expand:
+        # Template expansion (e.g. duplicate node IDs from a missing
+        # applies_to:"once") is itself a retryable planner mistake — feed the
+        # error back instead of letting it escape the loop.
+        error_detail = str(exc_expand)
+        checks = {"template_expansion_ok": False}
+        expansion_failed = True
+        # Try the deterministic repair before spending a whole planner call on
+        # a failure we have already root-caused.
+        patched = try_offline_template_patch(checks, error_detail, plan_raw)
+        if patched is not None:
+            plan, checks, error_detail = patched, {}, ""
+            expansion_failed = False
+            offline_patch_used = True
+            print("  [offline_patch] repaired template expansion with no extra planner call")
+
+    if not expansion_failed:
+        checks.update(check_struct(plan))
+
+        if tool_schemas:
+            arg_checks, arg_detail = check_tool_arg_schemas(plan, tool_schemas)
+            checks.update(arg_checks)
+            if arg_detail:
+                error_detail = f"{error_detail} {arg_detail}".strip()
+
+        checker_fn = _CHECKER_MAP.get(checker_name)
+        if checker_fn:
+            import inspect as _inspect
+            sig = _inspect.signature(checker_fn)
+            task_checks = (checker_fn(plan, checker_context)
+                           if "context" in sig.parameters else checker_fn(plan))
+            # When geometries are preloaded: opt-before-TDDFT not required;
+            # LLM comparison node allowed (reporter handles comparison, but planner may add one too)
+            if preload_specs and checker_name == "tddft":
+                task_checks.pop("has_opt_node", None)
+                task_checks.pop("tddft_after_opt", None)
+                task_checks.pop("no_llm_node", None)
+            checks.update(task_checks)
+
+    return plan, checks, error_detail, offline_patch_used
+
+
 def run_plan_once(
     client: OpenAI,
     message: str,
@@ -830,6 +987,7 @@ def run_plan_once(
     compound_context: str,
     preload_specs: Optional[List[str]] = None,
     checker_context: Optional[Dict[str, Any]] = None,
+    tool_schemas: Optional[Dict[str, dict]] = None,
 ) -> RunResult:
     """One planning run. Returns pass/fail + per-check breakdown.
 
@@ -849,6 +1007,7 @@ def run_plan_once(
     token_usage: Dict[str, int] = {"planner": 0, "calculator": 0, "total": 0}
     retry_fired   = False   # did the loop attempt at least one retry?
     retry_stalled = False   # did it stop early because the same failure recurred?
+    offline_patch_used = False   # was a failure repaired without a planner call?
     try:
         skill_ctxs = run_planning_skills(message, state) if with_skills else []
         msgs       = _build_messages(message, state, skill_ctxs, compound_context)
@@ -859,33 +1018,10 @@ def run_plan_once(
             for k, v in attempt_tokens.items():
                 token_usage[k] = token_usage.get(k, 0) + (v or 0)
 
-            checks: Dict[str, bool] = {}
-            expand_error = ""
-            try:
-                plan = expand_template(plan)
-            except Exception as exc_expand:
-                # Template expansion (e.g. duplicate node IDs from a missing
-                # applies_to:"once") is itself a retryable planner mistake —
-                # feed the error back instead of letting it escape the loop.
-                expand_error = str(exc_expand)
-                checks = {"template_expansion_ok": False}
-
-            if not expand_error:
-                checks.update(check_struct(plan))
-
-                checker_fn = _CHECKER_MAP.get(checker_name)
-                if checker_fn:
-                    import inspect as _inspect
-                    sig = _inspect.signature(checker_fn)
-                    task_checks = (checker_fn(plan, checker_context)
-                                   if "context" in sig.parameters else checker_fn(plan))
-                    # When geometries are preloaded: opt-before-TDDFT not required;
-                    # LLM comparison node allowed (reporter handles comparison, but planner may add one too)
-                    if preload_specs and checker_name == "tddft":
-                        task_checks.pop("has_opt_node", None)
-                        task_checks.pop("tddft_after_opt", None)
-                        task_checks.pop("no_llm_node", None)
-                    checks.update(task_checks)
+            plan, checks, expand_error, patched = _validate_plan_attempt(
+                plan, checker_name, checker_context, preload_specs, tool_schemas)
+            if patched:
+                offline_patch_used = True
 
             if all(checks.values()):
                 break
@@ -931,6 +1067,7 @@ def run_plan_once(
         "retry_attempts": retry_attempts,
         "retry_fired":     retry_fired,
         "retry_stalled":   retry_stalled,
+        "offline_patch_used": offline_patch_used,
         "token_usage": token_usage,
     }
 
@@ -944,6 +1081,7 @@ async def run_full_once(
     compound_context: str,
     preload_specs: Optional[List[str]] = None,
     checker_context: Optional[Dict[str, Any]] = None,
+    tool_schemas: Optional[Dict[str, dict]] = None,
 ) -> RunResult:
     """One full run: plan → execute → check artifacts.
 
@@ -963,9 +1101,11 @@ async def run_full_once(
     retry_attempts = 0
     retry_fired    = False
     retry_stalled  = False
+    offline_patch_used = False
 
     token_usage: Dict[str, int] = {"planner": 0, "calculator": 0, "reporter": 0, "total": 0}
     agent_report = ""
+    artifacts: Dict[str, Any] = {}
     try:
         # Step 1: generate plan
         skill_ctxs = run_planning_skills(message, state) if with_skills else []
@@ -977,32 +1117,10 @@ async def run_full_once(
             for k, v in attempt_tokens.items():
                 token_usage[k] = token_usage.get(k, 0) + (v or 0)
 
-            checks: Dict[str, bool] = {}
-            expand_error = ""
-            try:
-                plan = expand_template(plan)
-            except Exception as exc_expand:
-                # Template expansion (e.g. duplicate node IDs from a missing
-                # applies_to:"once") is itself a retryable planner mistake —
-                # feed the error back instead of letting it escape the loop.
-                expand_error = str(exc_expand)
-                checks = {"template_expansion_ok": False}
-
-            if not expand_error:
-                checks.update(check_struct(plan))
-                checker_fn = _CHECKER_MAP.get(checker_name)
-                if checker_fn:
-                    import inspect as _inspect
-                    sig = _inspect.signature(checker_fn)
-                    task_checks = (checker_fn(plan, checker_context)
-                                   if "context" in sig.parameters else checker_fn(plan))
-                    # When geometries are preloaded: opt-before-TDDFT not required;
-                    # LLM comparison node allowed (reporter handles comparison, but planner may add one too)
-                    if preload_specs and checker_name == "tddft":
-                        task_checks.pop("has_opt_node", None)
-                        task_checks.pop("tddft_after_opt", None)
-                        task_checks.pop("no_llm_node", None)
-                    checks.update(task_checks)
+            plan, checks, expand_error, patched = _validate_plan_attempt(
+                plan, checker_name, checker_context, preload_specs, tool_schemas)
+            if patched:
+                offline_patch_used = True
 
             if all(checks.values()):
                 break
@@ -1102,8 +1220,10 @@ async def run_full_once(
         "retry_attempts": retry_attempts,
         "retry_fired":     retry_fired,
         "retry_stalled":   retry_stalled,
+        "offline_patch_used": offline_patch_used,
         "token_usage": token_usage,
         "agent_report": agent_report,
+        "artifacts": artifacts,
     }
 
 
@@ -1165,6 +1285,7 @@ def save_test_log(
                 "retry_attempts": r.get("retry_attempts", 0),
                 "retry_fired":    r.get("retry_fired", False),
                 "retry_stalled":  r.get("retry_stalled", False),
+                "offline_patch_used": r.get("offline_patch_used", False),
                 "token_usage": r.get("token_usage", {}),
             }
             for i, r in enumerate(results)
@@ -1392,6 +1513,11 @@ async def _run_full_suite(args):
             tools = await session.list_tools()
             print(f"MCP tools: {[t.name for t in tools.tools]}")
 
+            # Live schemas from the open session are authoritative here; the
+            # tool_schemas.json snapshot is only for plan mode, which has no session.
+            tool_schemas = build_tool_schemas(
+                mcp_tools=tools.tools, client_side_funcs=CLIENT_SIDE_TOOL_FUNCS)
+
             verbose = getattr(args, "verbose", False)
             print(f"\nRunning {n_runs} full runs of: {message!r}")
             results: List[RunResult] = []
@@ -1400,6 +1526,7 @@ async def _run_full_suite(args):
                 r = await run_full_once(
                     session, client, message, checker_name, with_skills, compound_context,
                     preload_specs=preload_specs, checker_context=checker_context,
+                    tool_schemas=tool_schemas,
                 )
                 tag = "PASS" if r["passed"] else "FAIL"
                 print(f"{tag}  ({r['duration_ms']} ms)")
@@ -1449,12 +1576,14 @@ def _run_plan_suite(args):
         print(f"  Preload specs: {preload_specs}")
 
     verbose = getattr(args, "verbose", False)
+    tool_schemas = load_tool_schemas()
 
     results: List[RunResult] = []
     for i in range(n_runs):
         print(f"  Run {i+1:>3}/{n_runs}...", end=" ", flush=True)
         r = run_plan_once(client, message, checker_name, with_skills, compound_context,
-                          preload_specs=preload_specs, checker_context=checker_context)
+                          preload_specs=preload_specs, checker_context=checker_context,
+                          tool_schemas=tool_schemas)
         tag = "PASS" if r["passed"] else "FAIL"
         print(f"{tag}  ({r['duration_ms']:>5} ms)")
         if verbose and r["plan"]:

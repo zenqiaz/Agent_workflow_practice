@@ -45,6 +45,9 @@ from client_helpers import (
     build_plan_review,
     print_plan_review,
     check_struct,
+    check_tool_arg_schemas,
+    build_tool_schemas,
+    try_offline_template_patch,
     format_plan_validation_feedback,
     #run_node_via_existing_executor,
     #run_plan_deterministically,
@@ -68,7 +71,10 @@ from skills import run_planning_skills, collect_skill_client_tools
 
 load_dotenv(os.environ.get("ENV_FILE", ".env"))
 
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini")
+# Default must match the model actually used for reported results; a stale
+# fallback here was previously mistaken for the configured value when
+# documenting the system. LLM_MODEL in .env overrides it.
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.2")
 _LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip() or None
 
 OPENAI_TOOLS = json.loads(Path("openai_tools_geom.json").read_text(encoding="utf-8"))
@@ -152,7 +158,8 @@ def _print_token_usage(state: dict) -> None:
 
 async def handle_user_turn(session, client, state, user_text: str, tools_for_this_call: list,
                            compound_context: str = "", skill_contexts: list = [],
-                           valid_tools: set = frozenset()):
+                           valid_tools: set = frozenset(),
+                           tool_schemas: dict = None):
     # Build message list: general prompt → skills → state → compound identity → user
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
@@ -179,6 +186,7 @@ async def handle_user_turn(session, client, state, user_text: str, tools_for_thi
     retry_attempts = 0
     retry_fired    = False
     retry_stalled  = False
+    offline_patch_used = False
     prev_failed_signature = None
     for _round in range(MAX_TOOL_ROUNDS):
         #print("TOOL NAMES FOR MODEL:", tool_names_for_model)
@@ -196,6 +204,7 @@ async def handle_user_turn(session, client, state, user_text: str, tools_for_thi
         print(raw)
         plan = parse_json_only(raw)
 
+        plan_raw = plan
         expand_error = ""
         try:
             plan = expand_template(plan)
@@ -205,14 +214,37 @@ async def handle_user_turn(session, client, state, user_text: str, tools_for_thi
             # it here (before the human ever sees the plan) instead of letting
             # it surface later as a hard failure at execution time.
             expand_error = str(exc_expand)
+            # Deterministic repair first: this specific failure is fixable in
+            # code, so it need not cost another planner call.
+            patched = try_offline_template_patch(
+                {"template_expansion_ok": False}, expand_error, plan_raw)
+            if patched is not None:
+                plan, expand_error = patched, ""
+                offline_patch_used = True
+                print("  [offline_patch] repaired template expansion "
+                      "with no extra planner call")
 
-        checks = ({"template_expansion_ok": False} if expand_error
-                   else (check_struct(plan, valid_tools) if valid_tools else {}))
+        if expand_error:
+            checks = {"template_expansion_ok": False}
+        elif valid_tools:
+            checks = check_struct(plan, valid_tools)
+            # Argument-level validation against each tool's real declared
+            # schema — catches unsupported/missing argument names before any
+            # compute is dispatched.
+            if tool_schemas:
+                arg_checks, arg_detail = check_tool_arg_schemas(plan, tool_schemas)
+                checks.update(arg_checks)
+                if arg_detail:
+                    expand_error = arg_detail
+        else:
+            checks = {}
+
         if not checks or all(checks.values()):
             review = build_plan_review(plan)
             plan_pkg = {"plan": plan, "review": review, "ui": {"saved_files": {}},
                         "retry_attempts": retry_attempts, "retry_fired": retry_fired,
-                        "retry_stalled": retry_stalled}
+                        "retry_stalled": retry_stalled,
+                        "offline_patch_used": offline_patch_used}
             store_plan(state, plan_pkg)
             print_plan_review(plan_pkg)
             return plan_pkg
@@ -252,7 +284,8 @@ async def handle_user_turn(session, client, state, user_text: str, tools_for_thi
     )
     plan_pkg = {"plan": plan, "review": review, "ui": {"saved_files": {}},
                 "retry_attempts": retry_attempts, "retry_fired": retry_fired,
-                "retry_stalled": retry_stalled}
+                "retry_stalled": retry_stalled,
+                "offline_patch_used": offline_patch_used}
     store_plan(state, plan_pkg)
     print_plan_review(plan_pkg)
     print(review["validation_warning"])
@@ -460,6 +493,11 @@ async def main():
             # it's for the native tool-calling schema, which the planner never
             # actually invokes since tool_choice="none").
             VALID_TOOLS = set(tool_names) | set(CLIENT_SIDE_TOOL_FUNCS.keys())
+            # Per-tool argument schemas for plan validation. MCP schemas come
+            # live from this session (authoritative); client-side/skill-owned
+            # tools are introspected from their own signatures.
+            TOOL_SCHEMAS = build_tool_schemas(
+                mcp_tools=tools.tools, client_side_funcs=CLIENT_SIDE_TOOL_FUNCS)
             print("MCP tools available:", tool_names)
             print(f"Compound mode: {compound_mode}  "
                   f"(change with: mode full|name|smiles|xyz)")
@@ -626,7 +664,8 @@ async def main():
                 await handle_user_turn(session, client, state, line, tools_for_this_call,
                                        compound_context=compound_context,
                                        skill_contexts=skill_contexts,
-                                       valid_tools=VALID_TOOLS)
+                                       valid_tools=VALID_TOOLS,
+                                       tool_schemas=TOOL_SCHEMAS)
 
 if __name__ == "__main__":
     asyncio.run(main())

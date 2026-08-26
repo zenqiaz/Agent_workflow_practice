@@ -21,3 +21,4 @@
 !/server_with_product.py
 !/skills.py
 !/test_success_rate.py
+!/test_skill_schema_consistency.py

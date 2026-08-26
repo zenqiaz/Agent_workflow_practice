@@ -69,9 +69,7 @@ Output a single JSON object with these top-level keys:
   "version": "1.3",
   "geom_ids": ["ha_neutral", "a_anion"],
   "artifacts_to_save": ["G_HA_eh", "G_A_minus_eh", "pka"],
-  "settings": {
-    "G_H_plus_ref_eh": -0.01372
-  },
+  "settings": {},
   "nodes": [
     {
       "id": "load_ha",
@@ -124,8 +122,7 @@ Output a single JSON object with these top-level keys:
       "args": {
         "G_HA_eh": "$(artifacts.G_HA_eh)",
         "G_A_minus_eh": "$(artifacts.G_A_minus_eh)",
-        "references": [],
-        "G_H_plus_ref_eh": "$(settings.G_H_plus_ref_eh)"
+        "references": []
       },
       "product": { "pka": "pka" }
     }
@@ -230,8 +227,13 @@ Domain knowledge
 - Task-specific chemical reasoning (pKa protocol, solvation, thermochemistry, NBO,
   method selection) is provided in SKILL: blocks injected before this message.
 - Follow the skill instructions precisely; they take precedence over general defaults.
-- Record any external reference constants given in a skill (e.g. G_H_plus_ref_eh)
-  in plan settings, not as implicit text.
+- Record external reference constants given in a skill in plan settings, not as
+  implicit text — unless the skill states that a tool derives the constant
+  itself, in which case omit it and let the tool choose.
+- Implicit solvation is part of the method string ("method": "B3LYP CPCM(Water)"),
+  not a separate argument. The ORCA tools expose no solvent parameter; if a
+  solvation argument is rejected by validation, move the keyword into "method"
+  rather than deleting it, or the calculation silently becomes gas-phase.
 
 Template mode for multi-compound workflows
 - Use template mode when the SAME workflow is needed for N >= 3 compounds.

@@ -380,11 +380,31 @@ def _normalize_on_error_rule(rule: dict) -> Dict[str, Any]:
     }
 
 
+# Solvation is expressed inside the ORCA method string (e.g. "PBE0 CPCM(Water)")
+# because the tools take no separate solvent parameter. A patch that replaces
+# `method` wholesale would therefore silently drop solvation and report the
+# result as solvated anyway. These keywords are carried across such a patch.
+_SOLVATION_KEYWORDS = ("CPCM", "SMD", "COSMO", "PCM", "ALPB", "GBSA")
+
+
+def _preserved_solvation(method_value: Any) -> str:
+    """Solvation tokens present in a method string, e.g. 'CPCM(Water)'."""
+    if not isinstance(method_value, str):
+        return ""
+    for tok in method_value.split():
+        if any(tok.upper().startswith(k) for k in _SOLVATION_KEYWORDS):
+            return tok
+    return ""
+
+
 def _apply_patch_to_args(current_args: dict, patch: dict) -> dict:
     """Merge a patch dict into tool args, mapping nested structures to param names.
 
     Safe: only known tool parameter names are applied; unknown keys are silently
-    dropped to avoid TypeError in strict MCP tool signatures.
+    dropped to avoid TypeError in strict MCP tool signatures. A `method` patch
+    additionally preserves any solvation keyword from the method being replaced,
+    so an error-recovery retry cannot quietly turn a solvated calculation into a
+    gas-phase one.
     """
     new_args = dict(current_args)
     for key, val in patch.items():
@@ -395,6 +415,14 @@ def _apply_patch_to_args(current_args: dict, patch: dict) -> dict:
         elif key == "resources" and isinstance(val, dict):
             if "ncores" in val:
                 new_args["ncores"] = int(val["ncores"])
+        elif key == "method":
+            solv = _preserved_solvation(current_args.get("method"))
+            if solv and isinstance(val, str) and not _preserved_solvation(val):
+                new_args["method"] = f"{val} {solv}"
+                print(f"  [patch] preserving solvation keyword {solv!r} "
+                      f"across method patch -> {new_args['method']!r}")
+            else:
+                new_args["method"] = val
         elif key in _PATCHABLE_TOOL_ARGS:
             new_args[key] = val
         # else: silently drop (not a known tool parameter)
@@ -753,7 +781,7 @@ def build_graph_from_plan(
 
                             try:
                                 resp = openai_client.chat.completions.create(
-                                    model=os.getenv("LLM_MODEL", "gpt-4.1-mini"),
+                                    model=os.getenv("LLM_MODEL", "gpt-5.2"),
                                     messages=messages,
                                 )
                                 # Accumulate calculator token usage into state

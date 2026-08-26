@@ -1,5 +1,6 @@
 # client_helpers.py
 from __future__ import annotations
+import copy
 import os
 import re
 from pathlib import Path
@@ -1112,11 +1113,125 @@ def structure_add_remove_proton(
     )
 
 
+# Proton free-energy references, in Hartree. Which one is correct depends
+# entirely on whether the calculation is calibrated against reference acids.
+#
+#   THERMAL: the proton's gas-phase thermal correction only (H - TS for a
+#   monatomic ideal gas). Valid ONLY in the calibrated path, where the term
+#   cancels exactly between target and references and its value is therefore
+#   irrelevant. Using it uncalibrated omits the proton's aqueous solvation
+#   free energy (~-266 kcal/mol) and inflates the result by ~195 pKa units.
+#
+#   AQUEOUS: the full aqueous proton free energy, the physically meaningful
+#   choice for an uncalibrated thermodynamic cycle. Built from published
+#   components rather than written as a single opaque constant:
+#       dG_solv(H+) = -265.9 kcal/mol   (Tissandier et al. 1998)
+#       G_gas(H+)   =   -6.28 kcal/mol  (H - TS, 298.15 K, 1 atm)
+#       1 atm -> 1 M standard-state correction = +1.89 kcal/mol
+_EH_PER_KCAL = 1.0 / 627.509474
+G_H_PLUS_THERMAL_EH = -0.01372
+G_H_PLUS_AQUEOUS_EH = (-265.9 - 6.28 + 1.89) * _EH_PER_KCAL   # ~ -0.43074 Eh
+
+
+_EAS_DEFAULT_HETEROATOMS = ("N", "O", "S")
+
+
+def rank_eas_sites(
+    mulliken_charges: Any,
+    include_heteroatoms: bool = True,
+    heteroatoms: Optional[List[str]] = None,
+    top_n: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Rank EAS sites by partial charge, in code rather than in a language model.
+
+    The EAS skill previously instructed the planner to emit a kind:"llm" node
+    whose entire task was: keep the carbons (and any heteroatoms), sort ascending
+    by charge, return the ranking. That is filter-and-sort over a table the
+    upstream tool already produced -- the chemistry sits in the element
+    predicate, which is fixed, not in the sorting. Doing it in the model cost
+    roughly 1,500 tokens per molecule and inherited the reproducibility problem
+    documented for llm arithmetic nodes, in exchange for no judgement the code
+    cannot make.
+
+    Most negative charge first: the most electron-rich site is the most
+    activated toward electrophilic attack.
+
+    Accepts the tool's list of {atom_index, symbol, charge} dicts, or a JSON
+    string of the same, since planners pass artifacts through in both forms.
+    """
+    if isinstance(mulliken_charges, str):
+        try:
+            mulliken_charges = json.loads(mulliken_charges)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"mulliken_charges was a string but not valid JSON: {exc}") from exc
+
+    if isinstance(mulliken_charges, dict):
+        for key in ("mulliken_charges", "charges", "atoms"):
+            if isinstance(mulliken_charges.get(key), list):
+                mulliken_charges = mulliken_charges[key]
+                break
+
+    if not isinstance(mulliken_charges, list):
+        raise ValueError(
+            "mulliken_charges must be a list of {atom_index, symbol, charge} "
+            f"entries; got {type(mulliken_charges).__name__}")
+
+    wanted = {"C"}
+    if include_heteroatoms:
+        wanted |= {str(s).strip().title() for s in (heteroatoms or _EAS_DEFAULT_HETEROATOMS)}
+
+    rows: List[Dict[str, Any]] = []
+    skipped = 0
+    for entry in mulliken_charges:
+        if not isinstance(entry, dict):
+            skipped += 1
+            continue
+        symbol = str(entry.get("symbol") or entry.get("element") or "").strip().title()
+        charge = entry.get("charge", entry.get("mulliken_charge"))
+        idx = entry.get("atom_index", entry.get("index"))
+        if symbol not in wanted:
+            continue
+        try:
+            charge = float(charge)
+        except (TypeError, ValueError):
+            skipped += 1          # a malformed row is dropped, never coerced to 0.0,
+            continue              # which would rank it as the most activated site
+        rows.append({"atom_idx": idx, "element": symbol,
+                     "mulliken_charge": charge})
+
+    rows.sort(key=lambda r: r["mulliken_charge"])
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    if top_n is not None:
+        rows = rows[:int(top_n)]
+
+    warnings: List[str] = []
+    if skipped:
+        warnings.append(f"{skipped} entr{'y' if skipped == 1 else 'ies'} skipped "
+                        "(not a dict, or charge not numeric)")
+    if not rows:
+        warnings.append("no atoms matched the element filter "
+                        f"({', '.join(sorted(wanted))})")
+
+    return {
+        # Client-side tools report status the same way remote ones do; without
+        # it the executor records the node as 'unknown' and a node spec's
+        # expect.status_in cannot be satisfied.
+        "status": "ok",
+        "site_ranking": rows,
+        "most_activated": rows[0] if rows else None,
+        "n_sites": len(rows),
+        "elements_considered": sorted(wanted),
+        "warnings": warnings,
+    }
+
+
 def compute_pka_calibrated(
     G_HA_eh: float,
     G_A_minus_eh: float,
     references: List[Dict[str, float]],
-    G_H_plus_ref_eh: float = -0.01372,
+    G_H_plus_ref_eh: Optional[float] = None,
     temperature_K: float = 298.15,
 ) -> dict:
     """Deterministic reference-acid-calibrated pKa (no LLM arithmetic).
@@ -1140,18 +1255,40 @@ def compute_pka_calibrated(
         G_A_minus_eh: Gibbs free energy of the target conjugate base (Hartree).
         references: list of {"G_HA_eh": ..., "G_A_minus_eh": ..., "pka_exp": ...}
             dicts, one per reference acid. Empty list = no calibration.
-        G_H_plus_ref_eh: reference proton free energy (Hartree); Tissandier et al.
-            1998 default, -0.01372 Eh.
+        G_H_plus_ref_eh: proton free energy (Hartree). Defaults to whichever
+            constant is correct for the call: G_H_PLUS_AQUEOUS_EH when no
+            references are supplied (the term is then physically meaningful and
+            must include the proton's solvation free energy), and
+            G_H_PLUS_THERMAL_EH when they are (the term cancels exactly, so its
+            value cannot affect the result). Pass a value explicitly to override.
         temperature_K: temperature for the RT ln10 conversion (default 298.15 K).
 
     Returns:
         {"status": "ok", "pka": float, "pka_raw": float, "epsilon_avg": float,
-         "per_reference_epsilon": [float, ...]}
+         "per_reference_epsilon": [float, ...], "calibrated": bool,
+         "G_H_plus_ref_eh": float, "warnings": [str, ...]}
         or {"status": "error", "error": str} on invalid input.
     """
     R = 8.314462618          # J / (mol K)
     LN10 = 2.302585093
     EH_TO_J_PER_MOL = 2625499.638
+
+    calibrated = bool(references)
+    warnings: List[str] = []
+    if G_H_plus_ref_eh is None:
+        G_H_plus_ref_eh = (G_H_PLUS_THERMAL_EH if calibrated
+                           else G_H_PLUS_AQUEOUS_EH)
+    elif not calibrated and abs(G_H_plus_ref_eh - G_H_PLUS_THERMAL_EH) < 1e-9:
+        # The single most damaging misuse of this function: the gas-phase
+        # thermal correction used as if it were the aqueous proton free energy,
+        # with no references to cancel it. Silently correcting the caller would
+        # hide a bad plan, so compute what was asked and flag it loudly.
+        warnings.append(
+            "Uncalibrated pKa requested with the gas-phase thermal proton "
+            "reference (-0.01372 Eh). This omits the proton's aqueous solvation "
+            "free energy and overestimates pKa by roughly 195 units. Supply "
+            "reference acids, or use G_H_PLUS_AQUEOUS_EH."
+        )
 
     def _raw_pka(g_ha: float, g_a: float) -> float:
         dg_eh = g_a + G_H_plus_ref_eh - g_ha
@@ -1169,12 +1306,24 @@ def compute_pka_calibrated(
     except (KeyError, TypeError, ValueError) as exc:
         return {"status": "error", "error": f"invalid reference/energy input: {exc}"}
 
+    if not calibrated and not (-20.0 < pka < 60.0):
+        warnings.append(
+            f"Uncalibrated pKa {pka:.2f} is outside any physically plausible "
+            f"range. Check that the Gibbs energies include solvation (for an "
+            f"implicit model, put it in the method string, e.g. "
+            f"method=\"B3LYP CPCM(Water)\") and that the proton reference is "
+            f"the aqueous value."
+        )
+
     return {
         "status": "ok",
         "pka": pka,
         "pka_raw": pka_raw,
         "epsilon_avg": epsilon_avg,
         "per_reference_epsilon": epsilons,
+        "calibrated": calibrated,
+        "G_H_plus_ref_eh": G_H_plus_ref_eh,
+        "warnings": warnings,
     }
 
 
@@ -1195,7 +1344,7 @@ def extract_compound_names_llm(user_text: str, openai_client: Any) -> List[str]:
     )
     try:
         resp = openai_client.chat.completions.create(
-            model=os.getenv("LLM_MODEL", "gpt-4.1-mini"),
+            model=os.getenv("LLM_MODEL", "gpt-5.2"),
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
@@ -2114,12 +2263,47 @@ def state_update(state: Dict[str, Any], set: dict) -> dict:
 
 
 
+# Harness-level argument names a plan may legitimately use that never reach the
+# tool itself: state_get_tool_args() below pops them and resolves them against
+# the GeometryRegistry. Keep in sync with the pop chains in that function --
+# check_tool_arg_schemas() treats these as valid plan arguments even though they
+# appear in no tool's schema. Scoped per tool group, exactly as the pops are:
+# allowing the solvator names globally would let a bogus `solvent=...` on
+# run_opt_job (which has no solvation parameter at all) pass validation.
+_GEOM_REF_ARGS = {"input_geom_id", "geom_id", "input_id", "geom_in"}
+_SOLVATOR_REF_ARGS = {
+    "solute_geom_id", "solute_id", "solute",
+    "solvent_geom_id", "solvent_id", "solvent",
+}
+
+
+def _executor_consumed_args_for(tool_name: str) -> Set[str]:
+    consumed: Set[str] = set()
+    if tool_name in NEEDS_GEOM_SINGLE:
+        consumed |= _GEOM_REF_ARGS
+    if tool_name == "run_solvator_job":
+        consumed |= _SOLVATOR_REF_ARGS
+    return consumed
+
+# Arguments state_get_tool_args() supplies itself from the registry, so a plan is
+# not required to spell them out even when the tool schema marks them required.
+_EXECUTOR_INJECTED_ARGS = {
+    "geometry_xyz", "xyz", "charge", "multiplicity",
+    "solute_xyz", "solvent_xyz",
+}
+
+
 def state_get_tool_args(
     state: Dict[str, Any],
     tool_name: str,
     overrides: Optional[dict] = None,
 ) -> dict:
-    """Build tool args from dict-state + GeometryRegistry (no dataclass/legacy paths)."""
+    """Build tool args from dict-state + GeometryRegistry (no dataclass/legacy paths).
+
+    Note: the geometry-reference names popped below are mirrored in
+    _GEOM_REF_ARGS / _SOLVATOR_REF_ARGS above, which plan-time validation
+    (check_tool_arg_schemas) relies on to avoid flagging them as unknown.
+    """
     if not isinstance(state, dict):
         return {"status": "error", "tool_name": tool_name, "error": f"state must be a dict, got {type(state).__name__}"}
 
@@ -2846,6 +3030,287 @@ def _check_dep_graph(plan: dict) -> bool:
     return True
 
 
+def _schema_from_callable(fn) -> Optional[dict]:
+    """Derive a JSON-Schema-shaped dict from a Python function's own signature.
+
+    Client-side (skill-owned) tools declare their contract in their type hints;
+    this reads it rather than requiring a separately maintained schema, matching
+    the client_tools ownership convention in skills.py.
+    """
+    import inspect as _inspect
+    try:
+        sig = _inspect.signature(fn)
+    except (ValueError, TypeError):
+        return None
+    try:
+        import typing as _typing
+        hints = _typing.get_type_hints(fn)
+    except Exception:
+        hints = {}
+
+    _PY_TO_JSON = {str: "string", int: "integer", float: "number",
+                   bool: "boolean", list: "array", dict: "object"}
+    properties: Dict[str, dict] = {}
+    required: List[str] = []
+    accepts_any = False
+    for p in sig.parameters.values():
+        if p.kind is _inspect.Parameter.VAR_KEYWORD:
+            accepts_any = True
+            continue
+        if p.kind is _inspect.Parameter.VAR_POSITIONAL or p.name == "state":
+            continue
+        properties[p.name] = {"type": _PY_TO_JSON.get(hints.get(p.name), None)}
+        if p.default is _inspect.Parameter.empty:
+            required.append(p.name)
+    return {"properties": properties, "required": required, "accepts_any": accepts_any}
+
+
+def build_tool_schemas(mcp_tools=None, client_side_funcs: Optional[dict] = None) -> Dict[str, dict]:
+    """Collect argument schemas for every tool a plan may reference.
+
+    Both sources are already self-describing, so nothing here is hand-authored:
+      - MCP tools expose a real JSON Schema as `.inputSchema`, generated
+        server-side by FastMCP from the tool functions' type hints. Pass the
+        `.tools` list from `await session.list_tools()`.
+      - Client-side tools (including skill-owned ones from
+        collect_skill_client_tools()) are introspected from their signatures.
+
+    Returns {tool_name: {"properties": {...}, "required": [...], "accepts_any": bool}}.
+    """
+    schemas: Dict[str, dict] = {}
+    for t in (mcp_tools or []):
+        schema = getattr(t, "inputSchema", None)
+        if isinstance(schema, dict):
+            schemas[getattr(t, "name", "")] = {
+                "properties": schema.get("properties") or {},
+                "required": list(schema.get("required") or []),
+                "accepts_any": False,
+            }
+    for name, fn in (client_side_funcs or {}).items():
+        derived = _schema_from_callable(fn)
+        if derived is not None:
+            schemas[name] = derived
+    schemas.pop("", None)
+    return schemas
+
+
+_ANY_REF_RE = re.compile(r'\$\(([^)]+)\)')
+# The executor expands exactly these two prefixes (_expand_settings_refs and
+# _expand_artifact_refs). Anything else is passed through verbatim.
+_EXPANDABLE_REF_PREFIXES = ("artifacts.", "settings.")
+
+
+def _unexpandable_refs(value: Any) -> List[str]:
+    """References the executor will NOT expand, and so will pass on literally.
+
+    A reference the executor does not recognise -- for example
+    "$(load_methanol.geometry_xyz)", scoped by node id rather than by
+    artifacts/settings -- is not an error at dispatch time. It is silently handed
+    to the tool as the literal string "$(load_methanol.geometry_xyz)", which the
+    tool then treats as data: in one observed case it was written into an .xyz
+    file and rejected by ORCA as a malformed coordinate line, thirteen
+    milliseconds in, with no chemistry performed.
+
+    This is a form check, not a value-type check. It asks only whether a
+    reference *can* resolve, never what the resolved value should look like, so
+    it does not carry the false-positive risk that keeps type enforcement out of
+    scope here: a reference with an unexpandable prefix is wrong unconditionally.
+    """
+    out: List[str] = []
+    if isinstance(value, str):
+        for m in _ANY_REF_RE.finditer(value):
+            ref = m.group(1)
+            if not ref.startswith(_EXPANDABLE_REF_PREFIXES):
+                out.append(ref)
+    elif isinstance(value, dict):
+        for v in value.values():
+            out.extend(_unexpandable_refs(v))
+    elif isinstance(value, list):
+        for v in value:
+            out.extend(_unexpandable_refs(v))
+    return out
+
+
+def check_tool_arg_schemas(plan: dict,
+                           tool_schemas: Dict[str, dict]) -> Tuple[Dict[str, bool], str]:
+    """Validate every tool node's args against the tool's real declared schema.
+
+    Closes the gap check_struct leaves: check_struct validates plan *shape*
+    (node ids, kinds, registered tool names, geometry dependency graph) but never
+    compares an argument against what the tool actually accepts. Unsupported
+    argument names are the single most common recorded planner mistake (see
+    bug_reports/), and today they surface only as a runtime TypeError after
+    execution has already begun.
+
+    Scope is deliberately narrow -- argument NAMES and REQUIRED arguments only,
+    no value-type or enum enforcement -- to keep false positives near zero.
+
+    Template references are resolved at execution time, not plan time
+    (_expand_settings_refs/_expand_artifact_refs run inside
+    execute_tool_from_node_spec), so a plan legitimately carries literal
+    "$(settings.ncores)"/"$(artifacts.KEY)" strings here. Because this check
+    only inspects argument NAMES, such values need no special handling: they
+    satisfy presence and are never type-inspected.
+
+    Returns (checks, detail) where detail names the offending
+    node.tool.argument triples -- a bare "tool_args_known: False" is not
+    actionable feedback for the planner on its own.
+    """
+    unknown_args: List[str] = []
+    missing_required: List[str] = []
+    bad_refs: List[str] = []
+
+    for node in (plan.get("nodes") or []):
+        if node.get("kind") != "tool":
+            continue
+        for arg_name, value in (node.get("args") or {}).items():
+            for ref in _unexpandable_refs(value):
+                bad_refs.append(f"{node.get('id')}.{arg_name} -> $({ref})")
+        tool_name = node.get("tool")
+        schema = tool_schemas.get(tool_name)
+        if not schema:
+            continue   # unregistered tool names are check_struct's tools_valid job
+        args = node.get("args") or {}
+        if not isinstance(args, dict):
+            continue
+        properties = schema.get("properties") or {}
+        consumed = _executor_consumed_args_for(tool_name)
+        if properties and not schema.get("accepts_any"):
+            for arg_name in args:
+                # Harness-level geometry references (input_geom_id, solute_id, …)
+                # are resolved and popped by state_get_tool_args before dispatch,
+                # so they are valid in a plan despite being in no tool schema.
+                if arg_name in consumed:
+                    continue
+                if arg_name not in properties:
+                    unknown_args.append(f"{node.get('id')}.{tool_name}.{arg_name}")
+        for req in (schema.get("required") or []):
+            # Geometry-bearing args are injected by the executor from the
+            # registry, so a plan is not required to spell them out.
+            if req in _EXECUTOR_INJECTED_ARGS:
+                continue
+            if req not in args:
+                missing_required.append(f"{node.get('id')}.{tool_name}.{req}")
+
+    detail_parts: List[str] = []
+    if unknown_args:
+        detail_parts.append(
+            "These arguments are not accepted by the tool they were passed to "
+            "(node.tool.argument): " + ", ".join(unknown_args)
+            + ". Remove them or use the tool's documented argument names."
+        )
+    if missing_required:
+        detail_parts.append(
+            "These required arguments are missing (node.tool.argument): "
+            + ", ".join(missing_required) + "."
+        )
+    if bad_refs:
+        detail_parts.append(
+            "These references cannot be resolved by the executor and would be "
+            "passed to the tool as literal text (node.argument -> reference): "
+            + ", ".join(bad_refs)
+            + ". Only $(artifacts.KEY) and $(settings.KEY) are expanded. To use "
+            "an upstream node's output, name the artifact key it produces, as "
+            "$(artifacts.KEY)."
+        )
+
+    return (
+        {
+            "tool_args_known": not unknown_args,
+            "tool_args_required_present": not missing_required,
+            "tool_arg_refs_resolvable": not bad_refs,
+        },
+        " ".join(detail_parts),
+    )
+
+
+_C_PLACEHOLDER_RE = re.compile(r"\{C[^}]*\}")
+
+
+def _has_c_placeholder(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(_C_PLACEHOLDER_RE.search(value))
+    if isinstance(value, dict):
+        return any(_has_c_placeholder(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_c_placeholder(v) for v in value)
+    return False
+
+
+def _references_every_compound(node_tmpl: dict, compounds: List[dict]) -> bool:
+    """True if this post_template node's needs/needs_artifacts reference
+    something for every compound -- the signal that it is a genuine
+    once-per-request aggregation step rather than a per-compound node that
+    merely lost its {C} placeholder."""
+    needs_fields = list(node_tmpl.get("needs") or []) + list(node_tmpl.get("needs_artifacts") or [])
+    if not needs_fields or not compounds:
+        return False
+    slugs = [
+        c.get("id") or re.sub(r"[^a-z0-9]+", "_", str(c.get("name", "")).lower()).strip("_")
+        for c in compounds
+    ]
+    joined = " ".join(str(n) for n in needs_fields)
+    return all(slug and slug in joined for slug in slugs)
+
+
+def find_duplicate_id_fix(error_text: str, plan_raw: dict) -> Optional[dict]:
+    """Deterministically repair the one root-caused template-expansion failure:
+    a post_template node with a fixed (non-{C}) id whose applies_to is missing
+    or "all", which expand_template() duplicates once per compound.
+
+    Returns a patched deep copy, or None if the safety heuristic cannot
+    confidently confirm "once" is the right fix -- a duplicate id could equally
+    mean a per-compound node lost its {C} placeholder, where forcing "once"
+    would silently drop N-1 compounds' work.
+    """
+    m = re.search(r"Duplicate node IDs after template expansion: \{(.+)\}", error_text or "")
+    if not m:
+        return None
+    dup_ids = {s.strip().strip("'\"") for s in m.group(1).split(",") if s.strip()}
+    if not dup_ids:
+        return None
+
+    post_template = ((plan_raw.get("template") or {}).get("post_template")) or []
+    compounds = plan_raw.get("compounds") or []
+    patched = copy.deepcopy(plan_raw)
+    fixed_any = False
+
+    for i, node_tmpl in enumerate(post_template):
+        if node_tmpl.get("id") not in dup_ids:
+            continue
+        if _has_c_placeholder(node_tmpl.get("id")):
+            continue
+        if node_tmpl.get("applies_to") in ("once", "targets_only", "references_only"):
+            continue
+        if not _references_every_compound(node_tmpl, compounds):
+            continue
+        patched["template"]["post_template"][i]["applies_to"] = "once"
+        fixed_any = True
+
+    return patched if fixed_any else None
+
+
+def try_offline_template_patch(checks: Dict[str, bool], error_text: str,
+                               plan_raw: dict) -> Optional[dict]:
+    """Repair a template-expansion failure in code, with no extra planner call.
+
+    Returns a fully expanded, re-validated plan, or None if the failure is not
+    the known-and-root-caused pattern (caller falls through to a real LLM
+    retry). Saves a full planning round-trip on the one failure mode that is
+    deterministically fixable.
+    """
+    if checks.get("template_expansion_ok") is not False:
+        return None
+    patched_raw = find_duplicate_id_fix(error_text, plan_raw)
+    if patched_raw is None:
+        return None
+    try:
+        from build_graph_from_plan import expand_template
+        return expand_template(patched_raw)
+    except Exception:
+        return None
+
+
 def format_plan_validation_feedback(checks: Dict[str, bool], error: str = "") -> str:
     """Turn a failed structural-check result into an LLM-readable retry message.
 
@@ -3020,31 +3485,56 @@ async def execute_tool_from_node_spec(*, state: Dict[str, Any], node_spec: Dict[
         client_side_tools = {}
 
     # ---------------- client-side tool ----------------
-    # MCP-only parameters that client-side functions never accept
-    _MCP_ONLY_PARAMS = {"wall_timeout_seconds", "ncores", "job_label"}
-
     if tool_name in client_side_tools:
         fn = client_side_tools[tool_name]
         import inspect as _inspect
         try:
             sig = _inspect.signature(fn)
+            params = list(sig.parameters.values())
             has_var_keyword = any(
-                p.kind == _inspect.Parameter.VAR_KEYWORD
-                for p in sig.parameters.values()
+                p.kind == _inspect.Parameter.VAR_KEYWORD for p in params
             )
+            accepted_names = {
+                p.name for p in params
+                if p.kind in (_inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                              _inspect.Parameter.KEYWORD_ONLY)
+            }
         except (ValueError, TypeError):
+            sig, params, accepted_names = None, [], set()
             has_var_keyword = True
-        if not has_var_keyword:
-            _client_args = {k: v for k, v in args.items() if k not in _MCP_ONLY_PARAMS}
-        else:
+
+        # Keep only arguments this function actually declares. Replaces a former
+        # hardcoded {"wall_timeout_seconds","ncores","job_label"} blocklist —
+        # signature-derived, so it covers every MCP-only or misnamed argument,
+        # not just three known-bad ones.
+        if has_var_keyword:
             _client_args = args
-        try:
+            _dropped: List[str] = []
+        else:
+            _client_args = {k: v for k, v in args.items() if k in accepted_names}
+            _dropped = sorted(set(args) - accepted_names)
+        if _dropped:
+            # Surface, don't swallow: a dropped argument means the planner asked
+            # for something this tool cannot do (check_tool_arg_schemas catches
+            # this at plan time; this is the runtime backstop).
+            print(f"  [tool_args] {tool_name}: ignoring unsupported argument(s) "
+                  f"{_dropped} (not in signature)")
+
+        # Only pass `state` positionally to functions that actually declare it
+        # first. Client-side tools are heterogeneous: build_dimer_xyz/
+        # set_geometry_xyz/build_approach_scan_geometries take state first, while
+        # compute_pka_calibrated/structure_add_remove_proton/name_to_geometry_xyz
+        # do not. A blind `except TypeError: fn(state, **args)` fallback used to
+        # bind `state` to whatever the first parameter happened to be — producing
+        # a spurious "got multiple values for argument 'metal'" that masked the
+        # real error, or, worse, silently succeeding with `state` bound to a real
+        # parameter (e.g. pubchem_get_basic_properties(name=...)).
+        _first_is_state = bool(params) and params[0].name == "state" \
+            and "state" not in _client_args
+        if _first_is_state:
+            out = fn(state, **_client_args)
+        else:
             out = fn(**_client_args)
-        except TypeError as _e1:
-            try:
-                out = fn(state, **_client_args)
-            except TypeError as _e2:
-                raise TypeError(f"{_e1}") from None
 
         if isinstance(out, dict):
             payload = out

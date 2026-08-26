@@ -11,9 +11,10 @@ Usage:
     # → list[str], one entry per matched skill
 """
 from __future__ import annotations
+import functools
 from typing import Any, Callable, Dict, List
 
-from client_helpers import compute_pka_calibrated
+from client_helpers import compute_pka_calibrated, rank_eas_sites
 
 
 class PlannerSkill:
@@ -136,8 +137,34 @@ class PKaSkill(PlannerSkill):
         return """SKILL: pKa Calculation Protocol
 ────────────────────────────────────────────────────────────
 
-Reference proton free energy (gas phase, standard protocol):
-  G(H⁺)_ref = -0.01372 Eh   (Tissandier et al. 1998; include in plan settings)
+Solvation (READ FIRST — this is the most common planning error here):
+  An aqueous pKa REQUIRES solvated Gibbs energies. Implicit solvation is
+  requested by putting the solvation keyword INSIDE the method string:
+
+      "method": "B3LYP CPCM(Water)"
+
+  run_opt_job / run_freq_job / run_sp_energy have NO solvation parameter.
+  Passing solvent, solvent_model, implicit_solvation_model, or similar as
+  separate args is rejected by plan validation — and, worse, simply deleting
+  those args leaves a gas-phase calculation silently mislabelled as aqueous.
+  Move the keyword into "method"; do not drop it.
+  A gas-phase deprotonation energy is ~350 kcal/mol; an aqueous one is
+  ~6-25 kcal/mol. If ΔG comes out in the hundreds, solvation is missing.
+
+Reference proton free energy — pick by whether you calibrate:
+  CALIBRATED (references supplied): the proton term cancels exactly between
+    target and references, so its value is irrelevant. Omit G_H_plus_ref_eh
+    and let the tool choose.
+  UNCALIBRATED (references: []): the proton term does NOT cancel and must be
+    the full AQUEOUS proton free energy, -0.43074 Eh (Tissandier et al. 1998
+    solvation, plus gas-phase G(H⁺) and the 1 atm→1 M correction). The
+    gas-phase thermal value -0.01372 Eh is NOT valid here: it omits ~266
+    kcal/mol of proton solvation and inflates pKa by ~195 units.
+
+  PREFER CALIBRATION. Uncalibrated DFT pKa at these levels of theory carries
+  errors of many pKa units even when set up correctly, because solvation-model
+  error on the anion does not cancel. If the user names reference acids with
+  known pKa, always use them.
 
 Required artifacts:
   G_HA_eh        — Gibbs free energy of the neutral acid (Hartree)
@@ -159,8 +186,7 @@ verified that LLM-executed arithmetic on this exact formula can be off by
     "args": {
       "G_HA_eh": "$(artifacts.G_{C}_HA_eh)",
       "G_A_minus_eh": "$(artifacts.G_{C}_A_minus_eh)",
-      "references": [],
-      "G_H_plus_ref_eh": "$(settings.G_H_plus_ref_eh)"
+      "references": []
     },
     "product": {"pka_{C}": "pka"}
   }
@@ -169,6 +195,11 @@ verified that LLM-executed arithmetic on this exact formula can be off by
   G_H_plus_ref_eh − G_HA_eh, converted to pKa via ΔG_J/(R·T·ln10). Leave
   "references" as an empty list for this case — the tool treats an empty list
   as "no calibration" and returns the raw formula pKa.
+
+  Omit G_H_plus_ref_eh entirely, as shown. The tool then selects the correct
+  proton reference for the call (aqueous when uncalibrated, thermal when
+  calibrated). Only pass it explicitly if the user supplies a specific value;
+  do NOT wire it to a thermal-only constant on an uncalibrated node.
 
 Recommended level of theory:
   Gas phase    : B3LYP/def2-SVP  (opt + freq on same level)
@@ -200,8 +231,7 @@ also usable for any pKa calibrated against known reference-acid pKa values):
         {"G_HA_eh": "$(artifacts.G_ethanal_HA_eh)",
          "G_A_minus_eh": "$(artifacts.G_ethanal_A_minus_eh)",
          "pka_exp": 17.0}
-      ],
-      "G_H_plus_ref_eh": "$(settings.G_H_plus_ref_eh)"
+      ]
     },
     "product": {"pka_{C}": "pka"}
   }
@@ -212,9 +242,10 @@ also usable for any pKa calibrated against known reference-acid pKa values):
   extra nodes needed; the tool averages the per-reference correction
   internally (epsilon_avg over all references).
 
-  G_H_plus_ref_eh MUST be set in plan settings (single source of truth,
-  referenced via $(settings.G_H_plus_ref_eh) by every pKa node in the plan —
-  do not hardcode it as a literal per node).
+  Do NOT put G_H_plus_ref_eh in plan settings or wire it into pKa nodes unless
+  the user explicitly supplies a value. Omitting it lets the tool pick the
+  reference that is correct for each call; a plan-level constant cannot, since
+  the correct value differs between the calibrated and uncalibrated cases.
 
 Deprotonation step — structure_add_remove_proton:
   Use  mode="remove"  with the correct  site_selector  (STRING, not a dict).
@@ -252,8 +283,11 @@ Plan validation rules:
   ✓ artifacts_to_save MUST include G_HA_eh and G_A_minus_eh
   ✓ Both freq nodes must set  product: {"G_XX_eh": "gibbs_free_energy_eh"}
   ✓ compute_pka_{C} tool node must set  args: {"G_HA_eh": "$(artifacts...)",
-    "G_A_minus_eh": "$(artifacts...)", "references": [...], "G_H_plus_ref_eh":
-    "$(settings.G_H_plus_ref_eh)"}  and  product: {"pka_{C}": "pka"}
+    "G_A_minus_eh": "$(artifacts...)", "references": [...]}
+    and  product: {"pka_{C}": "pka"}.  Omit G_H_plus_ref_eh — the tool picks
+    the correct proton reference for calibrated vs uncalibrated calls.
+  ✓ For an aqueous pKa, solvation goes in the method string
+    ("method": "B3LYP CPCM(Water)"), never as a separate solvent argument
   ✓ structure_add_remove_proton node: use input_id (not geometry_xyz in args), site_selector only
   ✗ Do NOT use SP energy as proxy for G in a pKa plan
   ✗ Do NOT use kind:"llm" for the pKa calibration arithmetic — use the
@@ -475,10 +509,31 @@ class SolvationSkill(PlannerSkill):
         return """SKILL: Explicit Solvation (Microsolvation) Protocol
 ────────────────────────────────────────────────────────────
 
-Tool: run_solvator_cluster_thermo
+Two solvator tools exist. Pick by what the downstream node needs, and pass only
+the arguments the chosen tool declares — they are NOT interchangeable.
+
+Tool: run_solvator_cluster_thermo   (cluster + thermochemistry)
   → Builds water cluster with SOLVATOR, then runs ORCA freq in one call.
   → Returns: cluster_xyz, energy_eh, enthalpy_eh, gibbs_free_energy_eh
-  → Use this instead of separate run_solvator_cluster + run_freq_job.
+  → Accepts: geometry_xyz, nsolv, charge, multiplicity, method, basis, use_ri,
+             ncores, scf_max_iter, thermo_engine, thermo_timeout_seconds,
+             wall_timeout_seconds, job_label
+  → Use when a Gibbs free energy or enthalpy of the cluster is required
+    (pKa, ΔG, any thermochemistry). Prefer it over run_solvator_cluster +
+    run_freq_job in that case: one call instead of two.
+
+Tool: run_solvator_cluster          (cluster geometry only)
+  → Builds the water cluster and stops. No frequency job, no thermochemistry.
+  → Returns: cluster_geometry_xyz, energy_eh
+  → Accepts ONLY: geometry_xyz, nsolv, charge, multiplicity,
+             wall_timeout_seconds, job_label
+  → Does NOT accept method, basis, use_ri, ncores, scf_max_iter, or any
+    thermo_* argument. Passing one is rejected by plan validation.
+  → Use when only the solvated geometry is needed downstream — for example
+    a TD-DFT/UV-Vis spectrum on the cluster, or a single-point energy. Running
+    the thermo variant there buys a frequency calculation nothing consumes.
+
+If the request names one of these tools explicitly, use the one it names.
 
 nsolv selection guide:
   nsolv = 1–2  : qualitative, fast, suitable for screening
@@ -489,7 +544,10 @@ nsolv selection guide:
 Workflow pattern for solvated pKa:
   load HA → solvator_thermo(HA, nsolv=3) → G_HA_cluster_eh
           → remove_proton → solvator_thermo(A⁻, nsolv=3) → G_A_cluster_eh
-          → LLM calc pKa (same formula as gas phase)
+          → kind:"tool" node, tool: compute_pka_calibrated
+  Do the pKa arithmetic in that tool node, NOT in a kind:"llm" node. A language
+  model asked to evaluate this expression does not reproduce its own answer
+  across runs even when the input energies are byte-identical.
 
 Important constraints:
   - Charge of cluster = charge of solute (SOLVATOR keeps solute charge)
@@ -968,7 +1026,7 @@ Tool: run_tddft_job (standalone alternative)
   or for a clean 3-node plan after run_opt_job.
 
 Parameters:
-  n_tddft_states (run_sp_energy) / n_states (run_tddft_job): number of roots (default 5)
+  n_tddft_states (run_sp_energy) / nroots (run_tddft_job): number of roots (default 5)
 
 Output fields:
   energy_eh / energy_ground_state_eh: ground-state DFT energy (Eh)
@@ -1004,7 +1062,7 @@ Plan patterns (NO LLM node):
               "dipole_<mol>_debye": "dipole_moment_debye"}
 
   Standalone run_tddft_job:
-    load -> run_opt_job (output_id: mol_opt) -> run_tddft_job(input_id: mol_opt, n_states=5)
+    load -> run_opt_job (output_id: mol_opt) -> run_tddft_job(input_id: mol_opt, nroots=5)
     product: {"excited_states_<mol>": "excited_states",
               "homo_lumo_gap_<mol>_ev": "homo_lumo_gap_ev"}
 
@@ -1269,6 +1327,13 @@ class EASSkill(PlannerSkill):
     name     = "eas_reactivity"
     priority = 33
 
+    # Owns rank_eas_sites: deterministic filter-and-sort over the Mulliken charge
+    # table — replaces the kind:"llm" node this skill used to instruct the
+    # planner to emit, whose whole task was keeping the carbons and sorting by
+    # charge. The chemistry is in the element predicate, which is fixed; the
+    # sorting never needed a language model.
+    client_tools = {"rank_eas_sites": rank_eas_sites}
+
     _KEYWORDS = (
         "eas", "electrophilic aromatic", "aromatic substitution",
         "site selectivity", "site reactivity", "activated site", "deactivated site",
@@ -1297,11 +1362,14 @@ Use Mulliken charges from run_sp_energy (always available, no extra keyword need
   Step 1  opt → run_opt_job  (output_id: mol_opt)
   Step 2  run_sp_energy(input_id: mol_opt)  ← NO properties needed
           product: {"mulliken_mol": "mulliken_charges"}
-  Step 3  llm node: read mulliken_mol (list of {atom_index, symbol, charge});
-          filter to aromatic C (and heteroatoms) only;
-          sort by charge ascending (most negative = most EAS-activated);
-          return JSON:
-            {"site_ranking": [{"atom_idx": N, "element": "C", "mulliken_charge": X, "rank": 1}, ...]}
+  Step 3  kind:"tool" node, tool: rank_eas_sites
+          args: {"mulliken_charges": "$(artifacts.mulliken_<mol>)"}
+          Returns site_ranking (carbons and heteroatoms, sorted most-negative
+          first), most_activated, n_sites.
+          Do NOT emit a kind:"llm" node for this step. Filtering a charge table
+          by element and sorting it is not a reasoning task, and a language model
+          asked to do it costs ~1,500 tokens per molecule without reproducing its
+          own output across runs.
 
   Chemistry: EAS preferentially attacks the most electron-rich (most negative) carbon.
   Mulliken charges are less absolute than NPA but correctly rank relative site reactivity
@@ -1562,5 +1630,33 @@ def collect_skill_client_tools(registry: List[PlannerSkill] = SKILL_REGISTRY) ->
                 raise ValueError(
                     f"client_tools collision: {tool_name!r} declared by multiple skills"
                 )
-            merged[tool_name] = fn
+            merged[tool_name] = _with_status(fn)
     return merged
+
+
+def _with_status(fn: Callable) -> Callable:
+    """Guarantee the executor's status contract for a skill-owned tool.
+
+    The executor reads a tool result's "status" field and records the node as
+    'unknown' when it is absent, which no node spec's expect.status_in can
+    satisfy. That contract lived only in the example set by existing tools, so a
+    new tool could satisfy every schema, compute the right answer, and still fail
+    its node -- which is exactly what happened when rank_eas_sites was added: the
+    chemistry ran, the rankings were correct, and all three benchmark repeats
+    failed on execution_ok.
+
+    Rather than ask each author to remember, the collector enforces it here. A
+    dict returned without a status is a successful return by definition, since
+    failures in these functions are raised, not encoded. Existing values are
+    never overwritten, so a tool that reports its own status -- including
+    "error" -- keeps it.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        out = fn(*args, **kwargs)
+        if isinstance(out, dict) and "status" not in out:
+            out = {"status": "ok", **out}
+        return out
+
+    wrapper.__wrapped__ = fn        # keep the original signature introspectable,
+    return wrapper                  # build_tool_schemas reads it to make schemas
