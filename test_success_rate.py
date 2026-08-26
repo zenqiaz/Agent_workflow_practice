@@ -522,7 +522,6 @@ def check_eas(plan: dict) -> Dict[str, bool]:
     nodes      = plan.get("nodes", [])
     tools_used = [n.get("tool") for n in nodes if n.get("kind") == "tool"]
     tools_set  = set(tools_used)
-    llm_nodes  = [n for n in nodes if n.get("kind") == "llm"]
     all_keys   = set(plan.get("artifacts_to_save") or []) | _all_product_keys(plan)
 
     # SP for charge analysis: Mulliken (no extra properties) OR NBO/NPA
@@ -535,7 +534,7 @@ def check_eas(plan: dict) -> Dict[str, bool]:
         any(kw in k.lower() for kw in ("npa", "nbo", "charge", "fukui", "mulliken"))
         for k in all_keys
     )
-    # Ranking artifact from LLM node
+    # Ranking artifact -- from the deterministic rank_eas_sites tool
     has_ranking_art = any(
         any(kw in k.lower() for kw in ("ranking", "site", "eas", "fukui"))
         for k in all_keys
@@ -544,7 +543,12 @@ def check_eas(plan: dict) -> Dict[str, bool]:
     return {
         "has_opt_node":     "run_opt_job" in tools_set,
         "has_charge_calc":  has_sp_node or has_nbo_job,
-        "has_ranking_llm":  len(llm_nodes) >= 1,
+        # Per-molecule ranking is deterministic (rank_eas_sites), not an llm node --
+        # see client_helpers.rank_eas_sites and Section S5.13 for why an llm node
+        # doing this filter-and-sort was replaced. The cross-molecule comparison
+        # is left to the reporter rather than to a dedicated plan node, since it
+        # needs nothing an earlier node has not already produced.
+        "has_ranking_tool": "rank_eas_sites" in tools_set,
         "charge_artifact":  has_charge_art,
         "ranking_artifact": has_ranking_art,
     }

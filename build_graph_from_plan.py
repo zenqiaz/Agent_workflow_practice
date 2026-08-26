@@ -8,6 +8,7 @@ from langgraph.types import Command
 import ast
 import math
 import json
+import re
 import time
 from datetime import datetime, timezone
 from orchestrator_reporter import report_bug_and_persist, report_runtime_and_persist
@@ -779,26 +780,60 @@ def build_graph_from_plan(
                                 {"role": "user", "content": user_content},
                             ]
 
-                            try:
-                                resp = openai_client.chat.completions.create(
-                                    model=os.getenv("LLM_MODEL", "gpt-5.2"),
-                                    messages=messages,
-                                )
-                                # Accumulate calculator token usage into state
-                                _usage = getattr(resp, "usage", None)
-                                if _usage:
-                                    _tu = state.get("token_usage") or {}
-                                    _tu["calculator"] = _tu.get("calculator", 0) + (_usage.total_tokens or 0)
-                                    _tu["total"]      = _tu.get("total", 0)      + (_usage.total_tokens or 0)
-                                    state = {**state, "token_usage": _tu}
-                                raw = (resp.choices[0].message.content or "").strip()
-                                out = json.loads(raw)
-                                if not isinstance(out, dict):
-                                    out = {"status": "error", "error": "LLM returned non-dict JSON", "raw": raw}
-                            except json.JSONDecodeError:
-                                out = {"status": "error", "error": "LLM returned non-JSON", "raw": raw}
-                            except Exception as e:
-                                out = {"status": "error", "error": str(e)}
+                            # A calculator node's whole output is one json.loads call
+                            # on a raw completion, so a fenced response
+                            # ("```json\n{...}\n```", which some completions add even
+                            # when told not to) or one truncated mid-object fails the
+                            # node outright with no recovery. One retry, explicitly
+                            # telling the model what was wrong with its own last
+                            # answer, converts an intermittent parse failure into a
+                            # deterministic pass without weakening what is checked --
+                            # the JSON still has to be a valid dict either way.
+                            call_messages = list(messages)
+                            raw = ""
+                            out = None
+                            for attempt in range(2):
+                                try:
+                                    resp = openai_client.chat.completions.create(
+                                        model=os.getenv("LLM_MODEL", "gpt-5.2"),
+                                        messages=call_messages,
+                                        response_format={"type": "json_object"},
+                                    )
+                                    _usage = getattr(resp, "usage", None)
+                                    if _usage:
+                                        _tu = state.get("token_usage") or {}
+                                        _tu["calculator"] = _tu.get("calculator", 0) + (_usage.total_tokens or 0)
+                                        _tu["total"]      = _tu.get("total", 0)      + (_usage.total_tokens or 0)
+                                        state = {**state, "token_usage": _tu}
+                                    raw = (resp.choices[0].message.content or "").strip()
+                                    stripped = raw
+                                    if stripped.startswith("```"):
+                                        stripped = re.sub(r"^```[a-zA-Z]*\n?", "", stripped)
+                                        stripped = re.sub(r"```\s*$", "", stripped).strip()
+                                    parsed = json.loads(stripped)
+                                    if not isinstance(parsed, dict):
+                                        out = {"status": "error",
+                                               "error": "LLM returned non-dict JSON",
+                                               "raw": raw}
+                                    else:
+                                        out = parsed
+                                        break
+                                except json.JSONDecodeError as e:
+                                    out = {"status": "error",
+                                           "error": f"LLM returned non-JSON: {e}",
+                                           "raw": raw}
+                                except Exception as e:
+                                    out = {"status": "error", "error": str(e), "raw": raw}
+                                    break   # not a parse failure -- retrying will not help
+                                if attempt == 0:
+                                    call_messages = messages + [
+                                        {"role": "assistant", "content": raw},
+                                        {"role": "user", "content":
+                                            "That response was not valid JSON "
+                                            f"({out.get('error')}). Reply with the JSON "
+                                            "object only -- no prose, no markdown "
+                                            "code fence."},
+                                    ]
 
                     status = out.get("status", "ok")
 
@@ -815,7 +850,7 @@ def build_graph_from_plan(
 
                     updates["last_status"] = status
                     updates["last_tool_result"] = out_with_meta
-                    updates["run_log"] = [{
+                    log_entry = {
                         "node": node_id,
                         "kind": kind,
                         "llm_task": task,
@@ -823,7 +858,17 @@ def build_graph_from_plan(
                         "started_utc": node_started_utc,
                         "ended_utc": ended_utc,
                         "duration_ms": duration_ms,
-                    }]
+                    }
+                    if status != "ok":
+                        # Preserved specifically so a parse failure is diagnosable from
+                        # the runtime report alone -- previously this information was
+                        # produced (out["error"]/out["raw"]) and then discarded before
+                        # it reached the log, so a failed llm node left no trace of why.
+                        if out.get("error"):
+                            log_entry["error"] = out["error"]
+                        if out.get("raw"):
+                            log_entry["raw"] = out["raw"][:2000]
+                    updates["run_log"] = [log_entry]
 
                     # Stash artifacts from LLM output via product spec
                     # LLM may return values at top level or nested under "values"

@@ -1378,9 +1378,13 @@ Use Mulliken charges from run_sp_energy (always available, no extra keyword need
 ══ Multi-molecule comparison ═══════════════════════════════════════════════
 
   Run Method above for each molecule (separate opt → SP chains).
-  Final llm node (needs_artifacts: all mulliken_* keys):
-    compare most activated site per molecule, report cross-molecule ranking.
-    product: {"eas_comparison": "comparison_table"}
+  Do NOT add a final node to compare molecules. Every eas_sites_<mol> artifact
+  is already visible to the reporter once the plan finishes executing, and
+  building the cross-molecule table from them -- take the top-ranked site per
+  molecule, order the molecules by that site's charge -- is a report-writing
+  task, not a plan step: it needs no artifact no earlier node has already
+  produced, and no computation the reporter cannot do directly from what it is
+  already given. Stop the plan at the last rank_eas_sites node.
 
 ══ Recommended settings ════════════════════════════════════════════════════
 
