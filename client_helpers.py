@@ -1227,6 +1227,54 @@ def rank_eas_sites(
     }
 
 
+def compute_spin_gap(
+    E_hs_eh: float,
+    E_ls_eh: float,
+) -> dict:
+    """Deterministic CASSCF spin-state gap (no LLM arithmetic).
+
+    The CASSCF skill previously instructed the planner to emit a kind:"llm"
+    node whose entire task was subtracting two already-computed energies and
+    converting Hartree to kcal/mol -- the same class of arithmetic-in-a-language-
+    model defect documented for the pKa and EAS skills. There is no judgement
+    call here: which two energies to subtract and which conversion factor to
+    use are both fixed once the two CASSCF jobs are specified.
+
+    A positive result means the high-spin state lies above the low-spin state.
+
+    Args:
+        E_hs_eh: high-spin state CASSCF energy (Hartree).
+        E_ls_eh: low-spin state CASSCF energy (Hartree).
+
+    Returns:
+        {"status": "ok", "delta_E_kcal": float, "delta_E_eh": float,
+         "ground_state": "high-spin" | "low-spin" | "degenerate"}
+        or {"status": "error", "error": str} on invalid input.
+    """
+    EH_TO_KCAL = 627.509474
+    try:
+        e_hs = float(E_hs_eh)
+        e_ls = float(E_ls_eh)
+    except (TypeError, ValueError) as exc:
+        return {"status": "error", "error": f"invalid energy input: {exc}"}
+
+    delta_eh = e_hs - e_ls
+    delta_kcal = delta_eh * EH_TO_KCAL
+    if abs(delta_kcal) < 1e-6:
+        ground_state = "degenerate"
+    elif delta_kcal > 0:
+        ground_state = "low-spin"
+    else:
+        ground_state = "high-spin"
+
+    return {
+        "status": "ok",
+        "delta_E_kcal": delta_kcal,
+        "delta_E_eh": delta_eh,
+        "ground_state": ground_state,
+    }
+
+
 def compute_pka_calibrated(
     G_HA_eh: float,
     G_A_minus_eh: float,

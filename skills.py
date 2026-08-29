@@ -14,7 +14,7 @@ from __future__ import annotations
 import functools
 from typing import Any, Callable, Dict, List
 
-from client_helpers import compute_pka_calibrated, rank_eas_sites
+from client_helpers import compute_pka_calibrated, rank_eas_sites, compute_spin_gap
 
 
 class PlannerSkill:
@@ -389,6 +389,7 @@ class CasscfSkill(PlannerSkill):
 
     name = "casscf"
     priority = 24
+    client_tools = {"compute_spin_gap": compute_spin_gap}
 
     _KEYWORDS = [
         "casscf", "cas(", "cas (", "active space", "multireference",
@@ -413,6 +414,12 @@ Tool
   Optional: nroots (default 1), basis (default def2-SVP), maxiter (default 300),
             avas_variant, scf_max_iter (default 200)
   Returns: energy_eh (total or SA-average), energies_eh list (only when nroots > 1)
+
+  compute_spin_gap  (kind:"tool", NOT kind:"llm" -- this is arithmetic, not judgement)
+  Required: E_hs_eh, E_ls_eh (the two run_casscf_job energy_eh artifacts)
+  Returns: delta_E_kcal, delta_E_eh, ground_state ("high-spin"/"low-spin"/"degenerate")
+  Subtracting two energies and converting Hartree to kcal/mol has no chemistry
+  judgement in it -- do not route this through an llm node.
 
 AVAS (strongly recommended for all transition metal and pi systems)
   ORCA 6 uses avas_variant as a simple keyword — no separate block, no orbital strings.
@@ -452,15 +459,21 @@ Basis sets
   - ANO-RCC or def2-TZVPP: high-accuracy metal active spaces
 
 Typical plan pattern (Fe spin-state gap with AVAS)
+  CRITICAL: run_casscf_job must publish energy_eh under a node-specific artifact
+  key via product: -- a bare node-id reference (casscf_hs.energy_eh) is only
+  valid inside an llm node's needs_artifacts list, NOT inside a tool node's
+  args, which only expand $(artifacts.KEY) and $(settings.KEY).
   nodes:
     - {id: casscf_hs, kind: tool, tool: run_casscf_job,
-       input_id: mol_hs, args: {nel: 5, norb: 5, avas_variant: "VALENCE-D"}}
+       input_id: mol_hs, args: {nel: 5, norb: 5, avas_variant: "VALENCE-D"},
+       product: {energy_eh_hs: energy_eh}}
     - {id: casscf_ls, kind: tool, tool: run_casscf_job,
-       input_id: mol_ls, args: {nel: 5, norb: 5, avas_variant: "VALENCE-D"}}
-    - {id: calc_gap, kind: llm, task: compute_spin_gap,
+       input_id: mol_ls, args: {nel: 5, norb: 5, avas_variant: "VALENCE-D"},
+       product: {energy_eh_ls: energy_eh}}
+    - {id: calc_gap, kind: tool, tool: compute_spin_gap,
        needs: [casscf_hs, casscf_ls],
-       needs_artifacts: [casscf_hs.energy_eh, casscf_ls.energy_eh],
-       product: {delta_E_kcal: delta_E_kcal}}
+       args: {E_hs_eh: "$(artifacts.energy_eh_hs)", E_ls_eh: "$(artifacts.energy_eh_ls)"},
+       product: {delta_E_kcal: delta_E_kcal, ground_state: ground_state}}
 
 No geometry optimization with CASSCF
   run_casscf_job is SP-only. Optimize with DFT first (run_opt_job), then run CASSCF.
