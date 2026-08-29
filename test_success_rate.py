@@ -864,8 +864,6 @@ def _call_planner(client: OpenAI, msgs: list) -> Tuple[dict, dict]:
     resp = client.chat.completions.create(
         model=LLM_MODEL,
         messages=msgs,
-        tool_choice="none",
-        tools=[],
     )
     usage = getattr(resp, "usage", None)
     planner_total = getattr(usage, "total_tokens",      0) or 0
